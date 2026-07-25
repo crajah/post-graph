@@ -12,6 +12,7 @@ class Vertex:
     updated_at: Optional[datetime] = None
     table_name: Optional[str] = None
     fqid: Optional[str] = None
+    embedding: Optional[List[float]] = None
     _client: Optional[Any] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
@@ -27,7 +28,8 @@ class Vertex:
             "payload": self.payload,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-            "table_name": self.table_name
+            "table_name": self.table_name,
+            "embedding": self.embedding
         }
 
     async def to(self, edge_table: str, direction: str = 'out') -> List['TraversalStep']:

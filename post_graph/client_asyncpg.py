@@ -129,7 +129,12 @@ class AsyncPostGraph:
             row = await self._fetchrow(query, table_name)
         return row is not None
 
-    async def create_vertex_table(self, table_name: str, realm: Optional[str] = None):
+    async def create_vertex_table(
+        self,
+        table_name: str,
+        realm: Optional[str] = None,
+        vector_dim: Optional[int] = None
+    ):
         """Create a new vertex table and its associated shadow audit table, indexes, and triggers."""
         self._validate_identifier(table_name)
         if self.schema_per_realm:
@@ -211,6 +216,14 @@ class AsyncPostGraph:
         """
         await self._execute(query)
         await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED;")
+
+        if vector_dim and vector_dim > 0:
+            try:
+                await self._execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});")
+                await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);')
+            except Exception as e:
+                raise PostGraphError(f"Failed to initialize pgvector extension or embedding column for table '{table_name}': {e}")
 
         # 2. Create shadow audit table
         audit_query = f"""
@@ -417,12 +430,14 @@ class AsyncPostGraph:
         realm: str,
         vertex_id: Optional[Union[str, int]] = None,
         payload: Optional[Dict[str, Any]] = None,
+        embedding: Optional[List[float]] = None,
         user_id: Optional[str] = None
     ) -> Vertex:
         """Add a new vertex. Raises TableExistsError if it already exists."""
         self._validate_identifier(table_name)
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
+        vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
 
         async def _op(conn):
             nonlocal vertex_id
@@ -435,17 +450,36 @@ class AsyncPostGraph:
 
             v_id_str = str(v_id_int)
 
-            query = f"""
-            INSERT INTO {table_ref} (realm, id, payload)
-            VALUES ($1, $2, $3::jsonb)
-            RETURNING realm, id, fqid, payload, created_at, updated_at
-            """
-            try:
+            has_emb = False
+            if vec_str:
+                if self.schema_per_realm:
+                    has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'", realm, table_name) is not None
+                else:
+                    has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'", table_name) is not None
+
+            if vec_str and has_emb:
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, payload, embedding)
+                VALUES ($1, $2, $3::jsonb, $4::vector)
+                RETURNING realm, id, fqid, payload, created_at, updated_at, embedding::text AS embedding_text
+                """
+                row = await conn.fetchrow(query, realm, v_id_int, payload_json, vec_str)
+            else:
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, payload)
+                VALUES ($1, $2, $3::jsonb)
+                RETURNING realm, id, fqid, payload, created_at, updated_at
+                """
                 row = await conn.fetchrow(query, realm, v_id_int, payload_json)
+
+            try:
                 if vertex_id is not None:
                     await conn.execute(
                         f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"
                     )
+                emb = None
+                if 'embedding_text' in row and row['embedding_text']:
+                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
                 return Vertex(
                     realm=row['realm'],
                     id=str(row['id']),
@@ -454,6 +488,7 @@ class AsyncPostGraph:
                     created_at=row['created_at'],
                     updated_at=row['updated_at'],
                     table_name=table_name,
+                    embedding=emb,
                     _client=self
                 )
             except asyncpg.UniqueViolationError:
@@ -471,12 +506,14 @@ class AsyncPostGraph:
         realm: str,
         vertex_id: Optional[Union[str, int]] = None,
         payload: Optional[Dict[str, Any]] = None,
+        embedding: Optional[List[float]] = None,
         user_id: Optional[str] = None
     ) -> Vertex:
         """Upsert a vertex (merges payload JSONB on conflict)."""
         self._validate_identifier(table_name)
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
+        vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
 
         async def _op(conn):
             nonlocal vertex_id
@@ -489,16 +526,38 @@ class AsyncPostGraph:
 
             v_id_str = str(v_id_int)
 
-            query = f"""
-            INSERT INTO {table_ref} (realm, id, payload)
-            VALUES ($1, $2, $3::jsonb)
-            ON CONFLICT (realm, id) DO UPDATE
-            SET payload = {table_ref}.payload || EXCLUDED.payload,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING realm, id, fqid, payload, created_at, updated_at
-            """
-            try:
+            has_emb = False
+            if vec_str:
+                if self.schema_per_realm:
+                    has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'", realm, table_name) is not None
+                else:
+                    has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'", table_name) is not None
+
+            if vec_str and has_emb:
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, payload, embedding)
+                VALUES ($1, $2, $3::jsonb, $4::vector)
+                ON CONFLICT (realm, id) DO UPDATE
+                SET payload = {table_ref}.payload || EXCLUDED.payload,
+                    embedding = EXCLUDED.embedding,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING realm, id, fqid, payload, created_at, updated_at, embedding::text AS embedding_text
+                """
+                row = await conn.fetchrow(query, realm, v_id_int, payload_json, vec_str)
+            else:
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, payload)
+                VALUES ($1, $2, $3::jsonb)
+                ON CONFLICT (realm, id) DO UPDATE
+                SET payload = {table_ref}.payload || EXCLUDED.payload,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING realm, id, fqid, payload, created_at, updated_at
+                """
                 row = await conn.fetchrow(query, realm, v_id_int, payload_json)
+            try:
+                emb = None
+                if 'embedding_text' in row and row['embedding_text']:
+                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
                 return Vertex(
                     realm=row['realm'],
                     id=str(row['id']),
@@ -507,6 +566,7 @@ class AsyncPostGraph:
                     created_at=row['created_at'],
                     updated_at=row['updated_at'],
                     table_name=table_name,
+                    embedding=emb,
                     _client=self
                 )
             except asyncpg.UndefinedTableError:
@@ -518,28 +578,112 @@ class AsyncPostGraph:
         """Fetch a vertex by realm and id."""
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
-        v_str = str(vertex_id)
-        query = f"""
-        SELECT realm, id, fqid, payload, created_at, updated_at 
-        FROM {table_ref} 
-        WHERE realm = $1 AND ((CASE WHEN $2 ~ '^[0-9]+$' THEN id = $2::bigint ELSE FALSE END) OR fqid = $2)
+        v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+
+        async def _op(conn):
+            query = f"""
+            SELECT t.realm, t.id, t.fqid, t.payload, t.created_at, t.updated_at,
+                   to_jsonb(t)->>'embedding' AS embedding_text
+            FROM {table_ref} t
+            WHERE t.realm = $1 AND t.id = $2
+            """
+            try:
+                row = await conn.fetchrow(query, realm, v_id_int)
+                if not row:
+                    return None
+
+                emb = None
+                if 'embedding_text' in row and row['embedding_text']:
+                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+
+                return Vertex(
+                    realm=row['realm'],
+                    id=str(row['id']),
+                    fqid=row['fqid'],
+                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                    created_at=row['created_at'],
+                    updated_at=row['updated_at'],
+                    table_name=table_name,
+                    embedding=emb,
+                    _client=self
+                )
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+
+        if isinstance(self.connection, asyncpg.Pool):
+            async with self.connection.acquire() as conn:
+                return await _op(conn)
+        else:
+            return await _op(self.connection)
+
+    async def vector_search(
+        self,
+        table_name: str,
+        realm: str,
+        query_vector: List[float],
+        top_k: int = 5,
+        distance_metric: str = "cosine"
+    ) -> List[Tuple[Vertex, float]]:
+        """Perform vector similarity search on vertex embeddings using pgvector.
+        
+        Distance metrics:
+          - 'cosine': <=> (cosine distance)
+          - 'l2': <-> (Euclidean distance)
+          - 'inner_product': <#> (negative inner product)
         """
-        try:
-            row = await self._fetchrow(query, realm, v_str)
-            if not row:
-                return None
-            return Vertex(
-                realm=row['realm'],
-                id=str(row['id']),
-                fqid=row['fqid'] or f"{row['realm']}/{table_name}/{row['id']}",
-                payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                created_at=row['created_at'],
-                updated_at=row['updated_at'],
-                table_name=table_name,
-                _client=self
-            )
-        except asyncpg.UndefinedTableError:
-            raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+        vec_str = f"[{','.join(str(x) for x in query_vector)}]"
+        
+        op = "<=>"
+        if distance_metric == "l2":
+            op = "<->"
+        elif distance_metric == "inner_product":
+            op = "<#>"
+
+        query = f"""
+        SELECT realm, id, fqid, payload, created_at, updated_at, embedding::text AS embedding_text,
+               (embedding {op} $2::vector) AS distance
+        FROM {table_ref}
+        WHERE realm = $1 AND embedding IS NOT NULL
+        ORDER BY embedding {op} $2::vector ASC
+        LIMIT $3
+        """
+
+        async def _op(conn):
+            try:
+                rows = await conn.fetch(query, realm, vec_str, top_k)
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+            except asyncpg.UndefinedColumnError:
+                logger.warning(f"Table '{table_name}' does not have a vector embedding column.")
+                return []
+
+            results = []
+            for r in rows:
+                emb = None
+                if r['embedding_text']:
+                    emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+                v = Vertex(
+                    realm=r['realm'],
+                    id=str(r['id']),
+                    fqid=r['fqid'],
+                    payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
+                    created_at=r['created_at'],
+                    updated_at=r['updated_at'],
+                    table_name=table_name,
+                    embedding=emb,
+                    _client=self
+                )
+                dist = float(r['distance'])
+                results.append((v, dist))
+            return results
+
+        if isinstance(self.connection, asyncpg.Pool):
+            async with self.connection.acquire() as conn:
+                return await _op(conn)
+        else:
+            return await _op(self.connection)
 
     async def delete_vertex(self, table_name: str, realm: str, vertex_id: str, user_id: Optional[str] = None) -> bool:
         """Delete a vertex. Cascading foreign keys will automatically delete referencing edges."""

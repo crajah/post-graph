@@ -119,7 +119,13 @@ class Vertex:
             user_id=user_id
         )
 
-    async def add_data(self, payload: Dict[str, Any], timestamp: Optional[datetime] = None, user_id: Optional[str] = None) -> 'DataRecord':
+    async def add_data(
+        self,
+        payload: Dict[str, Any],
+        timestamp: Optional[datetime] = None,
+        embedding: Optional[List[float]] = None,
+        user_id: Optional[str] = None
+    ) -> 'DataRecord':
         """Append a data record to this vertex's {table_name}_data table."""
         if not self._client:
             from post_graph.errors import PostGraphError
@@ -130,6 +136,7 @@ class Vertex:
             vertex_id=self.id,
             payload=payload,
             timestamp=timestamp,
+            embedding=embedding,
             user_id=user_id
         )
 
@@ -191,7 +198,13 @@ class Edge:
             user_id=user_id
         )
 
-    async def add_data(self, payload: Dict[str, Any], timestamp: Optional[datetime] = None, user_id: Optional[str] = None) -> 'DataRecord':
+    async def add_data(
+        self,
+        payload: Dict[str, Any],
+        timestamp: Optional[datetime] = None,
+        embedding: Optional[List[float]] = None,
+        user_id: Optional[str] = None
+    ) -> 'DataRecord':
         """Append a data record to this edge's {table_name}_data table."""
         if not self._client:
             from post_graph.errors import PostGraphError
@@ -202,6 +215,7 @@ class Edge:
             edge_id=self.id,
             payload=payload,
             timestamp=timestamp,
+            embedding=embedding,
             user_id=user_id
         )
 
@@ -225,6 +239,7 @@ class DataRecord:
     id: str
     payload: Dict[str, Any] = field(default_factory=dict)
     timestamp: Optional[datetime] = None
+    embedding: Optional[List[float]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert DataRecord object to a dictionary."""
@@ -234,6 +249,7 @@ class DataRecord:
             "id": self.id,
             "payload": self.payload,
             "timestamp": self.timestamp.isoformat() if self.timestamp else None,
+            "embedding": self.embedding
         }
 
 

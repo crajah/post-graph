@@ -194,6 +194,8 @@ class SQLAlchemyPostGraph:
                     await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
                     await conn.execute(text(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"))
                     await conn.execute(text(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);'))
+                    await conn.execute(text(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"))
+                    await conn.execute(text(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);'))
                 except Exception as e:
                     raise PostGraphError(f"Failed to initialize pgvector extension or embedding column for table '{table_name}': {e}")
 
@@ -583,11 +585,14 @@ class SQLAlchemyPostGraph:
         realm: str,
         query_vector: List[float],
         top_k: int = 5,
-        distance_metric: str = "cosine"
+        distance_metric: str = "cosine",
+        search_data_table: bool = False,
+        search_scope: str = "main"
     ) -> List[Tuple[Vertex, float]]:
         """Perform vector similarity search on vertex embeddings using pgvector."""
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
+        data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
         vec_str = f"[{','.join(str(x) for x in query_vector)}]"
         
         op = "<=>"
@@ -596,14 +601,58 @@ class SQLAlchemyPostGraph:
         elif distance_metric == "inner_product":
             op = "<#>"
 
-        query = f"""
-        SELECT realm, id, fqid, payload, created_at, updated_at, CAST(embedding AS TEXT) AS embedding_text,
-               (embedding {op} CAST(:vec AS vector)) AS distance
-        FROM {table_ref}
-        WHERE realm = :realm AND embedding IS NOT NULL
-        ORDER BY embedding {op} CAST(:vec AS vector) ASC
-        LIMIT :top_k
-        """
+        scope = search_scope.lower()
+        if search_data_table and scope == "main":
+            scope = "data"
+
+        if scope == "data":
+            query = f"""
+            SELECT v.realm, v.id, v.fqid, v.payload, v.created_at, v.updated_at,
+                   to_jsonb(v)->>'embedding' AS embedding_text,
+                   MIN(d.embedding {op} CAST(:vec AS vector)) AS distance
+            FROM {data_table_ref} d
+            JOIN {table_ref} v ON d.realm = v.realm AND d.id = v.id
+            WHERE d.realm = :realm AND d.embedding IS NOT NULL
+            GROUP BY v.realm, v.id, v.fqid, v.payload, v.created_at, v.updated_at, to_jsonb(v)
+            ORDER BY distance ASC
+            LIMIT :top_k
+            """
+        elif scope == "both":
+            query = f"""
+            WITH combined AS (
+                SELECT realm, id, (embedding {op} CAST(:vec AS vector)) AS distance
+                FROM {table_ref}
+                WHERE realm = :realm AND embedding IS NOT NULL
+
+                UNION ALL
+
+                SELECT realm, id, (embedding {op} CAST(:vec AS vector)) AS distance
+                FROM {data_table_ref}
+                WHERE realm = :realm AND embedding IS NOT NULL
+            ),
+            best AS (
+                SELECT realm, id, MIN(distance) AS distance
+                FROM combined
+                GROUP BY realm, id
+            )
+            SELECT v.realm, v.id, v.fqid, v.payload, v.created_at, v.updated_at,
+                   to_jsonb(v)->>'embedding' AS embedding_text,
+                   b.distance
+            FROM best b
+            JOIN {table_ref} v ON b.realm = v.realm AND b.id = v.id
+            ORDER BY b.distance ASC
+            LIMIT :top_k
+            """
+        else:
+            query = f"""
+            SELECT t.realm, t.id, t.fqid, t.payload, t.created_at, t.updated_at,
+                   CAST(t.embedding AS TEXT) AS embedding_text,
+                   (t.embedding {op} CAST(:vec AS vector)) AS distance
+            FROM {table_ref} t
+            WHERE t.realm = :realm AND t.embedding IS NOT NULL
+            ORDER BY t.embedding {op} CAST(:vec AS vector) ASC
+            LIMIT :top_k
+            """
 
         async def _op(conn):
             try:
@@ -1328,6 +1377,7 @@ class SQLAlchemyPostGraph:
         vertex_id: Union[str, int],
         payload: Dict[str, Any],
         timestamp: Optional[Any] = None,
+        embedding: Optional[List[float]] = None,
         user_id: Optional[str] = None
     ) -> DataRecord:
         """Append a historical record to {table_name}_data table for a vertex."""
@@ -1335,29 +1385,63 @@ class SQLAlchemyPostGraph:
         v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
         payload_json = json.dumps(payload or {})
         data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
+        vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding is not None else None
 
         async def _op(conn):
-            if timestamp:
-                query = f"""
-                INSERT INTO {data_table_ref} (realm, id, payload, timestamp)
-                VALUES (:realm, :id, CAST(:payload AS JSONB), :timestamp)
-                RETURNING data_id, realm, id, payload, timestamp
-                """
-                row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json, timestamp=timestamp)
+            has_emb = False
+            if vec_str:
+                data_t_name = f"{table_name}_data"
+                if self.schema_per_realm:
+                    check_q = "SELECT 1 FROM information_schema.columns WHERE table_schema = :schema AND table_name = :t_name AND column_name = 'embedding'"
+                    res = await conn.execute(text(check_q), {"schema": realm, "t_name": data_t_name})
+                    has_emb = res.scalar() is not None
+                else:
+                    check_q = "SELECT 1 FROM information_schema.columns WHERE table_name = :t_name AND column_name = 'embedding'"
+                    res = await conn.execute(text(check_q), {"t_name": data_t_name})
+                    has_emb = res.scalar() is not None
+
+            if vec_str and has_emb:
+                if timestamp:
+                    query = f"""
+                    INSERT INTO {data_table_ref} (realm, id, payload, timestamp, embedding)
+                    VALUES (:realm, :id, CAST(:payload AS JSONB), :timestamp, CAST(:vec AS vector))
+                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    """
+                    row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json, timestamp=timestamp, vec=vec_str)
+                else:
+                    query = f"""
+                    INSERT INTO {data_table_ref} (realm, id, payload, embedding)
+                    VALUES (:realm, :id, CAST(:payload AS JSONB), CAST(:vec AS vector))
+                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    """
+                    row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json, vec=vec_str)
             else:
-                query = f"""
-                INSERT INTO {data_table_ref} (realm, id, payload)
-                VALUES (:realm, :id, CAST(:payload AS JSONB))
-                RETURNING data_id, realm, id, payload, timestamp
-                """
-                row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json)
+                if timestamp:
+                    query = f"""
+                    INSERT INTO {data_table_ref} (realm, id, payload, timestamp)
+                    VALUES (:realm, :id, CAST(:payload AS JSONB), :timestamp)
+                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    """
+                    row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json, timestamp=timestamp)
+                else:
+                    query = f"""
+                    INSERT INTO {data_table_ref} (realm, id, payload)
+                    VALUES (:realm, :id, CAST(:payload AS JSONB))
+                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    """
+                    row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json)
+
+            emb = None
+            if 'embedding_text' in row and row['embedding_text']:
+                emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
 
             return DataRecord(
                 data_id=str(row['data_id']),
                 realm=row['realm'],
                 id=str(row['id']),
                 payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                timestamp=row['timestamp']
+                timestamp=row['timestamp'],
+                embedding=emb
             )
 
         return await self._run_in_tx(_op, user_id)
@@ -1376,25 +1460,31 @@ class SQLAlchemyPostGraph:
 
         limit_clause = f"LIMIT {limit}" if limit and limit > 0 else ""
         query = f"""
-        SELECT data_id, realm, id, payload, timestamp
-        FROM {data_table_ref}
-        WHERE realm = :realm AND id = :id
-        ORDER BY timestamp DESC, data_id DESC
+        SELECT d.data_id, d.realm, d.id, d.payload, d.timestamp, to_jsonb(d)->>'embedding' AS embedding_text
+        FROM {data_table_ref} d
+        WHERE d.realm = :realm AND d.id = :id
+        ORDER BY d.timestamp DESC, d.data_id DESC
         {limit_clause}
         """
 
         async def _op(conn):
             rows = await self._fetch(conn, query, realm=realm, id=v_id_int)
-            return [
-                DataRecord(
-                    data_id=str(r['data_id']),
-                    realm=r['realm'],
-                    id=str(r['id']),
-                    payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
-                    timestamp=r['timestamp']
+            results = []
+            for r in rows:
+                emb = None
+                if 'embedding_text' in r and r['embedding_text']:
+                    emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+                results.append(
+                    DataRecord(
+                        data_id=str(r['data_id']),
+                        realm=r['realm'],
+                        id=str(r['id']),
+                        payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
+                        timestamp=r['timestamp'],
+                        embedding=emb
+                    )
                 )
-                for r in rows
-            ]
+            return results
 
         if isinstance(self.engine_or_connection, AsyncConnection):
             return await _op(self.engine_or_connection)
@@ -1409,10 +1499,11 @@ class SQLAlchemyPostGraph:
         edge_id: Union[str, int],
         payload: Dict[str, Any],
         timestamp: Optional[Any] = None,
+        embedding: Optional[List[float]] = None,
         user_id: Optional[str] = None
     ) -> DataRecord:
         """Append a historical record to {table_name}_data table for an edge."""
-        return await self.add_vertex_data(table_name, realm, edge_id, payload, timestamp=timestamp, user_id=user_id)
+        return await self.add_vertex_data(table_name, realm, edge_id, payload, timestamp=timestamp, embedding=embedding, user_id=user_id)
 
     async def get_edge_data(
         self,

@@ -1,0 +1,2 @@
+asyncpg>=0.29.0
+SQLAlchemy>=2.0.0

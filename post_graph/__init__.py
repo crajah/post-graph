@@ -10,7 +10,10 @@ from post_graph.models import Vertex, Edge, TraversalStep
 from post_graph.client_asyncpg import AsyncPostGraph
 from post_graph.client_sqlalchemy import SQLAlchemyPostGraph
 
+__version__ = "0.1.1"
+
 __all__ = [
+    "__version__",
     "PostGraphError",
     "VertexNotFoundError",
     "EdgeNotFoundError",

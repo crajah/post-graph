@@ -1,0 +1,65 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+      - 'v*'
+
+jobs:
+  publish:
+    name: Build & Publish post-graph to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for PyPI Trusted Publisher OIDC
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Update module and package version from git tag
+        run: |
+          # Extract version (e.g. v1.2.3 -> 1.2.3)
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG_NAME#v}"
+          echo "Release version: $VERSION"
+
+          # Update version in pyproject.toml
+          python -c "
+          import re
+          with open('pyproject.toml', 'r') as f:
+              content = f.read()
+          updated = re.sub(r'version\s*=\s*\"[^\"]+\"', f'version = \"{VERSION}\"', content, count=1)
+          with open('pyproject.toml', 'w') as f:
+              f.write(updated)
+          "
+
+          # Update __version__ in post_graph/__init__.py
+          python -c "
+          import re
+          with open('post_graph/__init__.py', 'r') as f:
+              content = f.read()
+          updated = re.sub(r'__version__\s*=\s*\"[^\"]+\"', f'__version__ = \"{VERSION}\"', content, count=1)
+          with open('post_graph/__init__.py', 'w') as f:
+              f.write(updated)
+          "
+
+          echo "Updated pyproject.toml and post_graph/__init__.py to version ${VERSION}"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Build package artifacts
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true

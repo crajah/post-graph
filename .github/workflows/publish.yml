@@ -3,8 +3,8 @@ name: Publish to PyPI
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
-      - 'v*'
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+      - "v*"
 
 jobs:
   publish:
@@ -27,25 +27,23 @@ jobs:
         run: |
           # Extract version (e.g. v1.2.3 -> 1.2.3)
           TAG_NAME="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG_NAME#v}"
+          export VERSION="${TAG_NAME#v}"
           echo "Release version: $VERSION"
 
-          # Update version in pyproject.toml
+          # Update version in pyproject.toml and post_graph/__init__.py
           python -c "
-          import re
+          import os, re
+          ver = os.environ['VERSION']
+
           with open('pyproject.toml', 'r') as f:
               content = f.read()
-          updated = re.sub(r'version\s*=\s*\"[^\"]+\"', f'version = \"{VERSION}\"', content, count=1)
+          updated = re.sub(r'version\s*=\s*\"[^\"]+\"', 'version = \"' + ver + '\"', content, count=1)
           with open('pyproject.toml', 'w') as f:
               f.write(updated)
-          "
 
-          # Update __version__ in post_graph/__init__.py
-          python -c "
-          import re
           with open('post_graph/__init__.py', 'r') as f:
               content = f.read()
-          updated = re.sub(r'__version__\s*=\s*\"[^\"]+\"', f'__version__ = \"{VERSION}\"', content, count=1)
+          updated = re.sub(r'__version__\s*=\s*\"[^\"]+\"', '__version__ = \"' + ver + '\"', content, count=1)
           with open('post_graph/__init__.py', 'w') as f:
               f.write(updated)
           "
@@ -54,6 +52,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: false
 
       - name: Build package artifacts
         run: uv build

@@ -347,7 +347,28 @@ vertex = await client.add_vertex(
 #### `get_vertex`
 ```python
 vertex = await client.get_vertex(table_name="users", realm="tenant_1", vertex_id=1)
+# Seamlessly accepts integer ID, FQID ("tenant_1/users/1"), or UUID string ("550e8400-e29b-41d4-a716-446655440000")
 ```
+
+#### `get_vertex_by_uuid`
+```python
+vertex = await client.get_vertex_by_uuid(
+    table_name="users",
+    realm="tenant_1",
+    uuid="550e8400-e29b-41d4-a716-446655440000"
+)
+```
+Performs fast $O(1)$ indexed lookup on the automatically assigned `uuid` column.
+
+#### `get_edge_by_uuid`
+```python
+edge = await client.get_edge_by_uuid(
+    table_name="likes",
+    realm="tenant_1",
+    uuid="463bf3f0-33f7-47cf-9fa9-46ab83035033"
+)
+```
+Performs fast indexed lookup for edge records by UUID.
 
 #### `update_vertex`
 ```python

@@ -13,6 +13,7 @@ class Vertex:
     table_name: Optional[str] = None
     fqid: Optional[str] = None
     embedding: Optional[List[float]] = None
+    uuid: Optional[str] = None
     _client: Optional[Any] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
@@ -24,6 +25,7 @@ class Vertex:
         return {
             "realm": self.realm,
             "id": self.id,
+            "uuid": self.uuid,
             "fqid": self.fqid,
             "payload": self.payload,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -165,6 +167,7 @@ class Edge:
     updated_at: Optional[datetime] = None
     table_name: Optional[str] = None
     fqid: Optional[str] = None
+    uuid: Optional[str] = None
     _client: Optional[Any] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
@@ -176,6 +179,7 @@ class Edge:
         return {
             "realm": self.realm,
             "id": self.id,
+            "uuid": self.uuid,
             "fqid": self.fqid,
             "from_id": self.from_id,
             "to_id": self.to_id,

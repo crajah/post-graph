@@ -1603,6 +1603,56 @@ class SQLAlchemyPostGraph:
             async with self.engine_or_connection.connect() as conn:
                 return await _op(conn)
 
+    async def get_latest_vertex_data(
+        self,
+        table_name: str,
+        realm: str,
+        vertex_id: Union[str, int]
+    ) -> Optional[DataRecord]:
+        """Fetch the latest append-only data record (version) for a vertex."""
+        records = await self.get_vertex_data(table_name, realm, vertex_id, limit=1)
+        return records[0] if records else None
+
+    async def get_vertex_data_by_id(
+        self,
+        table_name: str,
+        realm: str,
+        data_id: Union[str, int]
+    ) -> Optional[DataRecord]:
+        """Query a specific data entry / version by its sequential data_id."""
+        self._validate_identifier(table_name)
+        d_id_int = int(data_id)
+        data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
+
+        query = f"""
+        SELECT d.data_id, d.realm, d.id, d.payload, d.timestamp, to_jsonb(d)->>'embedding' AS embedding_text
+        FROM {data_table_ref} d
+        WHERE d.realm = :realm AND d.data_id = :data_id
+        """
+
+        async def _op(conn):
+            rows = await self._fetch(conn, query, realm=realm, data_id=d_id_int)
+            if not rows:
+                return None
+            r = rows[0]
+            emb = None
+            if 'embedding_text' in r and r['embedding_text']:
+                emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+            return DataRecord(
+                data_id=str(r['data_id']),
+                realm=r['realm'],
+                id=str(r['id']),
+                payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
+                timestamp=r['timestamp'],
+                embedding=emb
+            )
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            return await _op(self.engine_or_connection)
+        else:
+            async with self.engine_or_connection.connect() as conn:
+                return await _op(conn)
+
     async def add_edge_data(
         self,
         table_name: str,
@@ -1625,4 +1675,22 @@ class SQLAlchemyPostGraph:
     ) -> List[DataRecord]:
         """Fetch append-only data records for an edge sorted by timestamp descending."""
         return await self.get_vertex_data(table_name, realm, edge_id, limit=limit)
+
+    async def get_latest_edge_data(
+        self,
+        table_name: str,
+        realm: str,
+        edge_id: Union[str, int]
+    ) -> Optional[DataRecord]:
+        """Fetch the latest append-only data record for an edge."""
+        return await self.get_latest_vertex_data(table_name, realm, edge_id)
+
+    async def get_edge_data_by_id(
+        self,
+        table_name: str,
+        realm: str,
+        data_id: Union[str, int]
+    ) -> Optional[DataRecord]:
+        """Query a specific data entry by its sequential data_id for an edge."""
+        return await self.get_vertex_data_by_id(table_name, realm, data_id)
 

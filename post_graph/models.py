@@ -154,6 +154,28 @@ class Vertex:
             limit=limit
         )
 
+    async def get_latest_data(self) -> Optional['DataRecord']:
+        """Fetch the latest append-only data record (version) for this vertex."""
+        if not self._client:
+            from post_graph.errors import PostGraphError
+            raise PostGraphError("Vertex was not loaded with a database client reference.")
+        return await self._client.get_latest_vertex_data(
+            table_name=self.table_name,
+            realm=self.realm,
+            vertex_id=self.id
+        )
+
+    async def get_data_by_id(self, data_id: Any) -> Optional['DataRecord']:
+        """Fetch a specific append-only data record / version by sequential data_id."""
+        if not self._client:
+            from post_graph.errors import PostGraphError
+            raise PostGraphError("Vertex was not loaded with a database client reference.")
+        return await self._client.get_vertex_data_by_id(
+            table_name=self.table_name,
+            realm=self.realm,
+            data_id=data_id
+        )
+
 
 @dataclass
 class Edge:
@@ -233,6 +255,28 @@ class Edge:
             realm=self.realm,
             edge_id=self.id,
             limit=limit
+        )
+
+    async def get_latest_data(self) -> Optional['DataRecord']:
+        """Fetch the latest append-only data record for this edge."""
+        if not self._client:
+            from post_graph.errors import PostGraphError
+            raise PostGraphError("Edge was not loaded with a database client reference.")
+        return await self._client.get_latest_edge_data(
+            table_name=self.table_name,
+            realm=self.realm,
+            edge_id=self.id
+        )
+
+    async def get_data_by_id(self, data_id: Any) -> Optional['DataRecord']:
+        """Fetch a specific append-only data record by sequential data_id for this edge."""
+        if not self._client:
+            from post_graph.errors import PostGraphError
+            raise PostGraphError("Edge was not loaded with a database client reference.")
+        return await self._client.get_edge_data_by_id(
+            table_name=self.table_name,
+            realm=self.realm,
+            data_id=data_id
         )
 
 

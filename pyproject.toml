@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "post-graph"
-version = "0.2.0"
-description = "High-performance PostgreSQL-backed graph database library supporting multi-tenant realms, schema-per-realm, shadow auditing, and append-only data history."
+version = "0.3.0"
+description = "High-performance PostgreSQL-backed graph database library supporting multi-tenant realms, space sub-grouping, schema-per-realm, shadow auditing, and append-only data history."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

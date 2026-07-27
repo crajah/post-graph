@@ -179,6 +179,7 @@ class SQLAlchemyPostGraph:
             CREATE TABLE IF NOT EXISTS {table_ref} (
                 realm TEXT NOT NULL,
                 id BIGSERIAL,
+                space VARCHAR(255) DEFAULT 'default' NOT NULL,
                 uuid UUID DEFAULT gen_random_uuid() NOT NULL,
                 fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED NOT NULL,
                 payload JSONB NOT NULL DEFAULT '{{}}'::jsonb,
@@ -188,6 +189,8 @@ class SQLAlchemyPostGraph:
             );
             """
             await conn.execute(text(query))
+            await conn.execute(text(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"))
+            await conn.execute(text(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);'))
             await conn.execute(text(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED;"))
             await conn.execute(text(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();"))
             await conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);'))
@@ -591,6 +594,68 @@ class SQLAlchemyPostGraph:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
                 raise PostGraphError(f"Programming error: {e}")
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            return await _op(self.engine_or_connection)
+        else:
+            async with self.engine_or_connection.connect() as conn:
+                return await _op(conn)
+
+    async def get_vertices(
+        self,
+        table_name: str,
+        realm: str,
+        space: Optional[str] = None,
+        limit: Optional[int] = None
+    ) -> List[Vertex]:
+        """Fetch all vertices in a realm, optionally filtered by space."""
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            params = {"realm": realm}
+            space_clause = ""
+            if space:
+                params["space"] = space
+                space_clause = " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+
+            limit_clause = ""
+            if limit:
+                params["limit"] = limit
+                limit_clause = " LIMIT :limit"
+
+            query = f"""
+            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text,
+                   to_jsonb(t)->>'embedding' AS embedding_text
+            FROM {table_ref} t
+            WHERE t.realm = :realm{space_clause}
+            ORDER BY t.id ASC{limit_clause}
+            """
+            try:
+                result = await conn.execute(text(query), params)
+                rows = result.mappings().all()
+                vertices = []
+                for row in rows:
+                    emb = None
+                    if 'embedding_text' in row and row['embedding_text']:
+                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                    vertices.append(Vertex(
+                        realm=row['realm'],
+                        id=str(row['id']),
+                        space=row.get('space') or 'default',
+                        fqid=row['fqid'],
+                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                        created_at=row['created_at'],
+                        updated_at=row['updated_at'],
+                        table_name=table_name,
+                        embedding=emb,
+                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
+                        _client=self
+                    ))
+                return vertices
+            except (ProgrammingError, UndefinedTableError):
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
         if isinstance(self.engine_or_connection, AsyncConnection):
             return await _op(self.engine_or_connection)

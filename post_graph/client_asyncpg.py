@@ -207,6 +207,7 @@ class AsyncPostGraph:
         CREATE TABLE IF NOT EXISTS {table_ref} (
             realm TEXT NOT NULL,
             id BIGSERIAL,
+            space VARCHAR(255) DEFAULT 'default' NOT NULL,
             uuid UUID DEFAULT gen_random_uuid() NOT NULL,
             fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED NOT NULL,
             payload JSONB NOT NULL DEFAULT '{{}}'::jsonb,
@@ -216,6 +217,8 @@ class AsyncPostGraph:
         );
         """
         await self._execute(query)
+        await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
+        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);')
         await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED;")
         await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();")
         await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);')
@@ -235,6 +238,7 @@ class AsyncPostGraph:
         CREATE TABLE IF NOT EXISTS {audit_table_ref} (
             audit_id BIGSERIAL PRIMARY KEY,
             realm TEXT NOT NULL,
+            space VARCHAR(255) DEFAULT 'default',
             action TEXT NOT NULL,
             changed_by TEXT,
             changed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -250,12 +254,15 @@ class AsyncPostGraph:
             data_id BIGSERIAL PRIMARY KEY,
             realm TEXT NOT NULL,
             id BIGINT NOT NULL,
+            space VARCHAR(255) DEFAULT 'default' NOT NULL,
             payload JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (realm, id) REFERENCES {table_ref}(realm, id) ON DELETE CASCADE
         );
         """
         await self._execute(data_query)
+        await self._execute(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
+        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);')
         await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);')
         await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);')
 
@@ -439,13 +446,15 @@ class AsyncPostGraph:
         vertex_id: Optional[Union[str, int]] = None,
         payload: Optional[Dict[str, Any]] = None,
         embedding: Optional[List[float]] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        space: Optional[str] = "default"
     ) -> Vertex:
         """Add a new vertex. Raises TableExistsError if it already exists."""
         self._validate_identifier(table_name)
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
+        eff_space = space or "default"
 
         async def _op(conn):
             nonlocal vertex_id
@@ -467,18 +476,18 @@ class AsyncPostGraph:
 
             if vec_str and has_emb:
                 query = f"""
-                INSERT INTO {table_ref} (realm, id, payload, embedding)
-                VALUES ($1, $2, $3::jsonb, $4::vector)
-                RETURNING realm, id, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
+                INSERT INTO {table_ref} (realm, id, space, payload, embedding)
+                VALUES ($1, $2, $3, $4::jsonb, $5::vector)
+                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
                 """
-                row = await conn.fetchrow(query, realm, v_id_int, payload_json, vec_str)
+                row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json, vec_str)
             else:
                 query = f"""
-                INSERT INTO {table_ref} (realm, id, payload)
-                VALUES ($1, $2, $3::jsonb)
-                RETURNING realm, id, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
+                INSERT INTO {table_ref} (realm, id, space, payload)
+                VALUES ($1, $2, $3, $4::jsonb)
+                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
                 """
-                row = await conn.fetchrow(query, realm, v_id_int, payload_json)
+                row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json)
 
             try:
                 if vertex_id is not None:
@@ -491,6 +500,7 @@ class AsyncPostGraph:
                 return Vertex(
                     realm=row['realm'],
                     id=str(row['id']),
+                    space=row.get('space') or 'default',
                     fqid=row['fqid'],
                     payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
                     created_at=row['created_at'],
@@ -516,13 +526,15 @@ class AsyncPostGraph:
         vertex_id: Optional[Union[str, int]] = None,
         payload: Optional[Dict[str, Any]] = None,
         embedding: Optional[List[float]] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        space: Optional[str] = "default"
     ) -> Vertex:
         """Upsert a vertex (merges payload JSONB on conflict)."""
         self._validate_identifier(table_name)
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
+        eff_space = space or "default"
 
         async def _op(conn):
             nonlocal vertex_id
@@ -544,25 +556,27 @@ class AsyncPostGraph:
 
             if vec_str and has_emb:
                 query = f"""
-                INSERT INTO {table_ref} (realm, id, payload, embedding)
-                VALUES ($1, $2, $3::jsonb, $4::vector)
+                INSERT INTO {table_ref} (realm, id, space, payload, embedding)
+                VALUES ($1, $2, $3, $4::jsonb, $5::vector)
                 ON CONFLICT (realm, id) DO UPDATE
-                SET payload = {table_ref}.payload || EXCLUDED.payload,
+                SET space = EXCLUDED.space,
+                    payload = {table_ref}.payload || EXCLUDED.payload,
                     embedding = EXCLUDED.embedding,
                     updated_at = CURRENT_TIMESTAMP
-                RETURNING realm, id, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
+                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
                 """
-                row = await conn.fetchrow(query, realm, v_id_int, payload_json, vec_str)
+                row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json, vec_str)
             else:
                 query = f"""
-                INSERT INTO {table_ref} (realm, id, payload)
-                VALUES ($1, $2, $3::jsonb)
+                INSERT INTO {table_ref} (realm, id, space, payload)
+                VALUES ($1, $2, $3, $4::jsonb)
                 ON CONFLICT (realm, id) DO UPDATE
-                SET payload = {table_ref}.payload || EXCLUDED.payload,
+                SET space = EXCLUDED.space,
+                    payload = {table_ref}.payload || EXCLUDED.payload,
                     updated_at = CURRENT_TIMESTAMP
-                RETURNING realm, id, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
+                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
                 """
-                row = await conn.fetchrow(query, realm, v_id_int, payload_json)
+                row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json)
             try:
                 emb = None
                 if 'embedding_text' in row and row['embedding_text']:
@@ -570,6 +584,7 @@ class AsyncPostGraph:
                 return Vertex(
                     realm=row['realm'],
                     id=str(row['id']),
+                    space=row.get('space') or 'default',
                     fqid=row['fqid'],
                     payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
                     created_at=row['created_at'],
@@ -628,6 +643,67 @@ class AsyncPostGraph:
                     uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
                     _client=self
                 )
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+
+        if isinstance(self.connection, asyncpg.Pool):
+            async with self.connection.acquire() as conn:
+                return await _op(conn)
+        else:
+            return await _op(self.connection)
+
+    async def get_vertices(
+        self,
+        table_name: str,
+        realm: str,
+        space: Optional[str] = None,
+        limit: Optional[int] = None
+    ) -> List[Vertex]:
+        """Fetch all vertices in a realm, optionally filtered by space."""
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            params = [realm]
+            space_clause = ""
+            if space:
+                params.append(space)
+                space_clause = f" AND (t.space = ${len(params)} OR (${len(params)} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+
+            limit_clause = ""
+            if limit:
+                params.append(limit)
+                limit_clause = f" LIMIT ${len(params)}"
+
+            query = f"""
+            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text,
+                   to_jsonb(t)->>'embedding' AS embedding_text
+            FROM {table_ref} t
+            WHERE t.realm = $1{space_clause}
+            ORDER BY t.id ASC{limit_clause}
+            """
+            try:
+                rows = await conn.fetch(query, *params)
+                vertices = []
+                for row in rows:
+                    emb = None
+                    if 'embedding_text' in row and row['embedding_text']:
+                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                    vertices.append(Vertex(
+                        realm=row['realm'],
+                        id=str(row['id']),
+                        space=row.get('space') or 'default',
+                        fqid=row['fqid'],
+                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                        created_at=row['created_at'],
+                        updated_at=row['updated_at'],
+                        table_name=table_name,
+                        embedding=emb,
+                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
+                        _client=self
+                    ))
+                return vertices
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 

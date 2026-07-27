@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, List
 class Vertex:
     realm: str
     id: str
+    space: Optional[str] = "default"
     payload: Dict[str, Any] = field(default_factory=dict)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -25,6 +26,7 @@ class Vertex:
         return {
             "realm": self.realm,
             "id": self.id,
+            "space": self.space,
             "uuid": self.uuid,
             "fqid": self.fqid,
             "payload": self.payload,
@@ -184,6 +186,7 @@ class Edge:
     from_id: str
     to_id: str
     relation_type: str
+    space: Optional[str] = "default"
     payload: Dict[str, Any] = field(default_factory=dict)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -201,6 +204,7 @@ class Edge:
         return {
             "realm": self.realm,
             "id": self.id,
+            "space": self.space,
             "uuid": self.uuid,
             "fqid": self.fqid,
             "from_id": self.from_id,
@@ -285,6 +289,7 @@ class DataRecord:
     data_id: str
     realm: str
     id: str
+    space: Optional[str] = "default"
     payload: Dict[str, Any] = field(default_factory=dict)
     timestamp: Optional[datetime] = None
     embedding: Optional[List[float]] = None
@@ -295,6 +300,7 @@ class DataRecord:
             "data_id": self.data_id,
             "realm": self.realm,
             "id": self.id,
+            "space": self.space,
             "payload": self.payload,
             "timestamp": self.timestamp.isoformat() if self.timestamp else None,
             "embedding": self.embedding

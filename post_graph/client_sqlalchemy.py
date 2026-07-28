@@ -717,7 +717,8 @@ class SQLAlchemyPostGraph:
         top_k: int = 5,
         distance_metric: str = "cosine",
         search_data_table: bool = False,
-        search_scope: str = "main"
+        search_scope: str = "main",
+        space: Optional[str] = None
     ) -> List[Tuple[Vertex, float]]:
         """Perform vector similarity search on vertex embeddings using pgvector."""
         self._validate_identifier(table_name)

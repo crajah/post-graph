@@ -69,13 +69,14 @@ class Vertex:
         edge_table: str,
         edge_id: Optional[str] = None,
         payload: Optional[Dict[str, Any]] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        space: Optional[str] = None
     ) -> 'Edge':
         """Create a new outgoing edge from this vertex to another vertex."""
         if not self._client:
             from post_graph.errors import PostGraphError
             raise PostGraphError("Vertex was not loaded with a database client reference. Edge creation is unavailable.")
-        
+
         return await self._client.add_edge(
             table_name=edge_table,
             realm=self.realm,
@@ -84,7 +85,8 @@ class Vertex:
             to_id=to_id,
             relation_type=edge_table,  # Default relation_type to the edge table name
             payload=payload,
-            user_id=user_id
+            user_id=user_id,
+            space=space or self.space
         )
 
     async def add_edge_from(
@@ -93,13 +95,14 @@ class Vertex:
         edge_table: str,
         edge_id: Optional[str] = None,
         payload: Optional[Dict[str, Any]] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        space: Optional[str] = None
     ) -> 'Edge':
         """Create a new incoming edge from another vertex to this vertex."""
         if not self._client:
             from post_graph.errors import PostGraphError
             raise PostGraphError("Vertex was not loaded with a database client reference. Edge creation is unavailable.")
-        
+
         return await self._client.add_edge(
             table_name=edge_table,
             realm=self.realm,
@@ -108,7 +111,8 @@ class Vertex:
             to_id=self.id,
             relation_type=edge_table,
             payload=payload,
-            user_id=user_id
+            user_id=user_id,
+            space=space or self.space
         )
 
     async def delete(self, user_id: Optional[str] = None) -> bool:

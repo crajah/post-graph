@@ -26,3 +26,8 @@ class TableNotFoundError(PostGraphError):
 class CyclicReferenceError(PostGraphError):
     """Raised when adding an edge would introduce a cyclic reference in the graph."""
     pass
+
+
+class ReservedSpaceError(PostGraphError):
+    """Raised when a reserved space name like '__all__' is used in a write operation."""
+    pass

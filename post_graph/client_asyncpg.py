@@ -10,10 +10,14 @@ from post_graph.errors import (
     TableExistsError,
     TableNotFoundError,
     PostGraphError,
+    ReservedSpaceError,
 )
 from post_graph.models import Vertex, Edge, DataRecord
 
 logger = logging.getLogger("post_graph")
+
+
+RESERVED_SPACE_ALL = "__all__"
 
 
 class AsyncPostGraph:
@@ -338,6 +342,7 @@ class AsyncPostGraph:
         CREATE TABLE IF NOT EXISTS {table_ref} (
             realm TEXT NOT NULL,
             id BIGSERIAL,
+            space VARCHAR(255) DEFAULT 'default' NOT NULL,
             uuid UUID DEFAULT gen_random_uuid() NOT NULL,
             fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{from_vertex_table}-{to_vertex_table}' || '/' || id::text) STORED NOT NULL,
             from_id BIGINT NOT NULL,
@@ -352,6 +357,8 @@ class AsyncPostGraph:
         );
         """
         await self._execute(query)
+        await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
+        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);')
         await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{from_vertex_table}-{to_vertex_table}' || '/' || id::text) STORED;")
         await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();")
         await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);')
@@ -361,6 +368,7 @@ class AsyncPostGraph:
         CREATE TABLE IF NOT EXISTS {audit_table_ref} (
             audit_id BIGSERIAL PRIMARY KEY,
             realm TEXT NOT NULL,
+            space VARCHAR(255) DEFAULT 'default',
             action TEXT NOT NULL,
             changed_by TEXT,
             changed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -376,12 +384,15 @@ class AsyncPostGraph:
             data_id BIGSERIAL PRIMARY KEY,
             realm TEXT NOT NULL,
             id BIGINT NOT NULL,
+            space VARCHAR(255) DEFAULT 'default' NOT NULL,
             payload JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (realm, id) REFERENCES {table_ref}(realm, id) ON DELETE CASCADE
         );
         """
         await self._execute(data_query)
+        await self._execute(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
+        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);')
         await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);')
         await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);')
 
@@ -451,6 +462,8 @@ class AsyncPostGraph:
     ) -> Vertex:
         """Add a new vertex. Raises TableExistsError if it already exists."""
         self._validate_identifier(table_name)
+        if space == RESERVED_SPACE_ALL:
+            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -531,6 +544,8 @@ class AsyncPostGraph:
     ) -> Vertex:
         """Upsert a vertex (merges payload JSONB on conflict)."""
         self._validate_identifier(table_name)
+        if space == RESERVED_SPACE_ALL:
+            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -616,7 +631,7 @@ class AsyncPostGraph:
 
         async def _op(conn):
             query = f"""
-            SELECT t.realm, t.id, t.fqid, t.payload, t.created_at, t.updated_at,
+            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
                    t.uuid::text AS uuid_text,
                    to_jsonb(t)->>'embedding' AS embedding_text
             FROM {table_ref} t
@@ -634,6 +649,7 @@ class AsyncPostGraph:
                 return Vertex(
                     realm=row['realm'],
                     id=str(row['id']),
+                    space=row.get('space') or 'default',
                     fqid=row['fqid'],
                     payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
                     created_at=row['created_at'],
@@ -666,7 +682,7 @@ class AsyncPostGraph:
         async def _op(conn):
             params = [realm]
             space_clause = ""
-            if space:
+            if space and space != RESERVED_SPACE_ALL:
                 params.append(space)
                 space_clause = f" AND (t.space = ${len(params)} OR (${len(params)} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
 
@@ -721,7 +737,7 @@ class AsyncPostGraph:
 
         async def _op(conn):
             query = f"""
-            SELECT t.realm, t.id, t.fqid, t.payload, t.created_at, t.updated_at,
+            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
                    t.uuid::text AS uuid_text,
                    to_jsonb(t)->>'embedding' AS embedding_text
             FROM {table_ref} t
@@ -739,6 +755,7 @@ class AsyncPostGraph:
                 return Vertex(
                     realm=row['realm'],
                     id=str(row['id']),
+                    space=row.get('space') or 'default',
                     fqid=row['fqid'],
                     payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
                     created_at=row['created_at'],
@@ -796,15 +813,22 @@ class AsyncPostGraph:
         if search_data_table and scope == "main":
             scope = "data"
 
+        effective_space = space if space and space != RESERVED_SPACE_ALL else None
+        space_filter = ""
+        if effective_space:
+            space_filter = f" AND v.space = $4" if scope in ("data", "both") else f" AND t.space = $4"
+        space_filter_d = f" AND d.space = $4" if effective_space else ""
+        space_filter_combined = f" AND space = $4" if effective_space else ""
+
         if scope == "data":
             query = f"""
-            SELECT v.realm, v.id, v.fqid, v.payload, v.created_at, v.updated_at,
+            SELECT v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at,
                    to_jsonb(v)->>'embedding' AS embedding_text,
                    MIN(d.embedding {op} $2::vector) AS distance
             FROM {data_table_ref} d
             JOIN {table_ref} v ON d.realm = v.realm AND d.id = v.id
-            WHERE d.realm = $1 AND d.embedding IS NOT NULL
-            GROUP BY v.realm, v.id, v.fqid, v.payload, v.created_at, v.updated_at, to_jsonb(v)
+            WHERE d.realm = $1 AND d.embedding IS NOT NULL{space_filter_d}
+            GROUP BY v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at, to_jsonb(v)
             ORDER BY distance ASC
             LIMIT $3
             """
@@ -813,20 +837,20 @@ class AsyncPostGraph:
             WITH combined AS (
                 SELECT realm, id, (embedding {op} $2::vector) AS distance
                 FROM {table_ref}
-                WHERE realm = $1 AND embedding IS NOT NULL
+                WHERE realm = $1 AND embedding IS NOT NULL{space_filter_combined}
 
                 UNION ALL
 
                 SELECT realm, id, (embedding {op} $2::vector) AS distance
                 FROM {data_table_ref}
-                WHERE realm = $1 AND embedding IS NOT NULL
+                WHERE realm = $1 AND embedding IS NOT NULL{space_filter_combined}
             ),
             best AS (
                 SELECT realm, id, MIN(distance) AS distance
                 FROM combined
                 GROUP BY realm, id
             )
-            SELECT v.realm, v.id, v.fqid, v.payload, v.created_at, v.updated_at,
+            SELECT v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at,
                    to_jsonb(v)->>'embedding' AS embedding_text,
                    b.distance
             FROM best b
@@ -836,18 +860,22 @@ class AsyncPostGraph:
             """
         else:
             query = f"""
-            SELECT t.realm, t.id, t.fqid, t.payload, t.created_at, t.updated_at,
+            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
                    to_jsonb(t)->>'embedding' AS embedding_text,
                    (t.embedding {op} $2::vector) AS distance
             FROM {table_ref} t
-            WHERE t.realm = $1 AND t.embedding IS NOT NULL
+            WHERE t.realm = $1 AND t.embedding IS NOT NULL{space_filter}
             ORDER BY t.embedding {op} $2::vector ASC
             LIMIT $3
             """
 
+        fetch_args = [realm, vec_str, top_k]
+        if effective_space:
+            fetch_args.append(effective_space)
+
         async def _op(conn):
             try:
-                rows = await conn.fetch(query, realm, vec_str, top_k)
+                rows = await conn.fetch(query, *fetch_args)
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
             except asyncpg.UndefinedColumnError:
@@ -862,6 +890,7 @@ class AsyncPostGraph:
                 v = Vertex(
                     realm=r['realm'],
                     id=str(r['id']),
+                    space=r.get('space') or 'default',
                     fqid=r['fqid'],
                     payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
                     created_at=r['created_at'],
@@ -909,12 +938,16 @@ class AsyncPostGraph:
         edge_id: Optional[Union[str, int]] = None,
         payload: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
-        check_cycle: Union[bool, List[str]] = False
+        check_cycle: Union[bool, List[str]] = False,
+        space: Optional[str] = "default"
     ) -> Edge:
         """Add a new edge. Raises TableExistsError if it already exists."""
         self._validate_identifier(table_name)
+        if space == RESERVED_SPACE_ALL:
+            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
+        eff_space = space or "default"
 
         async def _op(conn):
             nonlocal edge_id
@@ -954,12 +987,12 @@ class AsyncPostGraph:
                     )
 
             query = f"""
-            INSERT INTO {table_ref} (realm, id, from_id, to_id, relation_type, payload)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-            RETURNING realm, id, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
+            INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+            RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
             """
             try:
-                row = await conn.fetchrow(query, realm, e_id_int, from_id_int, to_id_int, relation_type, payload_json)
+                row = await conn.fetchrow(query, realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json)
                 if edge_id is not None:
                     await conn.execute(
                         f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"
@@ -971,6 +1004,7 @@ class AsyncPostGraph:
                     from_id=str(row['from_id']),
                     to_id=str(row['to_id']),
                     relation_type=row['relation_type'],
+                    space=row.get('space') or 'default',
                     payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
                     created_at=row['created_at'],
                     updated_at=row['updated_at'],
@@ -999,12 +1033,16 @@ class AsyncPostGraph:
         edge_id: Optional[Union[str, int]] = None,
         payload: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
-        check_cycle: Union[bool, List[str]] = False
+        check_cycle: Union[bool, List[str]] = False,
+        space: Optional[str] = "default"
     ) -> Edge:
         """Upsert an edge (merges payload JSONB on conflict)."""
         self._validate_identifier(table_name)
+        if space == RESERVED_SPACE_ALL:
+            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
+        eff_space = space or "default"
 
         async def _op(conn):
             nonlocal edge_id
@@ -1045,18 +1083,19 @@ class AsyncPostGraph:
                     )
 
             query = f"""
-            INSERT INTO {table_ref} (realm, id, from_id, to_id, relation_type, payload)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+            INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
             ON CONFLICT (realm, id) DO UPDATE
-            SET from_id = EXCLUDED.from_id,
+            SET space = EXCLUDED.space,
+                from_id = EXCLUDED.from_id,
                 to_id = EXCLUDED.to_id,
                 relation_type = EXCLUDED.relation_type,
                 payload = {table_ref}.payload || EXCLUDED.payload,
                 updated_at = CURRENT_TIMESTAMP
-            RETURNING realm, id, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
+            RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
             """
             try:
-                row = await conn.fetchrow(query, realm, e_id_int, from_id_int, to_id_int, relation_type, payload_json)
+                row = await conn.fetchrow(query, realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json)
                 return Edge(
                     realm=row['realm'],
                     id=str(row['id']),
@@ -1064,6 +1103,7 @@ class AsyncPostGraph:
                     from_id=str(row['from_id']),
                     to_id=str(row['to_id']),
                     relation_type=row['relation_type'],
+                    space=row.get('space') or 'default',
                     payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
                     created_at=row['created_at'],
                     updated_at=row['updated_at'],
@@ -1088,8 +1128,8 @@ class AsyncPostGraph:
 
         table_ref = self._get_table_ref(table_name, realm)
         query = f"""
-        SELECT realm, id, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
-        FROM {table_ref} 
+        SELECT realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
+        FROM {table_ref}
         WHERE realm = $1 AND ((CASE WHEN $2 ~ '^[0-9]+$' THEN id = $2::bigint ELSE FALSE END) OR fqid = $2)
         """
         try:
@@ -1103,6 +1143,7 @@ class AsyncPostGraph:
                 from_id=str(row['from_id']),
                 to_id=str(row['to_id']),
                 relation_type=row['relation_type'],
+                space=row.get('space') or 'default',
                 payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
                 created_at=row['created_at'],
                 updated_at=row['updated_at'],
@@ -1119,8 +1160,8 @@ class AsyncPostGraph:
         table_ref = self._get_table_ref(table_name, realm)
         uuid_str = str(uuid).strip()
         query = f"""
-        SELECT realm, id, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
-        FROM {table_ref} 
+        SELECT realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
+        FROM {table_ref}
         WHERE realm = $1 AND uuid = $2::uuid
         """
         try:
@@ -1134,6 +1175,7 @@ class AsyncPostGraph:
                 from_id=str(row['from_id']),
                 to_id=str(row['to_id']),
                 relation_type=row['relation_type'],
+                space=row.get('space') or 'default',
                 payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
                 created_at=row['created_at'],
                 updated_at=row['updated_at'],
@@ -1280,9 +1322,9 @@ class AsyncPostGraph:
                 queries.append((
                     to_ref,
                     f"""
-                    SELECT 
-                        v.id AS v_id, v.fqid AS v_fqid, v.payload AS v_payload, v.created_at AS v_created_at, v.updated_at AS v_updated_at,
-                        e.id AS e_id, e.fqid AS e_fqid, e.from_id AS e_from, e.to_id AS e_to, e.relation_type AS e_rel, e.payload AS e_payload, e.created_at AS e_created_at, e.updated_at AS e_updated_at
+                    SELECT
+                        v.id AS v_id, v.space AS v_space, v.fqid AS v_fqid, v.payload AS v_payload, v.created_at AS v_created_at, v.updated_at AS v_updated_at,
+                        e.id AS e_id, e.space AS e_space, e.fqid AS e_fqid, e.from_id AS e_from, e.to_id AS e_to, e.relation_type AS e_rel, e.payload AS e_payload, e.created_at AS e_created_at, e.updated_at AS e_updated_at
                     FROM {edge_ref} e
                     JOIN {to_ref_ref} v ON e.realm = v.realm AND e.to_id = v.id
                     WHERE e.realm = $1 AND e.from_id = $2
@@ -1296,9 +1338,9 @@ class AsyncPostGraph:
                 queries.append((
                     from_ref,
                     f"""
-                    SELECT 
-                        v.id AS v_id, v.fqid AS v_fqid, v.payload AS v_payload, v.created_at AS v_created_at, v.updated_at AS v_updated_at,
-                        e.id AS e_id, e.fqid AS e_fqid, e.from_id AS e_from, e.to_id AS e_to, e.relation_type AS e_rel, e.payload AS e_payload, e.created_at AS e_created_at, e.updated_at AS e_updated_at
+                    SELECT
+                        v.id AS v_id, v.space AS v_space, v.fqid AS v_fqid, v.payload AS v_payload, v.created_at AS v_created_at, v.updated_at AS v_updated_at,
+                        e.id AS e_id, e.space AS e_space, e.fqid AS e_fqid, e.from_id AS e_from, e.to_id AS e_to, e.relation_type AS e_rel, e.payload AS e_payload, e.created_at AS e_created_at, e.updated_at AS e_updated_at
                     FROM {edge_ref} e
                     JOIN {from_ref_ref} v ON e.realm = v.realm AND e.from_id = v.id
                     WHERE e.realm = $1 AND e.to_id = $2
@@ -1311,6 +1353,7 @@ class AsyncPostGraph:
                     v = Vertex(
                         realm=realm,
                         id=str(r['v_id']),
+                        space=r.get('v_space') or 'default',
                         fqid=r['v_fqid'],
                         payload=r['v_payload'] if isinstance(r['v_payload'], dict) else json.loads(r['v_payload']),
                         created_at=r['v_created_at'],
@@ -1325,6 +1368,7 @@ class AsyncPostGraph:
                         from_id=str(r['e_from']),
                         to_id=str(r['e_to']),
                         relation_type=r['e_rel'],
+                        space=r.get('e_space') or 'default',
                         payload=r['e_payload'] if isinstance(r['e_payload'], dict) else json.loads(r['e_payload']),
                         created_at=r['e_created_at'],
                         updated_at=r['e_updated_at'],

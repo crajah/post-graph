@@ -5,16 +5,17 @@ from post_graph.errors import (
     TableExistsError,
     TableNotFoundError,
     CyclicReferenceError,
+    ReservedSpaceError,
 )
 from post_graph.models import Vertex, Edge, TraversalStep
-from post_graph.client_asyncpg import AsyncPostGraph
+from post_graph.client_asyncpg import AsyncPostGraph, RESERVED_SPACE_ALL
 
 try:
     from post_graph.client_sqlalchemy import SQLAlchemyPostGraph
 except ImportError:
     SQLAlchemyPostGraph = None
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",
@@ -24,9 +25,11 @@ __all__ = [
     "TableExistsError",
     "TableNotFoundError",
     "CyclicReferenceError",
+    "ReservedSpaceError",
     "Vertex",
     "Edge",
     "TraversalStep",
     "AsyncPostGraph",
     "SQLAlchemyPostGraph",
+    "RESERVED_SPACE_ALL",
 ]

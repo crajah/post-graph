@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncConnection
-from sqlalchemy.exc import IntegrityError, ProgrammingError
+from sqlalchemy.exc import DataError, IntegrityError, ProgrammingError
 
 from post_graph.errors import (
     VertexNotFoundError,
@@ -654,7 +654,7 @@ class SQLAlchemyPostGraph:
                         _client=self
                     ))
                 return vertices
-            except (ProgrammingError, UndefinedTableError):
+            except ProgrammingError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
         if isinstance(self.engine_or_connection, AsyncConnection):

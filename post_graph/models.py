@@ -196,6 +196,7 @@ class Edge:
     updated_at: Optional[datetime] = None
     table_name: Optional[str] = None
     fqid: Optional[str] = None
+    embedding: Optional[List[float]] = None
     uuid: Optional[str] = None
     _client: Optional[Any] = field(default=None, repr=False, compare=False)
 
@@ -215,6 +216,7 @@ class Edge:
             "to_id": self.to_id,
             "relation_type": self.relation_type,
             "payload": self.payload,
+            "embedding": self.embedding,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "table_name": self.table_name

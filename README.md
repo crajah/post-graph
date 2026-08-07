@@ -218,8 +218,22 @@ await client.create_vertex_table(
 )
 ```
 
-#### `create_edge_table(table_name=None, from_vertex_table=..., to_vertex_table=..., cascade_delete_from=False, cascade_delete_to=False, realm=None)`
+#### `create_edge_table(table_name=None, from_vertex_table=..., to_vertex_table=..., cascade_delete_from=False, cascade_delete_to=False, realm=None, vector_dim=None)`
 Creates a directed edge table linking two vertex tables.
+
+Pass `vector_dim` to give edges their own pgvector `embedding` column and HNSW
+index, enabling `vector_search_edges`. Optional — most workloads reach edges by
+traversing from a vertex rather than by similarity.
+
+```python
+await client.create_edge_table(
+    "relations",
+    from_vertex_table="entities",
+    to_vertex_table="entities",
+    realm=realm,
+    vector_dim=1536  # Optional: enables semantic search over relationships
+)
+```
 
 ---
 
@@ -299,6 +313,39 @@ results = await client.vector_search(
 for vertex, distance in results:
     print(f"Agent: {vertex.payload['name']} | Distance: {distance:.4f}")
 ```
+
+---
+
+### Edge Semantic Search (`vector_search_edges`)
+
+Edges can carry embeddings too, when the edge table was created with a
+`vector_dim`. Supply the vector on `add_edge` / `upsert_edge`, then search:
+
+```python
+await client.add_edge(
+    "relations", realm=realm,
+    from_id=zeus.id, to_id=hera.id,
+    relation_type="married_to",
+    payload={"description": "spouse"},
+    embedding=[0.05] * 1536          # Optional: stored when the table has a vector column
+)
+
+results = await client.vector_search_edges(
+    table_name="relations",
+    realm=realm,
+    query_vector=[0.05] * 1536,
+    top_k=5,
+    distance_metric="cosine",
+    space="production",              # Optional space filter
+    relation_type="married_to"       # Optional relation type filter
+)
+
+for edge, distance in results:
+    print(f"{edge.relation_type} | Distance: {distance:.4f}")
+```
+
+If the edge table has no vector column, a supplied `embedding` is ignored with a
+warning and `vector_search_edges` returns `[]`.
 
 ---
 

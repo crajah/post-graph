@@ -133,6 +133,42 @@ class AsyncPostGraph:
             row = await self._fetchrow(query, table_name)
         return row is not None
 
+    async def _table_has_embedding(self, conn, table_name: str, realm: Optional[str] = None) -> bool:
+        """Return True if the given table has an 'embedding' column."""
+        if self.schema_per_realm:
+            found = await conn.fetchval(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'",
+                realm, table_name
+            )
+        else:
+            found = await conn.fetchval(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = $1 AND column_name = 'embedding'",
+                table_name
+            )
+        return found is not None
+
+    async def _add_vector_column(
+        self,
+        table_name: str,
+        table_ref: str,
+        data_table_ref: str,
+        vector_dim: int
+    ):
+        """Add pgvector embedding columns and HNSW indexes to a table and its data table.
+
+        Callers must invoke this only after both tables exist.
+        """
+        try:
+            await self._execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});")
+            await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);')
+            await self._execute(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});")
+            await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);')
+        except Exception as e:
+            raise PostGraphError(f"Failed to initialize pgvector extension or embedding column for table '{table_name}': {e}")
+
     async def create_vertex_table(
         self,
         table_name: str,
@@ -227,16 +263,6 @@ class AsyncPostGraph:
         await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();")
         await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);')
 
-        if vector_dim and vector_dim > 0:
-            try:
-                await self._execute("CREATE EXTENSION IF NOT EXISTS vector;")
-                await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});")
-                await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);')
-                await self._execute(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});")
-                await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);')
-            except Exception as e:
-                raise PostGraphError(f"Failed to initialize pgvector extension or embedding column for table '{table_name}': {e}")
-
         # 2. Create shadow audit table
         audit_query = f"""
         CREATE TABLE IF NOT EXISTS {audit_table_ref} (
@@ -270,7 +296,12 @@ class AsyncPostGraph:
         await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);')
         await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);')
 
-        # 4. Create GIN index on payload
+        # 4. Add vector columns. This must run after the data table exists, since
+        # the embedding column is added to both the main and the data table.
+        if vector_dim and vector_dim > 0:
+            await self._add_vector_column(table_name, table_ref, data_table_ref, vector_dim)
+
+        # 5. Create GIN index on payload
         await self._execute(
             f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_payload" ON {table_ref} USING gin (payload);'
         )
@@ -301,9 +332,15 @@ class AsyncPostGraph:
         to_vertex_table: str,
         cascade_delete_from: bool = False,
         cascade_delete_to: bool = False,
-        realm: Optional[str] = None
+        realm: Optional[str] = None,
+        vector_dim: Optional[int] = None
     ):
-        """Create a new edge table linking two vertex tables, plus shadow audit table and constraints."""
+        """Create a new edge table linking two vertex tables, plus shadow audit table and constraints.
+
+        When ``vector_dim`` is given, the edge table gains a pgvector ``embedding``
+        column with an HNSW index, so relationships can be retrieved by semantic
+        similarity the same way vertices are.
+        """
         # Validate vertex table identifiers
         self._validate_identifier(from_vertex_table)
         self._validate_identifier(to_vertex_table)
@@ -395,6 +432,10 @@ class AsyncPostGraph:
         await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);')
         await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);')
         await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);')
+
+        # 3a. Add vector columns, after both the main and data tables exist.
+        if vector_dim and vector_dim > 0:
+            await self._add_vector_column(table_name, table_ref, data_table_ref, vector_dim)
 
         # 3. Create indexes
         await self._execute(
@@ -909,6 +950,97 @@ class AsyncPostGraph:
         else:
             return await _op(self.connection)
 
+    async def vector_search_edges(
+        self,
+        table_name: str,
+        realm: str,
+        query_vector: List[float],
+        top_k: int = 5,
+        distance_metric: str = "cosine",
+        space: Optional[str] = None,
+        relation_type: Optional[str] = None
+    ) -> List[Tuple[Edge, float]]:
+        """Perform vector similarity search over edge embeddings using pgvector.
+
+        Requires the edge table to have been created with a ``vector_dim``.
+        Lets relationships be retrieved by meaning rather than by enumerating the
+        whole edge set, which is what graph-wide ('global') retrieval needs.
+
+        Distance metrics match :meth:`vector_search`: 'cosine', 'l2', 'inner_product'.
+        """
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+        vec_str = f"[{','.join(str(x) for x in query_vector)}]"
+
+        op = "<=>"
+        if distance_metric == "l2":
+            op = "<->"
+        elif distance_metric == "inner_product":
+            op = "<#>"
+
+        effective_space = space if space and space != RESERVED_SPACE_ALL else None
+        fetch_args: List[Any] = [realm, vec_str, top_k]
+        filters = ""
+        if effective_space:
+            fetch_args.append(effective_space)
+            filters += f" AND t.space = ${len(fetch_args)}"
+        if relation_type:
+            fetch_args.append(relation_type)
+            filters += f" AND t.relation_type = ${len(fetch_args)}"
+
+        query = f"""
+        SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type,
+               t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text,
+               to_jsonb(t)->>'embedding' AS embedding_text,
+               (t.embedding {op} $2::vector) AS distance
+        FROM {table_ref} t
+        WHERE t.realm = $1 AND t.embedding IS NOT NULL{filters}
+        ORDER BY t.embedding {op} $2::vector ASC
+        LIMIT $3
+        """
+
+        async def _op(conn):
+            try:
+                rows = await conn.fetch(query, *fetch_args)
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
+            except asyncpg.UndefinedColumnError:
+                logger.warning(
+                    f"Edge table '{table_name}' has no vector embedding column. "
+                    f"Recreate it with create_edge_table(..., vector_dim=N)."
+                )
+                return []
+
+            results = []
+            for r in rows:
+                emb = None
+                if r['embedding_text']:
+                    emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+                e = Edge(
+                    realm=r['realm'],
+                    id=str(r['id']),
+                    from_id=str(r['from_id']),
+                    to_id=str(r['to_id']),
+                    relation_type=r['relation_type'],
+                    space=r.get('space') or 'default',
+                    fqid=r['fqid'],
+                    payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
+                    embedding=emb,
+                    created_at=r['created_at'],
+                    updated_at=r['updated_at'],
+                    table_name=table_name,
+                    uuid=str(r['uuid_text']) if r.get('uuid_text') else None,
+                    _client=self
+                )
+                results.append((e, float(r['distance'])))
+            return results
+
+        if isinstance(self.connection, asyncpg.Pool):
+            async with self.connection.acquire() as conn:
+                return await _op(conn)
+        else:
+            return await _op(self.connection)
+
     async def delete_vertex(self, table_name: str, realm: str, vertex_id: str, user_id: Optional[str] = None) -> bool:
         """Delete a vertex. Cascading foreign keys will automatically delete referencing edges."""
         self._validate_identifier(table_name)
@@ -939,14 +1071,20 @@ class AsyncPostGraph:
         payload: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
         check_cycle: Union[bool, List[str]] = False,
-        space: Optional[str] = "default"
+        space: Optional[str] = "default",
+        embedding: Optional[List[float]] = None
     ) -> Edge:
-        """Add a new edge. Raises TableExistsError if it already exists."""
+        """Add a new edge. Raises TableExistsError if it already exists.
+
+        ``embedding`` is stored when the edge table was created with a
+        ``vector_dim``, enabling semantic search over relationships.
+        """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
             raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
+        vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
         eff_space = space or "default"
 
         async def _op(conn):
@@ -986,17 +1124,39 @@ class AsyncPostGraph:
                         f"Existing path: {' -> '.join(path['path'])}"
                     )
 
-            query = f"""
-            INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-            RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
-            """
+            has_emb = False
+            if vec_str:
+                has_emb = await self._table_has_embedding(conn, table_name, realm)
+
+            if vec_str and has_emb:
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload, embedding)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::vector)
+                RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
+                """
+                args = (realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json, vec_str)
+            else:
+                if vec_str and not has_emb:
+                    logger.warning(
+                        f"Edge table '{table_name}' has no embedding column; the supplied embedding was not stored. "
+                        f"Recreate the table with create_edge_table(..., vector_dim=N)."
+                    )
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
+                """
+                args = (realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json)
+
             try:
-                row = await conn.fetchrow(query, realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json)
+                row = await conn.fetchrow(query, *args)
                 if edge_id is not None:
                     await conn.execute(
                         f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"
                     )
+                emb = None
+                if 'embedding_text' in row and row['embedding_text']:
+                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
                 return Edge(
                     realm=row['realm'],
                     id=str(row['id']),
@@ -1006,6 +1166,7 @@ class AsyncPostGraph:
                     relation_type=row['relation_type'],
                     space=row.get('space') or 'default',
                     payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                    embedding=emb,
                     created_at=row['created_at'],
                     updated_at=row['updated_at'],
                     table_name=table_name,
@@ -1034,14 +1195,20 @@ class AsyncPostGraph:
         payload: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
         check_cycle: Union[bool, List[str]] = False,
-        space: Optional[str] = "default"
+        space: Optional[str] = "default",
+        embedding: Optional[List[float]] = None
     ) -> Edge:
-        """Upsert an edge (merges payload JSONB on conflict)."""
+        """Upsert an edge (merges payload JSONB on conflict).
+
+        ``embedding`` is stored when the edge table has a vector column, and
+        replaces any previous embedding for the edge.
+        """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
             raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
+        vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
         eff_space = space or "default"
 
         async def _op(conn):
@@ -1082,21 +1249,52 @@ class AsyncPostGraph:
                         f"Existing path: {' -> '.join(path['path'])}"
                     )
 
-            query = f"""
-            INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-            ON CONFLICT (realm, id) DO UPDATE
-            SET space = EXCLUDED.space,
-                from_id = EXCLUDED.from_id,
-                to_id = EXCLUDED.to_id,
-                relation_type = EXCLUDED.relation_type,
-                payload = {table_ref}.payload || EXCLUDED.payload,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
-            """
+            has_emb = False
+            if vec_str:
+                has_emb = await self._table_has_embedding(conn, table_name, realm)
+
+            if vec_str and has_emb:
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload, embedding)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::vector)
+                ON CONFLICT (realm, id) DO UPDATE
+                SET space = EXCLUDED.space,
+                    from_id = EXCLUDED.from_id,
+                    to_id = EXCLUDED.to_id,
+                    relation_type = EXCLUDED.relation_type,
+                    payload = {table_ref}.payload || EXCLUDED.payload,
+                    embedding = EXCLUDED.embedding,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
+                """
+                args = (realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json, vec_str)
+            else:
+                if vec_str and not has_emb:
+                    logger.warning(
+                        f"Edge table '{table_name}' has no embedding column; the supplied embedding was not stored. "
+                        f"Recreate the table with create_edge_table(..., vector_dim=N)."
+                    )
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                ON CONFLICT (realm, id) DO UPDATE
+                SET space = EXCLUDED.space,
+                    from_id = EXCLUDED.from_id,
+                    to_id = EXCLUDED.to_id,
+                    relation_type = EXCLUDED.relation_type,
+                    payload = {table_ref}.payload || EXCLUDED.payload,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
+                """
+                args = (realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json)
+
             try:
-                row = await conn.fetchrow(query, realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json)
+                row = await conn.fetchrow(query, *args)
+                emb = None
+                if 'embedding_text' in row and row['embedding_text']:
+                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
                 return Edge(
+                    embedding=emb,
                     realm=row['realm'],
                     id=str(row['id']),
                     fqid=row['fqid'],
@@ -1617,6 +1815,12 @@ class AsyncPostGraph:
                     has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'", realm, data_t_name) is not None
                 else:
                     has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'", data_t_name) is not None
+
+            if vec_str and not has_emb:
+                logger.warning(
+                    f"Data table '{table_name}_data' has no embedding column; the supplied embedding "
+                    f"was not stored. Recreate '{table_name}' with a vector_dim to enable it."
+                )
 
             if vec_str and has_emb:
                 if timestamp:

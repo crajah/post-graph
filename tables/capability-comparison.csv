@@ -1,0 +1,9 @@
+,Neo4j,Apache AGE,post-graph
+Runs inside your PostgreSQL,No,Yes,Yes
+openCypher,Yes,Yes,No
+Tables you may index and constrain,n/a,No — discouraged,Yes
+Vector search on vertices and edges,via plugin,No,Yes
+Shadow audit log of every mutation,enterprise,No,Yes
+Append-only history per element,No,No,Yes
+Schema-per-tenant isolation,enterprise,per graph,Yes
+Needs a recent PostgreSQL,n/a,Partial — 11–16,Yes — any supported

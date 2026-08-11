@@ -1577,6 +1577,70 @@ class AsyncPostGraph:
 
         return results
 
+    @staticmethod
+    def _padded_date_sql(expr: str) -> str:
+        """Pad a partial ISO date so string comparison orders it correctly.
+
+        '2020' must compare below '2020-06-01', so a bare year becomes
+        '2020-01-01'. Kept identical to how callers pad the ``as_of`` argument,
+        because a mismatch would silently answer temporal queries differently
+        one hop out than it does at the source vertex.
+        """
+        return (
+            f"(split_part({expr}, '-', 1) || '-' || "
+            f"COALESCE(NULLIF(split_part({expr}, '-', 2), ''), '01') || '-' || "
+            f"COALESCE(NULLIF(split_part({expr}, '-', 3), ''), '01'))"
+        )
+
+    def _edge_filter_sql(
+        self,
+        relation_types: Optional[List[str]],
+        as_of: Optional[str],
+        payload_null_keys: Optional[List[str]],
+        space: Optional[str],
+        valid_from_key: str,
+        valid_to_key: str,
+        first_param: int,
+    ) -> Tuple[str, List[Any]]:
+        """Build the WHERE fragment applied to every edge step of a traversal.
+
+        Returned as a fragment plus its parameters so both traversal directions
+        share one definition; drift between them would make an 'in' walk observe
+        a different graph from an 'out' walk.
+        """
+        clauses: List[str] = []
+        params: List[Any] = []
+        n = first_param
+
+        if relation_types:
+            clauses.append(f"relation_type = ANY(${n}::text[])")
+            params.append(list(relation_types))
+            n += 1
+
+        if space and space != RESERVED_SPACE_ALL:
+            clauses.append(f"space = ${n}")
+            params.append(space)
+            n += 1
+
+        # A relation with no stated period holds at every date: silence about
+        # when a fact applied means it applied throughout, not that it never did.
+        if as_of:
+            vf = f"payload->>'{valid_from_key}'"
+            vt = f"payload->>'{valid_to_key}'"
+            at = self._padded_date_sql(f"${n}::text")
+            clauses.append(
+                f"(({vf} IS NULL OR {self._padded_date_sql(vf)} <= {at}) AND "
+                f"({vt} IS NULL OR {self._padded_date_sql(vt)} >= {at}))"
+            )
+            params.append(as_of)
+            n += 1
+
+        for key in payload_null_keys or []:
+            self._validate_identifier(key)
+            clauses.append(f"payload->>'{key}' IS NULL")
+
+        return ("".join(f" AND {c}" for c in clauses), params)
+
     async def traverse(
         self,
         realm: str,
@@ -1584,17 +1648,42 @@ class AsyncPostGraph:
         start_id: str,
         edge_tables: List[str],
         max_depth: int = 3,
-        direction: str = 'out'
+        direction: str = 'out',
+        relation_types: Optional[List[str]] = None,
+        as_of: Optional[str] = None,
+        payload_null_keys: Optional[List[str]] = None,
+        space: Optional[str] = None,
+        valid_from_key: str = 'valid_from',
+        valid_to_key: str = 'valid_to',
     ) -> List[Dict[str, Any]]:
         """
         Perform a dynamic graph traversal starting from (start_table, start_id)
         up to max_depth. scoped to a specific realm.
+
+        Optional filters, all applied to every step rather than to the final
+        result, so a walk is never routed *through* an edge the caller excluded:
+
+        ``relation_types``   follow only these relation types.
+        ``as_of``            follow only edges whose stated validity covers this
+                             date; edges stating no period always qualify.
+        ``payload_null_keys`` follow only edges where these payload keys are
+                             absent or null — how a caller excludes edges it has
+                             marked, such as superseded ones.
+        ``space``            confine the walk to one space. Without it a
+                             traversal that started from a correctly scoped
+                             vertex will still wander into other tenants' data.
         """
         self._validate_identifier(start_table)
         if direction not in ('out', 'in', 'both'):
             raise ValueError("Direction must be 'out', 'in', or 'both'")
 
         start_id_str = str(start_id).split('/')[-1] if '/' in str(start_id) else str(start_id)
+
+        # $1..$4 are realm, start id, start table and depth; filters follow.
+        filter_sql, filter_params = self._edge_filter_sql(
+            relation_types, as_of, payload_null_keys, space,
+            valid_from_key, valid_to_key, first_param=5,
+        )
 
         subqueries = []
         for edge_table in edge_tables:
@@ -1613,7 +1702,7 @@ class AsyncPostGraph:
                     payload,
                     '{edge_table}'::text AS edge_table
                 FROM {edge_ref}
-                WHERE realm = $1 AND from_id = (CASE WHEN t.current_id ~ '^[0-9]+$' THEN t.current_id::bigint ELSE NULL END) AND t.current_table = '{from_ref}'
+                WHERE realm = $1 AND from_id = (CASE WHEN t.current_id ~ '^[0-9]+$' THEN t.current_id::bigint ELSE NULL END) AND t.current_table = '{from_ref}'{filter_sql}
                 """)
 
             if direction in ('in', 'both'):
@@ -1626,7 +1715,7 @@ class AsyncPostGraph:
                     payload,
                     '{edge_table}'::text AS edge_table
                 FROM {edge_ref}
-                WHERE realm = $1 AND to_id = (CASE WHEN t.current_id ~ '^[0-9]+$' THEN t.current_id::bigint ELSE NULL END) AND t.current_table = '{to_ref}'
+                WHERE realm = $1 AND to_id = (CASE WHEN t.current_id ~ '^[0-9]+$' THEN t.current_id::bigint ELSE NULL END) AND t.current_table = '{to_ref}'{filter_sql}
                 """)
 
         if not subqueries:
@@ -1665,7 +1754,7 @@ class AsyncPostGraph:
         SELECT current_id, current_table, depth, path, edge_path, edge_ids FROM graph_traversal;
         """
 
-        rows = await self._fetch(cte_query, realm, start_id_str, start_table, max_depth)
+        rows = await self._fetch(cte_query, realm, start_id_str, start_table, max_depth, *filter_params)
 
         return [
             {

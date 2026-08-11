@@ -1,0 +1,4 @@
+theme: jekyll-theme-primer
+title: post-graph
+description: A graph database that is just PostgreSQL — realms, audit history, pgvector and filtered traversal
+show_downloads: false

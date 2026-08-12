@@ -35,6 +35,15 @@ sqlalchemy = [
 all = [
     "SQLAlchemy>=2.0.0",
 ]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
 
 [project.urls]
 Homepage = "https://github.com/crajah/post-graph"

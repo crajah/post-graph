@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "post-graph"
-version = "0.6.0"
+version = "0.6.1"
 description = "High-performance PostgreSQL-backed graph database library supporting multi-tenant realms, space sub-grouping, schema-per-realm, shadow auditing, and append-only data history."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [
     { name = "Chandan Rajah", email = "chandan.rajah@gmail.com" }
 ]
@@ -16,7 +16,7 @@ keywords = ["postgres", "postgresql", "graph", "database", "asyncpg", "sqlalchem
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",

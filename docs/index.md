@@ -8,7 +8,7 @@ description: "Multi-tenant realms, audit history, pgvector search and filtered t
 
 ### Multi-tenant realms, audit history, pgvector search and filtered traversal — as ordinary tables you own, not an engine you operate
 
-**[GitHub](https://github.com/crajah/post-graph)** · **[PyPI](https://pypi.org/project/post-graph/)** · `pip install post-graph` · MIT
+**[GitHub](https://github.com/crajah/post-graph)** · **[PyPI](https://pypi.org/project/post-graph/)** · `pip install post-graph` · Apache 2.0
 
 ---
 
@@ -168,7 +168,7 @@ pip install post-graph
 createdb mydb && psql -d mydb -c "CREATE EXTENSION vector;"
 ```
 
-`post-graph` is MIT licensed and on PyPI. It is also the storage layer beneath **[post-graph-rag](https://github.com/crajah/post-graph-rag)** ([write-up](https://crajah.github.io/post-graph-rag/)), a Graph RAG library that leans on every feature described here — the vector columns for retrieval, the composite keys for tenancy, the audit history for re-indexing, and the filtered traversal for multi-hop question answering over corpora whose facts change.
+`post-graph` is Apache 2.0 licensed and on PyPI. It is also the storage layer beneath **[post-graph-rag](https://github.com/crajah/post-graph-rag)** ([write-up](https://crajah.github.io/post-graph-rag/)), a Graph RAG library that leans on every feature described here — the vector columns for retrieval, the composite keys for tenancy, the audit history for re-indexing, and the filtered traversal for multi-hop question answering over corpora whose facts change.
 
 A paper covering the architecture and evaluation methodology is going to arXiv — link to follow.
 

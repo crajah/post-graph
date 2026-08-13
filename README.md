@@ -2,7 +2,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/post-graph.svg)](https://pypi.org/project/post-graph/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/post-graph.svg)](https://pypi.org/project/post-graph/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
 A high-performance Python library for using PostgreSQL as a native graph database. It supports **multi-tenant realms**, **application-level space sub-grouping (`space`)**, **pgvector similarity search across main & history tables**, automatic **shadow audit logging**, **append-only history tables**, and high-speed **recursive graph traversals (CTEs)**.
 
@@ -417,6 +417,6 @@ deleted_count = await client.delete_realm(realm="tenant_to_remove")
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [Apache License 2.0](LICENSE).
 
 Developed by **Chandan Rajah** (<chandan.rajah@gmail.com>).

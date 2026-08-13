@@ -1894,6 +1894,10 @@ class AsyncPostGraph:
         v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
         payload_json = json.dumps(payload or {})
         data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
+        # RETURNING can only name the target table unqualified: PostgreSQL
+        # rejects to_jsonb("schema"."table") there with "missing FROM-clause
+        # entry", which broke every add_vertex_data in schema_per_realm mode.
+        data_table_bare = f'"{table_name}_data"'
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding is not None else None
 
         async def _op(conn):
@@ -1916,14 +1920,14 @@ class AsyncPostGraph:
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload, timestamp, embedding)
                     VALUES ($1, $2, $3::jsonb, $4, $5::vector)
-                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_bare})->>'embedding' AS embedding_text
                     """
                     row = await conn.fetchrow(query, realm, v_id_int, payload_json, timestamp, vec_str)
                 else:
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload, embedding)
                     VALUES ($1, $2, $3::jsonb, $4::vector)
-                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_bare})->>'embedding' AS embedding_text
                     """
                     row = await conn.fetchrow(query, realm, v_id_int, payload_json, vec_str)
             else:
@@ -1931,14 +1935,14 @@ class AsyncPostGraph:
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload, timestamp)
                     VALUES ($1, $2, $3::jsonb, $4)
-                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_bare})->>'embedding' AS embedding_text
                     """
                     row = await conn.fetchrow(query, realm, v_id_int, payload_json, timestamp)
                 else:
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload)
                     VALUES ($1, $2, $3::jsonb)
-                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_bare})->>'embedding' AS embedding_text
                     """
                     row = await conn.fetchrow(query, realm, v_id_int, payload_json)
 

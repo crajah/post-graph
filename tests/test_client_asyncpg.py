@@ -4,6 +4,8 @@ Set POST_GRAPH_TEST_DSN to a PostgreSQL connection string.
 Tests are skipped when the database is unreachable.
 """
 
+import json
+
 import pytest
 from post_graph import (
     AsyncPostGraph,
@@ -959,3 +961,59 @@ class TestObjectTraversal:
 
         by_id = await v.get_data_by_id(data_id=dr.data_id)
         assert by_id is not None
+
+
+# ------------------------------------------------- vertex data, schema-per-realm
+
+@pytest.mark.asyncio
+async def test_add_vertex_data_works_in_schema_per_realm():
+    """Regression: RETURNING cannot name the target table schema-qualified.
+
+    Every add_vertex_data variant ended with `to_jsonb("realm"."t_data")`, which
+    PostgreSQL rejects with "missing FROM-clause entry". That made the whole
+    append-only history unusable in schema_per_realm mode — the recommended
+    mode — while the shared-table mode it was tested in worked fine.
+
+    Builds its own client rather than using the session-scoped fixtures: those
+    share one connection across tests and fail with "another operation is in
+    progress", which is what hides every live test in this file.
+    """
+    import os
+    import uuid
+
+    dsn = os.getenv("POST_GRAPH_TEST_DSN")
+    if not dsn:
+        pytest.skip("POST_GRAPH_TEST_DSN not set")
+
+    realm = f"test_{uuid.uuid4().hex[:12]}"
+    c = AsyncPostGraph(dsn=dsn, schema_per_realm=True)
+    try:
+        await c.connect()
+    except Exception as exc:
+        pytest.skip(f"PostgreSQL not reachable: {exc}")
+
+    try:
+        await c.create_vertex_table("hist", realm=realm)
+        v = await c.add_vertex("hist", realm=realm, payload={"name": "thing"})
+
+        await c.add_vertex_data(table_name="hist", realm=realm, vertex_id=int(v.id),
+                                payload={"version": "1.0.0"})
+        await c.add_vertex_data(table_name="hist", realm=realm, vertex_id=int(v.id),
+                                payload={"version": "1.0.1"})
+
+        records = await c.get_vertex_data(table_name="hist", realm=realm, vertex_id=int(v.id))
+        assert len(records) == 2, "both history records must be readable back"
+
+        versions = []
+        for r in records:
+            payload = r.to_dict()["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            versions.append(payload["version"])
+        # Newest first: this ordering is what version resolution relies on.
+        assert versions == ["1.0.1", "1.0.0"]
+    finally:
+        try:
+            await c._execute(f'DROP SCHEMA IF EXISTS "{realm}" CASCADE')
+        finally:
+            await c.close()

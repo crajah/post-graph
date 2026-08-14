@@ -162,6 +162,64 @@ class TestGetTableRef:
         with pytest.raises(PostGraphError):
             c._get_table_ref("people")
 
+    def test_invalid_table_name_raises(self):
+        c = AsyncPostGraph(dsn="unused")
+        with pytest.raises(ValueError):
+            c._get_table_ref("bad-name")
+
+
+# ---------------------------------------------------------------------------
+# Client construction (no DB needed)
+# ---------------------------------------------------------------------------
+
+class TestClientConstruction:
+    def test_default_attributes(self):
+        c = AsyncPostGraph(dsn="postgresql://localhost/test")
+        assert c.dsn == "postgresql://localhost/test"
+        assert c.schema_per_realm is False
+        assert c.connection is None
+        assert c._pool is None
+        assert c._schema_cache == {}
+
+    def test_schema_per_realm_flag(self):
+        c = AsyncPostGraph(dsn="unused", schema_per_realm=True)
+        assert c.schema_per_realm is True
+
+    def test_connection_passed_directly(self):
+        sentinel = object()
+        c = AsyncPostGraph(connection_or_pool=sentinel)
+        assert c.connection is sentinel
+
+
+# ---------------------------------------------------------------------------
+# Traverse direction validation (no DB needed)
+# ---------------------------------------------------------------------------
+
+class TestTraverseDirectionValidation:
+    def test_invalid_neighbor_direction(self):
+        c = AsyncPostGraph(dsn="unused")
+        with pytest.raises(ValueError, match="Direction"):
+            import asyncio
+            asyncio.get_event_loop().run_until_complete(
+                c.get_neighbors("realm", "vtable", "1", ["e"], direction="sideways")
+            )
+
+    def test_invalid_traverse_direction(self):
+        c = AsyncPostGraph(dsn="unused")
+        with pytest.raises(ValueError, match="Direction"):
+            import asyncio
+            asyncio.get_event_loop().run_until_complete(
+                c.traverse("realm", "vtable", "1", ["e"], direction="sideways")
+            )
+
+    def test_invalid_shortest_path_direction(self):
+        c = AsyncPostGraph(dsn="unused")
+        with pytest.raises(ValueError, match="Direction"):
+            import asyncio
+            asyncio.get_event_loop().run_until_complete(
+                c.shortest_path("realm", "a", "1", "b", "2", ["e"], direction="sideways")
+            )
+
 
 # ===================================================================
 # Integration tests — require a running PostgreSQL
@@ -963,6 +1021,632 @@ class TestObjectTraversal:
         assert by_id is not None
 
 
+# ===================================================================
+# Additional integration tests
+# ===================================================================
+
+class TestVertexAutoId:
+    async def test_auto_id_increments(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("items", realm=realm)
+        v1 = await pg_client.add_vertex("items", realm=realm, payload={"n": 1})
+        v2 = await pg_client.add_vertex("items", realm=realm, payload={"n": 2})
+        assert int(v2.id) > int(v1.id)
+
+    async def test_auto_id_after_explicit_id(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("items", realm=realm)
+        await pg_client.add_vertex("items", realm=realm, vertex_id=100, payload={"n": 1})
+        v2 = await pg_client.add_vertex("items", realm=realm, payload={"n": 2})
+        assert int(v2.id) > 100
+
+
+class TestVertexEmbedding:
+    async def test_vertex_embedding_roundtrip(self, pg_client, clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = clean_realm
+        dim = 4
+        await pg_client.create_vertex_table("items", realm=realm, vector_dim=dim)
+        emb = [0.1, 0.2, 0.3, 0.4]
+        v = await pg_client.add_vertex("items", realm=realm, payload={"n": "A"}, embedding=emb)
+        assert v.embedding is not None
+        assert len(v.embedding) == 4
+        for a, b in zip(v.embedding, emb):
+            assert abs(a - b) < 1e-5
+
+    async def test_upsert_vertex_updates_embedding(self, pg_client, clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = clean_realm
+        dim = 4
+        await pg_client.create_vertex_table("items", realm=realm, vector_dim=dim)
+        v1 = await pg_client.upsert_vertex(
+            "items", realm=realm, vertex_id=1, payload={"n": "A"},
+            embedding=[1.0, 0.0, 0.0, 0.0]
+        )
+        v2 = await pg_client.upsert_vertex(
+            "items", realm=realm, vertex_id=1, payload={"n": "A"},
+            embedding=[0.0, 1.0, 0.0, 0.0]
+        )
+        assert v2.embedding is not None
+        assert abs(v2.embedding[0]) < 1e-5
+        assert abs(v2.embedding[1] - 1.0) < 1e-5
+
+
+class TestEdgeDefaultTableName:
+    async def test_default_edge_table_name(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people", realm=realm)
+        await pg_client.create_vertex_table("companies", realm=realm)
+        await pg_client.create_edge_table(
+            from_vertex_table="people", to_vertex_table="companies", realm=realm
+        )
+        v1 = await pg_client.add_vertex("people", realm=realm, payload={"n": "A"})
+        v2 = await pg_client.add_vertex("companies", realm=realm, payload={"n": "X"})
+        e = await pg_client.add_edge(
+            "peopleTOcompanies", realm=realm, from_id=v1.id, to_id=v2.id,
+            relation_type="works_at"
+        )
+        assert e is not None
+        assert e.relation_type == "works_at"
+
+
+class TestEdgeExplicitId:
+    async def test_edge_with_explicit_id(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        e = await pg_client.add_edge(
+            "links", realm=realm, from_id=a.id, to_id=b.id,
+            relation_type="to", edge_id=500
+        )
+        assert e.id == "500"
+
+
+class TestCascadeDeleteFromVertex:
+    async def test_deleting_vertex_cascades_edges(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        e = await pg_client.add_edge(
+            "links", realm=realm, from_id=a.id, to_id=b.id, relation_type="to"
+        )
+        await pg_client.delete_vertex("nodes", realm=realm, vertex_id=a.id)
+        fetched = await pg_client.get_edge("links", realm=realm, edge_id=e.id)
+        assert fetched is None
+
+
+class TestEdgeUpsertReservedSpace:
+    async def test_upsert_edge_reserved_space_raises(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        with pytest.raises(ReservedSpaceError):
+            await pg_client.upsert_edge(
+                "links", realm=realm, from_id=a.id, to_id=b.id,
+                relation_type="to", edge_id=1, space="__all__"
+            )
+
+
+class TestVertexGetByInvalidUuid:
+    async def test_invalid_uuid_returns_none(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        fetched = await pg_client.get_vertex_by_uuid("nodes", realm=realm, uuid="not-a-uuid")
+        assert fetched is None
+
+
+class TestEdgeGetByInvalidUuid:
+    async def test_invalid_uuid_returns_none(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        fetched = await pg_client.get_edge_by_uuid("links", realm=realm, uuid="not-a-uuid")
+        assert fetched is None
+
+
+class TestGetVerticesEmptyRealm:
+    async def test_empty_result(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        verts = await pg_client.get_vertices("nodes", realm=realm)
+        assert verts == []
+
+
+class TestGetVertexDataEmpty:
+    async def test_no_data_returns_empty(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        v = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        records = await pg_client.get_vertex_data("nodes", realm=realm, vertex_id=v.id)
+        assert records == []
+
+    async def test_get_latest_data_returns_none_when_empty(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        v = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        latest = await pg_client.get_latest_vertex_data("nodes", realm=realm, vertex_id=v.id)
+        assert latest is None
+
+    async def test_get_data_by_nonexistent_id(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        fetched = await pg_client.get_vertex_data_by_id("nodes", realm=realm, data_id=999999)
+        assert fetched is None
+
+
+class TestDeleteRealmWithEdges:
+    async def test_deletes_vertices_and_edges(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        await pg_client.add_edge("links", realm=realm, from_id=a.id, to_id=b.id, relation_type="to")
+
+        deleted = await pg_client.delete_realm(realm)
+        assert deleted >= 3  # 2 vertices + 1 edge (plus possible audit records)
+
+
+class TestTraverseMultipleEdgeTables:
+    async def test_traverse_across_two_edge_tables(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("multi_nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "multi_knows", from_vertex_table="multi_nodes", to_vertex_table="multi_nodes", realm=realm
+        )
+        await pg_client.create_edge_table(
+            "multi_works_with", from_vertex_table="multi_nodes", to_vertex_table="multi_nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("multi_nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("multi_nodes", realm=realm, payload={"n": "B"})
+        c = await pg_client.add_vertex("multi_nodes", realm=realm, payload={"n": "C"})
+        await pg_client.add_edge("multi_knows", realm=realm, from_id=a.id, to_id=b.id, relation_type="knows")
+        await pg_client.add_edge("multi_works_with", realm=realm, from_id=b.id, to_id=c.id, relation_type="works_with")
+
+        results = await pg_client.traverse(
+            realm, "multi_nodes", a.id, ["multi_knows", "multi_works_with"], max_depth=2
+        )
+        reached = {r["id"] for r in results}
+        assert a.id in reached
+        assert b.id in reached
+        assert c.id in reached
+
+
+class TestTraverseIncomingDirection:
+    async def test_traverse_incoming(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        c = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "C"})
+        await pg_client.add_edge("links", realm=realm, from_id=a.id, to_id=c.id, relation_type="to")
+        await pg_client.add_edge("links", realm=realm, from_id=b.id, to_id=c.id, relation_type="to")
+
+        results = await pg_client.traverse(
+            realm, "nodes", c.id, ["links"], max_depth=1, direction="in"
+        )
+        reached = {r["id"] for r in results if r["depth"] > 0}
+        assert a.id in reached
+        assert b.id in reached
+
+
+class TestTraverseCycleProtection:
+    async def test_traverse_does_not_loop(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        await pg_client.add_edge("links", realm=realm, from_id=a.id, to_id=b.id, relation_type="to")
+        await pg_client.add_edge("links", realm=realm, from_id=b.id, to_id=a.id, relation_type="to")
+
+        results = await pg_client.traverse(
+            realm, "nodes", a.id, ["links"], max_depth=10
+        )
+        ids = [r["id"] for r in results]
+        assert len(ids) == len(set(ids))
+
+
+class TestVectorSearchScopes:
+    async def test_vector_search_data_scope(self, pg_client, clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = clean_realm
+        dim = 4
+        await pg_client.create_vertex_table("items", realm=realm, vector_dim=dim)
+        v = await pg_client.add_vertex("items", realm=realm, payload={"n": "A"}, embedding=[1.0, 0.0, 0.0, 0.0])
+        await pg_client.add_vertex_data("items", realm=realm, vertex_id=v.id,
+                                         payload={"v": 1}, embedding=[0.0, 1.0, 0.0, 0.0])
+
+        results = await pg_client.vector_search(
+            "items", realm=realm, query_vector=[0.0, 1.0, 0.0, 0.0],
+            top_k=5, search_scope="data"
+        )
+        assert len(results) >= 1
+
+    async def test_vector_search_both_scope(self, pg_client, clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = clean_realm
+        dim = 4
+        await pg_client.create_vertex_table("items", realm=realm, vector_dim=dim)
+        await pg_client.add_vertex("items", realm=realm, payload={"n": "A"}, embedding=[1.0, 0.0, 0.0, 0.0])
+
+        results = await pg_client.vector_search(
+            "items", realm=realm, query_vector=[1.0, 0.0, 0.0, 0.0],
+            top_k=5, search_scope="both"
+        )
+        assert len(results) >= 1
+
+    async def test_vector_search_l2_metric(self, pg_client, clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = clean_realm
+        dim = 4
+        await pg_client.create_vertex_table("items", realm=realm, vector_dim=dim)
+        await pg_client.add_vertex("items", realm=realm, payload={"n": "A"}, embedding=[1.0, 0.0, 0.0, 0.0])
+
+        results = await pg_client.vector_search(
+            "items", realm=realm, query_vector=[1.0, 0.0, 0.0, 0.0],
+            top_k=5, distance_metric="l2"
+        )
+        assert len(results) >= 1
+
+    async def test_vector_search_inner_product_metric(self, pg_client, clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = clean_realm
+        dim = 4
+        await pg_client.create_vertex_table("items", realm=realm, vector_dim=dim)
+        await pg_client.add_vertex("items", realm=realm, payload={"n": "A"}, embedding=[1.0, 0.0, 0.0, 0.0])
+
+        results = await pg_client.vector_search(
+            "items", realm=realm, query_vector=[1.0, 0.0, 0.0, 0.0],
+            top_k=5, distance_metric="inner_product"
+        )
+        assert len(results) >= 1
+
+    async def test_vector_search_all_spaces(self, pg_client, clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = clean_realm
+        dim = 4
+        await pg_client.create_vertex_table("items", realm=realm, vector_dim=dim)
+        await pg_client.add_vertex("items", realm=realm, space="a", payload={"n": "A"}, embedding=[1.0, 0.0, 0.0, 0.0])
+        await pg_client.add_vertex("items", realm=realm, space="b", payload={"n": "B"}, embedding=[0.9, 0.1, 0.0, 0.0])
+
+        results = await pg_client.vector_search(
+            "items", realm=realm, query_vector=[1.0, 0.0, 0.0, 0.0],
+            top_k=10, space="__all__"
+        )
+        assert len(results) == 2
+
+
+class TestEdgeVectorSearchFilters:
+    async def test_edge_vector_search_by_relation_type(self, pg_client, clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = clean_realm
+        dim = 4
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "rels", from_vertex_table="nodes", to_vertex_table="nodes",
+            realm=realm, vector_dim=dim
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        c = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "C"})
+        await pg_client.add_edge(
+            "rels", realm=realm, from_id=a.id, to_id=b.id,
+            relation_type="alpha", embedding=[1.0, 0.0, 0.0, 0.0]
+        )
+        await pg_client.add_edge(
+            "rels", realm=realm, from_id=a.id, to_id=c.id,
+            relation_type="beta", embedding=[0.9, 0.1, 0.0, 0.0]
+        )
+
+        results = await pg_client.vector_search_edges(
+            "rels", realm=realm, query_vector=[1.0, 0.0, 0.0, 0.0],
+            top_k=10, relation_type="alpha"
+        )
+        assert len(results) == 1
+        assert results[0][0].relation_type == "alpha"
+
+    async def test_edge_vector_search_by_space(self, pg_client, clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = clean_realm
+        dim = 4
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "rels", from_vertex_table="nodes", to_vertex_table="nodes",
+            realm=realm, vector_dim=dim
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        c = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "C"})
+        await pg_client.add_edge(
+            "rels", realm=realm, from_id=a.id, to_id=b.id,
+            relation_type="r", space="prod", embedding=[1.0, 0.0, 0.0, 0.0]
+        )
+        await pg_client.add_edge(
+            "rels", realm=realm, from_id=a.id, to_id=c.id,
+            relation_type="r", space="staging", embedding=[0.9, 0.1, 0.0, 0.0]
+        )
+
+        results = await pg_client.vector_search_edges(
+            "rels", realm=realm, query_vector=[1.0, 0.0, 0.0, 0.0],
+            top_k=10, space="prod"
+        )
+        assert len(results) == 1
+        assert results[0][0].space == "prod"
+
+
+class TestEdgeSchema:
+    async def test_get_edge_schema(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people", realm=realm)
+        await pg_client.create_vertex_table("companies", realm=realm)
+        await pg_client.create_edge_table(
+            "works_at", from_vertex_table="people", to_vertex_table="companies", realm=realm
+        )
+        schema = await pg_client.get_edge_schema("works_at", realm=realm)
+        assert schema["from_id"] == "people"
+        assert schema["to_id"] == "companies"
+
+    async def test_get_edge_schema_caching(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        s1 = await pg_client.get_edge_schema("links", realm=realm)
+        s2 = await pg_client.get_edge_schema("links", realm=realm)
+        assert s1 is s2
+
+
+class TestVertexSpaceInheritance:
+    async def test_add_edge_to_inherits_space(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, space="prod", payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, space="prod", payload={"n": "B"})
+        edge = await a.add_edge_to(to_id=b.id, edge_table="links")
+        assert edge.space == "prod"
+
+    async def test_add_edge_to_override_space(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, space="prod", payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, space="prod", payload={"n": "B"})
+        edge = await a.add_edge_to(to_id=b.id, edge_table="links", space="staging")
+        assert edge.space == "staging"
+
+
+class TestSchemaPerRealmTraversal:
+    async def test_traverse_in_schema_per_realm(self, pg_client_spr, clean_realm_spr):
+        realm = clean_realm_spr
+        await pg_client_spr.create_vertex_table("nodes", realm=realm)
+        await pg_client_spr.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client_spr.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client_spr.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        await pg_client_spr.add_edge("links", realm=realm, from_id=a.id, to_id=b.id, relation_type="to")
+
+        results = await pg_client_spr.traverse(
+            realm, "nodes", a.id, ["links"], max_depth=1
+        )
+        reached = {r["id"] for r in results}
+        assert a.id in reached
+        assert b.id in reached
+
+
+class TestVertexPayloadTypes:
+    async def test_nested_json_payload(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        payload = {"nested": {"list": [1, 2, 3], "obj": {"a": True}}, "top": "val"}
+        v = await pg_client.add_vertex("nodes", realm=realm, payload=payload)
+        assert v.payload["nested"]["list"] == [1, 2, 3]
+        assert v.payload["nested"]["obj"]["a"] is True
+
+        fetched = await pg_client.get_vertex("nodes", realm=realm, vertex_id=v.id)
+        assert fetched.payload == payload
+
+    async def test_empty_payload(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        v = await pg_client.add_vertex("nodes", realm=realm, payload={})
+        assert v.payload == {}
+
+    async def test_null_payload_defaults_to_empty(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        v = await pg_client.add_vertex("nodes", realm=realm, payload=None)
+        assert v.payload == {}
+
+
+class TestUpsertVertexSpaceUpdate:
+    async def test_upsert_updates_space(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        v1 = await pg_client.upsert_vertex("nodes", realm=realm, vertex_id=1,
+                                             space="prod", payload={"n": 1})
+        assert v1.space == "prod"
+        v2 = await pg_client.upsert_vertex("nodes", realm=realm, vertex_id=1,
+                                             space="staging", payload={"n": 2})
+        assert v2.space == "staging"
+        assert v2.payload["n"] == 2
+        assert v2.payload.get("n") == 2
+
+
+class TestEdgeGetNotFound:
+    async def test_get_edge_nonexistent(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        fetched = await pg_client.get_edge("links", realm=realm, edge_id="999999")
+        assert fetched is None
+
+    async def test_delete_edge_not_found(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        deleted = await pg_client.delete_edge("links", realm=realm, edge_id="999999")
+        assert deleted is False
+
+
+class TestVertexFqidFormat:
+    async def test_fqid_format(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people", realm=realm)
+        v = await pg_client.add_vertex("people", realm=realm, payload={"n": "A"})
+        assert v.fqid == f"{realm}/people/{v.id}"
+
+
+class TestEdgeFqidFormat:
+    async def test_edge_fqid_format(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people", realm=realm)
+        await pg_client.create_vertex_table("companies", realm=realm)
+        await pg_client.create_edge_table(
+            "works_at", from_vertex_table="people", to_vertex_table="companies", realm=realm
+        )
+        v1 = await pg_client.add_vertex("people", realm=realm, payload={"n": "A"})
+        v2 = await pg_client.add_vertex("companies", realm=realm, payload={"n": "X"})
+        e = await pg_client.add_edge(
+            "works_at", realm=realm, from_id=v1.id, to_id=v2.id, relation_type="r"
+        )
+        assert e.fqid == f"{realm}/people-companies/{e.id}"
+
+
+class TestVertexAddEdgeFrom:
+    async def test_add_edge_from(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        edge = await b.add_edge_from(from_id=a.id, edge_table="links")
+        assert edge.from_id == a.id
+        assert edge.to_id == b.id
+
+
+class TestEdgeDeleteViaModel:
+    async def test_edge_delete_via_model(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        e = await pg_client.add_edge("links", realm=realm, from_id=a.id, to_id=b.id, relation_type="to")
+        deleted = await e.delete()
+        assert deleted is True
+        fetched = await pg_client.get_edge("links", realm=realm, edge_id=e.id)
+        assert fetched is None
+
+
+class TestEdgeDataViaModel:
+    async def test_edge_data_via_model(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        e = await pg_client.add_edge("links", realm=realm, from_id=a.id, to_id=b.id, relation_type="to")
+
+        dr = await e.add_data(payload={"w": 1.0})
+        assert dr.payload["w"] == 1.0
+
+        records = await e.get_data()
+        assert len(records) == 1
+
+        latest = await e.get_latest_data()
+        assert latest is not None
+        assert latest.payload["w"] == 1.0
+
+        by_id = await e.get_data_by_id(data_id=dr.data_id)
+        assert by_id is not None
+
+
+class TestTraversalStepChaining:
+    async def test_chained_traversal(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        c = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "C"})
+        await pg_client.add_edge("links", realm=realm, from_id=a.id, to_id=b.id, relation_type="to")
+        await pg_client.add_edge("links", realm=realm, from_id=b.id, to_id=c.id, relation_type="to")
+
+        steps_1 = await a.outgoing("links")
+        assert len(steps_1) == 1
+        assert steps_1[0].vertex().payload["n"] == "B"
+
+        steps_2 = await steps_1[0].vertex().outgoing("links")
+        assert len(steps_2) == 1
+        assert steps_2[0].vertex().payload["n"] == "C"
+
+    async def test_step_add_edge_to(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("nodes", realm=realm)
+        await pg_client.create_edge_table(
+            "links", from_vertex_table="nodes", to_vertex_table="nodes", realm=realm
+        )
+        a = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "A"})
+        b = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "B"})
+        c = await pg_client.add_vertex("nodes", realm=realm, payload={"n": "C"})
+        await pg_client.add_edge("links", realm=realm, from_id=a.id, to_id=b.id, relation_type="to")
+
+        steps = await a.outgoing("links")
+        edge = await steps[0].add_edge_to(to_id=c.id, edge_table="links")
+        assert edge.from_id == b.id
+        assert edge.to_id == c.id
+
+
 # ------------------------------------------------- vertex data, schema-per-realm
 
 @pytest.mark.asyncio
@@ -981,9 +1665,7 @@ async def test_add_vertex_data_works_in_schema_per_realm():
     import os
     import uuid
 
-    dsn = os.getenv("POST_GRAPH_TEST_DSN")
-    if not dsn:
-        pytest.skip("POST_GRAPH_TEST_DSN not set")
+    dsn = os.getenv("POST_GRAPH_TEST_DSN", "postgresql://localhost/post_graph_test")
 
     realm = f"test_{uuid.uuid4().hex[:12]}"
     c = AsyncPostGraph(dsn=dsn, schema_per_realm=True)

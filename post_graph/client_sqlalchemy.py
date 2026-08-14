@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncConnection
-from sqlalchemy.exc import DataError, IntegrityError, ProgrammingError
+from sqlalchemy.exc import DBAPIError, DataError, IntegrityError, ProgrammingError
 
 from post_graph.errors import (
     VertexNotFoundError,
@@ -743,7 +743,7 @@ class SQLAlchemyPostGraph:
                     uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
                     _client=self
                 )
-            except (ProgrammingError, DataError) as e:
+            except (ProgrammingError, DataError, DBAPIError) as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
                 return None
@@ -1176,7 +1176,7 @@ class SQLAlchemyPostGraph:
                     uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
                     _client=self
                 )
-            except (ProgrammingError, DataError) as e:
+            except (ProgrammingError, DataError, DBAPIError) as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
                 return None
@@ -1736,14 +1736,14 @@ class SQLAlchemyPostGraph:
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload, timestamp, embedding)
                     VALUES (:realm, :id, CAST(:payload AS JSONB), :timestamp, CAST(:vec AS vector))
-                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    RETURNING data_id, realm, id, payload, timestamp, CAST(embedding AS TEXT) AS embedding_text
                     """
                     row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json, timestamp=timestamp, vec=vec_str)
                 else:
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload, embedding)
                     VALUES (:realm, :id, CAST(:payload AS JSONB), CAST(:vec AS vector))
-                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    RETURNING data_id, realm, id, payload, timestamp, CAST(embedding AS TEXT) AS embedding_text
                     """
                     row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json, vec=vec_str)
             else:
@@ -1751,14 +1751,14 @@ class SQLAlchemyPostGraph:
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload, timestamp)
                     VALUES (:realm, :id, CAST(:payload AS JSONB), :timestamp)
-                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    RETURNING data_id, realm, id, payload, timestamp, NULL AS embedding_text
                     """
                     row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json, timestamp=timestamp)
                 else:
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload)
                     VALUES (:realm, :id, CAST(:payload AS JSONB))
-                    RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_ref})->>'embedding' AS embedding_text
+                    RETURNING data_id, realm, id, payload, timestamp, NULL AS embedding_text
                     """
                     row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json)
 

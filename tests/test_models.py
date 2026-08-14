@@ -1,5 +1,8 @@
 """Tests for the post_graph.models module — pure unit tests, no database needed."""
 
+import json
+import copy
+
 import pytest
 from datetime import datetime, timezone
 
@@ -70,6 +73,49 @@ class TestVertex:
     def test_repr_excludes_client(self):
         v = Vertex(realm="r", id="1", _client="secret")
         assert "secret" not in repr(v)
+
+    def test_fqid_not_generated_without_realm(self):
+        v = Vertex(realm="", id="1", table_name="people")
+        assert v.fqid is None
+
+    def test_fqid_not_generated_without_id(self):
+        v = Vertex(realm="r", id="", table_name="people")
+        assert v.fqid is None
+
+    def test_to_dict_is_json_serializable(self):
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        v = Vertex(realm="r", id="1", table_name="t", payload={"nested": {"a": [1, 2]}},
+                   created_at=now, updated_at=now, embedding=[0.1], uuid="u")
+        serialized = json.dumps(v.to_dict())
+        assert isinstance(serialized, str)
+
+    def test_to_dict_keys_complete(self):
+        v = Vertex(realm="r", id="1", table_name="t")
+        d = v.to_dict()
+        expected_keys = {"realm", "id", "space", "uuid", "fqid", "payload",
+                         "created_at", "updated_at", "table_name", "embedding"}
+        assert set(d.keys()) == expected_keys
+
+    def test_payload_default_is_independent(self):
+        v1 = Vertex(realm="r", id="1")
+        v2 = Vertex(realm="r", id="2")
+        v1.payload["key"] = "val"
+        assert "key" not in v2.payload
+
+    def test_space_none_stays_none(self):
+        v = Vertex(realm="r", id="1", space=None)
+        assert v.space is None
+
+    def test_vertex_with_all_fields(self):
+        now = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        v = Vertex(
+            realm="acme", id="99", space="prod", table_name="agents",
+            payload={"role": "worker"}, created_at=now, updated_at=now,
+            fqid="acme/agents/99", embedding=[0.1, 0.2, 0.3],
+            uuid="550e8400-e29b-41d4-a716-446655440000"
+        )
+        assert v.fqid == "acme/agents/99"
+        assert len(v.embedding) == 3
 
 
 class TestVertexWithoutClient:
@@ -175,6 +221,40 @@ class TestEdge:
         e2 = Edge(**base, _client="c2")
         assert e1 == e2
 
+    def test_to_dict_keys_complete(self):
+        e = Edge(realm="r", id="1", from_id="a", to_id="b",
+                 relation_type="x", table_name="edges")
+        d = e.to_dict()
+        expected_keys = {"realm", "id", "space", "uuid", "fqid", "from_id",
+                         "to_id", "relation_type", "payload", "embedding",
+                         "created_at", "updated_at", "table_name"}
+        assert set(d.keys()) == expected_keys
+
+    def test_to_dict_is_json_serializable(self):
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        e = Edge(realm="r", id="1", from_id="a", to_id="b",
+                 relation_type="x", table_name="edges",
+                 created_at=now, updated_at=now, payload={"w": 0.5})
+        serialized = json.dumps(e.to_dict())
+        assert isinstance(serialized, str)
+
+    def test_payload_default_is_independent(self):
+        e1 = Edge(realm="r", id="1", from_id="a", to_id="b", relation_type="x")
+        e2 = Edge(realm="r", id="2", from_id="c", to_id="d", relation_type="y")
+        e1.payload["key"] = "val"
+        assert "key" not in e2.payload
+
+    def test_fqid_not_generated_without_realm(self):
+        e = Edge(realm="", id="1", from_id="a", to_id="b",
+                 relation_type="x", table_name="edges")
+        assert e.fqid is None
+
+    def test_edge_inequality(self):
+        base = dict(realm="r", from_id="a", to_id="b", relation_type="x")
+        e1 = Edge(id="1", **base)
+        e2 = Edge(id="2", **base)
+        assert e1 != e2
+
 
 class TestEdgeWithoutClient:
     def _edge(self):
@@ -231,6 +311,30 @@ class TestDataRecord:
         assert d["timestamp"] == now.isoformat()
         assert d["embedding"] == [1.0, 2.0]
 
+    def test_to_dict_keys_complete(self):
+        dr = DataRecord(data_id="1", realm="r", id="10")
+        d = dr.to_dict()
+        expected_keys = {"data_id", "realm", "id", "space", "payload",
+                         "timestamp", "embedding"}
+        assert set(d.keys()) == expected_keys
+
+    def test_to_dict_is_json_serializable(self):
+        now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        dr = DataRecord(data_id="1", realm="r", id="10",
+                        payload={"k": "v"}, timestamp=now)
+        serialized = json.dumps(dr.to_dict())
+        assert isinstance(serialized, str)
+
+    def test_to_dict_none_timestamp(self):
+        dr = DataRecord(data_id="1", realm="r", id="10")
+        assert dr.to_dict()["timestamp"] is None
+
+    def test_payload_default_is_independent(self):
+        d1 = DataRecord(data_id="1", realm="r", id="10")
+        d2 = DataRecord(data_id="2", realm="r", id="20")
+        d1.payload["k"] = "v"
+        assert "k" not in d2.payload
+
 
 # ---------------------------------------------------------------------------
 # TraversalStep
@@ -259,3 +363,75 @@ class TestTraversalStep:
         step = self._step()
         with pytest.raises(PostGraphError, match="client"):
             await step.add_edge_from(from_id="3", edge_table="e")
+
+    def test_edge_accessor(self):
+        step = self._step()
+        assert step.edge.id == "1"
+        assert step.edge.relation_type == "knows"
+
+    def test_vertex_returns_same_object_each_call(self):
+        step = self._step()
+        assert step.vertex() is step.vertex()
+
+
+# ---------------------------------------------------------------------------
+# Edge fqid with from/to vertex table names
+# ---------------------------------------------------------------------------
+
+class TestEdgeFqidFromVertexTables:
+    def test_edge_fqid_with_from_to_tables(self):
+        e = Edge(
+            realm="r", id="5", from_id="1", to_id="2",
+            relation_type="rel", table_name="people-companies",
+            fqid="r/people-companies/5"
+        )
+        assert e.fqid == "r/people-companies/5"
+
+
+# ---------------------------------------------------------------------------
+# Vertex / Edge copy independence
+# ---------------------------------------------------------------------------
+
+class TestCopyIndependence:
+    def test_vertex_copy_is_independent(self):
+        v1 = Vertex(realm="r", id="1", payload={"a": [1, 2]})
+        v2 = copy.deepcopy(v1)
+        v2.payload["a"].append(3)
+        assert v1.payload["a"] == [1, 2]
+
+    def test_edge_copy_is_independent(self):
+        e1 = Edge(realm="r", id="1", from_id="a", to_id="b",
+                  relation_type="x", payload={"k": [1]})
+        e2 = copy.deepcopy(e1)
+        e2.payload["k"].append(2)
+        assert e1.payload["k"] == [1]
+
+    def test_data_record_copy_is_independent(self):
+        d1 = DataRecord(data_id="1", realm="r", id="10", payload={"k": [1]})
+        d2 = copy.deepcopy(d1)
+        d2.payload["k"].append(2)
+        assert d1.payload["k"] == [1]
+
+
+# ---------------------------------------------------------------------------
+# Vertex / Edge repr
+# ---------------------------------------------------------------------------
+
+class TestReprFormats:
+    def test_vertex_repr_contains_id_and_realm(self):
+        v = Vertex(realm="acme", id="42", table_name="people")
+        r = repr(v)
+        assert "42" in r
+        assert "acme" in r
+
+    def test_edge_repr_contains_from_to(self):
+        e = Edge(realm="r", id="1", from_id="10", to_id="20",
+                 relation_type="knows", table_name="edges")
+        r = repr(e)
+        assert "10" in r
+        assert "20" in r
+
+    def test_data_record_repr_contains_data_id(self):
+        dr = DataRecord(data_id="7", realm="r", id="10")
+        r = repr(dr)
+        assert "7" in r

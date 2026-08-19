@@ -663,18 +663,27 @@ class AsyncPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
-    async def get_vertex(self, table_name: str, realm: str, vertex_id: str) -> Optional[Vertex]:
-        """Fetch a vertex by realm and id or uuid."""
+    async def get_vertex(self, table_name: str, realm: str, vertex_id: str, strict: bool = False) -> Optional[Vertex]:
+        """Fetch a vertex by realm and id or uuid.
+
+        When *strict* is True, raises VertexNotFoundError instead of returning None.
+        """
         self._validate_identifier(table_name)
         v_str = str(vertex_id).strip()
 
         if len(v_str) == 36 and '-' in v_str:
-            return await self.get_vertex_by_uuid(table_name, realm, v_str)
+            result = await self.get_vertex_by_uuid(table_name, realm, v_str)
+            if strict and result is None:
+                raise VertexNotFoundError(f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'.")
+            return result
 
         try:
             v_id_int = int(v_str.split('/')[-1]) if '/' in v_str else int(v_str)
         except ValueError:
-            return await self.get_vertex_by_uuid(table_name, realm, v_str)
+            result = await self.get_vertex_by_uuid(table_name, realm, v_str)
+            if strict and result is None:
+                raise VertexNotFoundError(f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'.")
+            return result
 
         table_ref = self._get_table_ref(table_name, realm)
 
@@ -713,9 +722,12 @@ class AsyncPostGraph:
 
         if isinstance(self.connection, asyncpg.Pool):
             async with self.connection.acquire() as conn:
-                return await _op(conn)
+                result = await _op(conn)
         else:
-            return await _op(self.connection)
+            result = await _op(self.connection)
+        if strict and result is None:
+            raise VertexNotFoundError(f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'.")
+        return result
 
     async def get_vertices(
         self,
@@ -778,8 +790,11 @@ class AsyncPostGraph:
         else:
             return await _op(self.connection)
 
-    async def get_vertex_by_uuid(self, table_name: str, realm: str, uuid: str) -> Optional[Vertex]:
-        """Fetch a vertex record by its UUID."""
+    async def get_vertex_by_uuid(self, table_name: str, realm: str, uuid: str, strict: bool = False) -> Optional[Vertex]:
+        """Fetch a vertex record by its UUID.
+
+        When *strict* is True, raises VertexNotFoundError instead of returning None.
+        """
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
         uuid_str = str(uuid).strip()
@@ -821,9 +836,12 @@ class AsyncPostGraph:
 
         if isinstance(self.connection, asyncpg.Pool):
             async with self.connection.acquire() as conn:
-                return await _op(conn)
+                result = await _op(conn)
         else:
-            return await _op(self.connection)
+            result = await _op(self.connection)
+        if strict and result is None:
+            raise VertexNotFoundError(f"Vertex with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'.")
+        return result
 
     async def vector_search(
         self,
@@ -1324,13 +1342,19 @@ class AsyncPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
-    async def get_edge(self, table_name: str, realm: str, edge_id: str) -> Optional[Edge]:
-        """Fetch an edge by realm and id or uuid."""
+    async def get_edge(self, table_name: str, realm: str, edge_id: str, strict: bool = False) -> Optional[Edge]:
+        """Fetch an edge by realm and id or uuid.
+
+        When *strict* is True, raises EdgeNotFoundError instead of returning None.
+        """
         self._validate_identifier(table_name)
         e_str = str(edge_id).strip()
 
         if len(e_str) == 36 and '-' in e_str:
-            return await self.get_edge_by_uuid(table_name, realm, e_str)
+            result = await self.get_edge_by_uuid(table_name, realm, e_str)
+            if strict and result is None:
+                raise EdgeNotFoundError(f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'.")
+            return result
 
         table_ref = self._get_table_ref(table_name, realm)
         query = f"""
@@ -1341,7 +1365,10 @@ class AsyncPostGraph:
         try:
             row = await self._fetchrow(query, realm, e_str)
             if not row:
-                return await self.get_edge_by_uuid(table_name, realm, e_str)
+                result = await self.get_edge_by_uuid(table_name, realm, e_str)
+                if strict and result is None:
+                    raise EdgeNotFoundError(f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'.")
+                return result
             return Edge(
                 realm=row['realm'],
                 id=str(row['id']),
@@ -1360,8 +1387,11 @@ class AsyncPostGraph:
         except asyncpg.UndefinedTableError:
             raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
-    async def get_edge_by_uuid(self, table_name: str, realm: str, uuid: str) -> Optional[Edge]:
-        """Fetch an edge record by its UUID."""
+    async def get_edge_by_uuid(self, table_name: str, realm: str, uuid: str, strict: bool = False) -> Optional[Edge]:
+        """Fetch an edge record by its UUID.
+
+        When *strict* is True, raises EdgeNotFoundError instead of returning None.
+        """
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
         uuid_str = str(uuid).strip()
@@ -1373,6 +1403,8 @@ class AsyncPostGraph:
         try:
             row = await self._fetchrow(query, realm, uuid_str)
             if not row:
+                if strict:
+                    raise EdgeNotFoundError(f"Edge with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'.")
                 return None
             return Edge(
                 realm=row['realm'],
@@ -1392,6 +1424,8 @@ class AsyncPostGraph:
         except asyncpg.UndefinedTableError:
             raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
         except (asyncpg.DataError, asyncpg.InvalidTextRepresentationError):
+            if strict:
+                raise EdgeNotFoundError(f"Edge with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'.")
             return None
 
     async def get_edges(

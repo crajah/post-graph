@@ -14,6 +14,7 @@ from post_graph import (
     TableExistsError,
     TableNotFoundError,
     VertexNotFoundError,
+    EdgeNotFoundError,
     CyclicReferenceError,
     PostGraphError,
 )
@@ -502,6 +503,53 @@ class TestEdgeCRUD:
         await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
         edges = await sa_client.get_edges("sa_knows", realm=realm)
         assert edges == []
+
+
+class TestStrictMode:
+    async def test_get_vertex_strict_raises(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        with pytest.raises(VertexNotFoundError):
+            await sa_client.get_vertex("sa_people", realm=realm, vertex_id="999999", strict=True)
+
+    async def test_get_vertex_strict_returns_when_found(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        v = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "found"})
+        fetched = await sa_client.get_vertex("sa_people", realm=realm, vertex_id=v.id, strict=True)
+        assert fetched is not None
+        assert fetched.id == v.id
+
+    async def test_get_vertex_by_uuid_strict_raises(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        with pytest.raises(VertexNotFoundError):
+            await sa_client.get_vertex_by_uuid("sa_people", realm=realm, uuid="00000000-0000-0000-0000-000000000000", strict=True)
+
+    async def test_get_edge_strict_raises(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
+        with pytest.raises(EdgeNotFoundError):
+            await sa_client.get_edge("sa_knows", realm=realm, edge_id="999999", strict=True)
+
+    async def test_get_edge_strict_returns_when_found(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
+        a = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "A"})
+        b = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "B"})
+        e = await sa_client.add_edge("sa_knows", realm=realm, from_id=a.id, to_id=b.id, relation_type="friends")
+        fetched = await sa_client.get_edge("sa_knows", realm=realm, edge_id=e.id, strict=True)
+        assert fetched is not None
+        assert fetched.id == e.id
+
+    async def test_get_edge_by_uuid_strict_raises(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
+        with pytest.raises(EdgeNotFoundError):
+            await sa_client.get_edge_by_uuid("sa_knows", realm=realm, uuid="00000000-0000-0000-0000-000000000000", strict=True)
 
 
 class TestCycleDetection:

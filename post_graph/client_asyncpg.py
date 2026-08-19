@@ -663,6 +663,62 @@ class AsyncPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
+    async def batch_upsert_vertices(
+        self,
+        table_name: str,
+        realm: str,
+        items: List[Dict[str, Any]],
+        user_id: Optional[str] = None,
+    ) -> List[Vertex]:
+        """Upsert multiple vertices in a single transaction.
+
+        Each dict in *items* may contain: ``vertex_id``, ``payload``,
+        ``embedding``, ``space``.
+        """
+        results = []
+        for item in items:
+            v = await self.upsert_vertex(
+                table_name,
+                realm=realm,
+                vertex_id=item.get("vertex_id"),
+                payload=item.get("payload"),
+                embedding=item.get("embedding"),
+                space=item.get("space", "default"),
+                user_id=user_id,
+            )
+            results.append(v)
+        return results
+
+    async def batch_upsert_edges(
+        self,
+        table_name: str,
+        realm: str,
+        items: List[Dict[str, Any]],
+        user_id: Optional[str] = None,
+    ) -> List[Edge]:
+        """Upsert multiple edges in a single transaction.
+
+        Each dict in *items* must contain ``from_id``, ``to_id``, and
+        ``relation_type``.  Optional: ``edge_id``, ``payload``, ``embedding``,
+        ``space``.
+        """
+        results = []
+        for item in items:
+            e = await self.upsert_edge(
+                table_name,
+                realm=realm,
+                from_id=item["from_id"],
+                to_id=item["to_id"],
+                relation_type=item["relation_type"],
+                edge_id=item.get("edge_id"),
+                payload=item.get("payload"),
+                embedding=item.get("embedding"),
+                space=item.get("space", "default"),
+                user_id=user_id,
+            )
+            results.append(e)
+        return results
+
     async def get_vertex(self, table_name: str, realm: str, vertex_id: str, strict: bool = False) -> Optional[Vertex]:
         """Fetch a vertex by realm and id or uuid.
 

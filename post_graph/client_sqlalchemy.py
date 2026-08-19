@@ -1193,6 +1193,76 @@ class SQLAlchemyPostGraph:
             async with self.engine_or_connection.connect() as conn:
                 return await _op(conn)
 
+    async def get_edges(
+        self,
+        table_name: str,
+        realm: str,
+        space: Optional[str] = None,
+        limit: Optional[int] = None,
+        relation_type: Optional[str] = None,
+    ) -> List[Edge]:
+        """Fetch all edges in a realm, optionally filtered by space and relation_type."""
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            params = {"realm": realm}
+            filters = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params["space"] = space
+                filters += " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            if relation_type:
+                params["relation_type"] = relation_type
+                filters += " AND t.relation_type = :relation_type"
+
+            limit_clause = ""
+            if limit:
+                params["limit"] = limit
+                limit_clause = " LIMIT :limit"
+
+            query = f"""
+            SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id,
+                   t.relation_type, t.payload, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text,
+                   to_jsonb(t)->>'embedding' AS embedding_text
+            FROM {table_ref} t
+            WHERE t.realm = :realm{filters}
+            ORDER BY t.id ASC{limit_clause}
+            """
+            try:
+                result = await conn.execute(text(query), params)
+                rows = result.mappings().all()
+                edges = []
+                for row in rows:
+                    emb = None
+                    if 'embedding_text' in row and row['embedding_text']:
+                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                    edges.append(Edge(
+                        realm=row['realm'],
+                        id=str(row['id']),
+                        fqid=row['fqid'],
+                        from_id=str(row['from_id']),
+                        to_id=str(row['to_id']),
+                        relation_type=row['relation_type'],
+                        space=row.get('space') or 'default',
+                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                        created_at=row['created_at'],
+                        updated_at=row['updated_at'],
+                        table_name=table_name,
+                        embedding=emb,
+                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
+                        _client=self
+                    ))
+                return edges
+            except ProgrammingError:
+                raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            return await _op(self.engine_or_connection)
+        else:
+            async with self.engine_or_connection.connect() as conn:
+                return await _op(conn)
+
     async def delete_edge(self, table_name: str, realm: str, edge_id: str, user_id: Optional[str] = None) -> bool:
         """Delete an edge."""
         self._validate_identifier(table_name)

@@ -449,6 +449,60 @@ class TestEdgeCRUD:
         e = await sa_client.add_edge("sa_srcTOsa_tgt", realm=realm, from_id=a.id, to_id=b.id, relation_type="linked")
         assert isinstance(e, Edge)
 
+    async def test_get_edges(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
+        a = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "A"})
+        b = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "B"})
+        await sa_client.add_edge("sa_knows", realm=realm, from_id=a.id, to_id=b.id, relation_type="friends")
+        await sa_client.add_edge("sa_knows", realm=realm, from_id=b.id, to_id=a.id, relation_type="colleagues")
+        edges = await sa_client.get_edges("sa_knows", realm=realm)
+        assert len(edges) == 2
+        assert all(isinstance(e, Edge) for e in edges)
+
+    async def test_get_edges_with_limit(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
+        a = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "A"})
+        b = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "B"})
+        for i in range(5):
+            await sa_client.add_edge("sa_knows", realm=realm, from_id=a.id, to_id=b.id, relation_type=f"r{i}")
+        edges = await sa_client.get_edges("sa_knows", realm=realm, limit=2)
+        assert len(edges) == 2
+
+    async def test_get_edges_filter_by_relation_type(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
+        a = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "A"})
+        b = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "B"})
+        await sa_client.add_edge("sa_knows", realm=realm, from_id=a.id, to_id=b.id, relation_type="friends")
+        await sa_client.add_edge("sa_knows", realm=realm, from_id=b.id, to_id=a.id, relation_type="colleagues")
+        edges = await sa_client.get_edges("sa_knows", realm=realm, relation_type="friends")
+        assert len(edges) == 1
+        assert edges[0].relation_type == "friends"
+
+    async def test_get_edges_filter_by_space(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
+        a = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "A"})
+        b = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "B"})
+        await sa_client.add_edge("sa_knows", realm=realm, from_id=a.id, to_id=b.id, relation_type="friends", space="prod")
+        await sa_client.add_edge("sa_knows", realm=realm, from_id=b.id, to_id=a.id, relation_type="colleagues", space="staging")
+        edges = await sa_client.get_edges("sa_knows", realm=realm, space="prod")
+        assert len(edges) == 1
+        assert edges[0].space == "prod"
+
+    async def test_get_edges_empty(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
+        edges = await sa_client.get_edges("sa_knows", realm=realm)
+        assert edges == []
+
 
 class TestCycleDetection:
     async def test_cycle_raises(self, sa_client, sa_clean_realm):

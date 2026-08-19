@@ -71,26 +71,34 @@ class AsyncPostGraph:
             return f'"{realm}"."{table_name}"'
         return f'"{table_name}"'
 
-    async def _execute(self, query: str, *args) -> str:
+    async def execute(self, query: str, *args) -> str:
+        """Execute a SQL statement and return the status string."""
         if isinstance(self.connection, asyncpg.Pool):
             async with self.connection.acquire() as conn:
                 return await conn.execute(query, *args)
         else:
             return await self.connection.execute(query, *args)
 
-    async def _fetch(self, query: str, *args) -> List[asyncpg.Record]:
+    async def fetch(self, query: str, *args) -> List[asyncpg.Record]:
+        """Execute a SQL query and return all rows."""
         if isinstance(self.connection, asyncpg.Pool):
             async with self.connection.acquire() as conn:
                 return await conn.fetch(query, *args)
         else:
             return await self.connection.fetch(query, *args)
 
-    async def _fetchrow(self, query: str, *args) -> Optional[asyncpg.Record]:
+    async def fetchrow(self, query: str, *args) -> Optional[asyncpg.Record]:
+        """Execute a SQL query and return the first row."""
         if isinstance(self.connection, asyncpg.Pool):
             async with self.connection.acquire() as conn:
                 return await conn.fetchrow(query, *args)
         else:
             return await self.connection.fetchrow(query, *args)
+
+    # Backward-compatible aliases
+    _execute = execute
+    _fetch = fetch
+    _fetchrow = fetchrow
 
     async def _run_in_tx(self, func, user_id: Optional[str] = None):
         """Helper to run a block of operations inside a transaction, setting the user_id session context."""

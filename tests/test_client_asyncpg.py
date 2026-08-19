@@ -1699,3 +1699,46 @@ async def test_add_vertex_data_works_in_schema_per_realm():
             await c._execute(f'DROP SCHEMA IF EXISTS "{realm}" CASCADE')
         finally:
             await c.close()
+
+
+# ---------------------------------------------------------------------------
+# Public fetch/execute/fetchrow API
+# ---------------------------------------------------------------------------
+
+class TestPublicQueryAPI:
+    @pytest.mark.asyncio
+    async def test_fetch_returns_rows(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people")
+        await pg_client.add_vertex("people", realm, payload={"k": "v1"})
+        await pg_client.add_vertex("people", realm, payload={"k": "v2"})
+        rows = await pg_client.fetch(
+            'SELECT payload FROM "people" WHERE realm = $1', realm
+        )
+        assert len(rows) == 2
+
+    @pytest.mark.asyncio
+    async def test_execute_runs_statement(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people")
+        await pg_client.add_vertex("people", realm, payload={"x": 1})
+        status = await pg_client.execute(
+            'DELETE FROM "people" WHERE realm = $1', realm
+        )
+        assert "DELETE" in status
+
+    @pytest.mark.asyncio
+    async def test_fetchrow_returns_one(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people")
+        await pg_client.add_vertex("people", realm, payload={"only": True})
+        row = await pg_client.fetchrow(
+            'SELECT payload FROM "people" WHERE realm = $1', realm
+        )
+        assert row is not None
+
+    @pytest.mark.asyncio
+    async def test_aliases_match_underlying_function(self, pg_client):
+        assert type(pg_client).fetch is type(pg_client)._fetch
+        assert type(pg_client).execute is type(pg_client)._execute
+        assert type(pg_client).fetchrow is type(pg_client)._fetchrow

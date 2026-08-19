@@ -2395,6 +2395,203 @@ class SQLAlchemyPostGraph:
                 async with self.engine_or_connection.connect() as conn:
                     return await _op(conn)
 
+    async def connected_components(
+        self,
+        realm: str,
+        vertex_table: str,
+        edge_tables: List[str],
+        direction: str = "both",
+    ) -> List[List[str]]:
+        """Return connected components as lists of vertex IDs."""
+        self._validate_identifier(vertex_table)
+        if direction not in ("out", "in", "both"):
+            raise ValueError("direction must be 'out', 'in', or 'both'")
+
+        vtable_ref = self._get_table_ref(vertex_table, realm)
+
+        async def _op(conn):
+            subqueries: list = []
+            for et in edge_tables:
+                self._validate_identifier(et)
+                schema = await self.get_edge_schema(conn, et, realm=realm)
+                eref = self._get_table_ref(et, realm)
+                if schema["from_id"] == vertex_table:
+                    if direction in ("out", "both"):
+                        subqueries.append(
+                            f"SELECT CAST(from_id AS text) AS src, CAST(to_id AS text) AS dst FROM {eref} WHERE realm = :realm"
+                        )
+                    if direction in ("in", "both"):
+                        subqueries.append(
+                            f"SELECT CAST(to_id AS text) AS src, CAST(from_id AS text) AS dst FROM {eref} WHERE realm = :realm"
+                        )
+                elif schema["to_id"] == vertex_table:
+                    if direction in ("out", "both"):
+                        subqueries.append(
+                            f"SELECT CAST(to_id AS text) AS src, CAST(from_id AS text) AS dst FROM {eref} WHERE realm = :realm"
+                        )
+                    if direction in ("in", "both"):
+                        subqueries.append(
+                            f"SELECT CAST(from_id AS text) AS src, CAST(to_id AS text) AS dst FROM {eref} WHERE realm = :realm"
+                        )
+
+            if not subqueries:
+                result = await conn.execute(
+                    text(f"SELECT CAST(id AS text) FROM {vtable_ref} WHERE realm = :realm"),
+                    {"realm": realm},
+                )
+                return [[str(r[0]) for r in result.fetchall()]]
+
+            edges_union = "\nUNION ALL\n".join(subqueries)
+            query = f"""
+            WITH all_edges AS ({edges_union}),
+            RECURSIVE flood AS (
+                SELECT CAST(id AS text) AS vid, CAST(id AS text) AS component_root
+                FROM {vtable_ref} WHERE realm = :realm
+
+                UNION
+
+                SELECT f.vid,
+                       LEAST(f.component_root, e.dst) AS component_root
+                FROM flood f
+                JOIN all_edges e ON f.vid = e.src
+            )
+            SELECT component_root, array_agg(DISTINCT vid) AS members
+            FROM flood
+            GROUP BY component_root
+            """
+            result = await conn.execute(text(query), {"realm": realm})
+            return [list(r[1]) for r in result.fetchall()]
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            return await _op(self.engine_or_connection)
+        else:
+            async with self.engine_or_connection.connect() as conn:
+                return await _op(conn)
+
+    async def weighted_shortest_path(
+        self,
+        realm: str,
+        start_table: str,
+        start_id: str,
+        target_table: str,
+        target_id: str,
+        edge_tables: List[str],
+        weight_field: str = "weight",
+        max_depth: int = 10,
+        direction: str = "out",
+    ) -> Optional[Dict[str, Any]]:
+        """Dijkstra-style weighted shortest path using a payload field as weight."""
+        self._validate_identifier(start_table)
+        self._validate_identifier(target_table)
+        if direction not in ("out", "in", "both"):
+            raise ValueError("direction must be 'out', 'in', or 'both'")
+
+        start_id_str = str(start_id).split("/")[-1] if "/" in str(start_id) else str(start_id)
+        target_id_str = str(target_id).split("/")[-1] if "/" in str(target_id) else str(target_id)
+
+        async def _op(conn):
+            subqueries: list = []
+            for et in edge_tables:
+                schema = await self.get_edge_schema(conn, et, realm=realm)
+                from_ref = schema["from_id"]
+                to_ref = schema["to_id"]
+                eref = self._get_table_ref(et, realm)
+
+                if direction in ("out", "both"):
+                    subqueries.append(f"""
+                    SELECT CAST(to_id AS text) AS next_id,
+                           CAST('{to_ref}' AS text) AS next_table,
+                           CAST(id AS text) AS edge_id,
+                           relation_type,
+                           CAST('{et}' AS text) AS edge_table,
+                           COALESCE(CAST(payload->>'{weight_field}' AS double precision), 1.0) AS edge_weight
+                    FROM {eref}
+                    WHERE realm = :realm
+                      AND from_id = (CASE WHEN t.current_id ~ '^[0-9]+$$' THEN CAST(t.current_id AS bigint) ELSE NULL END)
+                      AND t.current_table = '{from_ref}'
+                    """)
+
+                if direction in ("in", "both"):
+                    subqueries.append(f"""
+                    SELECT CAST(from_id AS text) AS next_id,
+                           CAST('{from_ref}' AS text) AS next_table,
+                           CAST(id AS text) AS edge_id,
+                           relation_type,
+                           CAST('{et}' AS text) AS edge_table,
+                           COALESCE(CAST(payload->>'{weight_field}' AS double precision), 1.0) AS edge_weight
+                    FROM {eref}
+                    WHERE realm = :realm
+                      AND to_id = (CASE WHEN t.current_id ~ '^[0-9]+$$' THEN CAST(t.current_id AS bigint) ELSE NULL END)
+                      AND t.current_table = '{to_ref}'
+                    """)
+
+            if not subqueries:
+                return None
+
+            union_all = "\nUNION ALL\n".join(subqueries)
+
+            cte_query = f"""
+            WITH RECURSIVE graph_traversal AS (
+                SELECT
+                    CAST(:start_id AS text) AS current_id,
+                    CAST(:start_table AS text) AS current_table,
+                    0 AS depth,
+                    ARRAY[CAST(:start_table AS text) || ':' || CAST(:start_id AS text)]::text[] AS path,
+                    ARRAY[]::text[] AS edge_path,
+                    ARRAY[]::text[] AS edge_ids,
+                    CAST(0.0 AS double precision) AS total_weight
+
+                UNION ALL
+
+                SELECT
+                    step.next_id,
+                    step.next_table,
+                    t.depth + 1,
+                    t.path || (step.next_table || ':' || step.next_id),
+                    t.edge_path || (step.edge_table || ':' || step.relation_type),
+                    t.edge_ids || step.edge_id,
+                    t.total_weight + step.edge_weight
+                FROM graph_traversal t
+                CROSS JOIN LATERAL (
+                    {union_all}
+                ) step
+                WHERE t.depth < :max_depth
+                  AND NOT ((step.next_table || ':' || step.next_id) = ANY(t.path))
+            )
+            SELECT depth, path, edge_path, edge_ids, total_weight
+            FROM graph_traversal
+            WHERE current_id = :target_id AND current_table = :target_table
+            ORDER BY total_weight ASC
+            LIMIT 1;
+            """
+
+            params = {
+                "realm": realm,
+                "start_id": start_id_str,
+                "start_table": start_table,
+                "max_depth": max_depth,
+                "target_id": target_id_str,
+                "target_table": target_table,
+            }
+
+            result = await conn.execute(text(cte_query), params)
+            row = result.mappings().first()
+            if not row:
+                return None
+            return {
+                "depth": row["depth"],
+                "path": list(row["path"]),
+                "edge_path": list(row["edge_path"]),
+                "edge_ids": list(row["edge_ids"]),
+                "total_weight": float(row["total_weight"]),
+            }
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            return await _op(self.engine_or_connection)
+        else:
+            async with self.engine_or_connection.connect() as conn:
+                return await _op(conn)
+
     async def add_vertex_data(
         self,
         table_name: str,

@@ -2115,3 +2115,53 @@ class TestMultiVector:
         )
         assert entity_results[0][0].payload["name"] == "a"
         assert fact_results[0][0].payload["name"] == "b"
+
+
+class TestWeightedShortestPath:
+    @pytest.fixture(autouse=True)
+    async def _setup(self, pg_client, clean_realm):
+        self.client = pg_client
+        self.realm = clean_realm
+        await pg_client.create_vertex_table("wsp_nodes")
+        self.a = await pg_client.add_vertex("wsp_nodes", clean_realm, payload={"name": "A"})
+        self.b = await pg_client.add_vertex("wsp_nodes", clean_realm, payload={"name": "B"})
+        self.c = await pg_client.add_vertex("wsp_nodes", clean_realm, payload={"name": "C"})
+        self.d = await pg_client.add_vertex("wsp_nodes", clean_realm, payload={"name": "D"})
+        await pg_client.create_edge_table("wsp_edges", from_vertex_table="wsp_nodes", to_vertex_table="wsp_nodes")
+        await pg_client.add_edge("wsp_edges", clean_realm, self.a.id, self.b.id, relation_type="road",
+                                 payload={"weight": 1.0})
+        await pg_client.add_edge("wsp_edges", clean_realm, self.b.id, self.c.id, relation_type="road",
+                                 payload={"weight": 1.0})
+        await pg_client.add_edge("wsp_edges", clean_realm, self.a.id, self.c.id, relation_type="road",
+                                 payload={"weight": 10.0})
+        await pg_client.add_edge("wsp_edges", clean_realm, self.c.id, self.d.id, relation_type="road",
+                                 payload={"weight": 1.0})
+
+    @pytest.mark.asyncio
+    async def test_weighted_shortest_path_prefers_light_edges(self):
+        result = await self.client.weighted_shortest_path(
+            self.realm, "wsp_nodes", self.a.id, "wsp_nodes", self.c.id,
+            edge_tables=["wsp_edges"],
+        )
+        assert result is not None
+        assert result["total_weight"] == 2.0
+        assert result["depth"] == 2
+
+    @pytest.mark.asyncio
+    async def test_weighted_shortest_path_no_path(self):
+        e = await self.client.add_vertex("wsp_nodes", self.realm, payload={"name": "E"})
+        result = await self.client.weighted_shortest_path(
+            self.realm, "wsp_nodes", self.a.id, "wsp_nodes", e.id,
+            edge_tables=["wsp_edges"],
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_weighted_path_returns_total_weight(self):
+        result = await self.client.weighted_shortest_path(
+            self.realm, "wsp_nodes", self.a.id, "wsp_nodes", self.d.id,
+            edge_tables=["wsp_edges"],
+        )
+        assert result is not None
+        assert result["total_weight"] == 3.0
+        assert result["depth"] == 3

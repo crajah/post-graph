@@ -1518,6 +1518,148 @@ class TestWeightedShortestPath:
         assert result["depth"] == 3
 
 
+class TestEdgeEmbedding:
+    async def test_add_edge_with_embedding(self, sa_client, sa_clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_enodes", realm=realm)
+        await sa_client.create_edge_table(
+            "sa_elinks", from_vertex_table="sa_enodes", to_vertex_table="sa_enodes",
+            realm=realm, vector_dim=3
+        )
+        a = await sa_client.add_vertex("sa_enodes", realm=realm, payload={"n": "A"})
+        b = await sa_client.add_vertex("sa_enodes", realm=realm, payload={"n": "B"})
+        emb = [0.5, 0.6, 0.7]
+        e = await sa_client.add_edge(
+            "sa_elinks", realm=realm, from_id=a.id, to_id=b.id,
+            relation_type="linked", embedding=emb
+        )
+        assert e.embedding is not None
+        assert len(e.embedding) == 3
+        for x, y in zip(e.embedding, emb):
+            assert abs(x - y) < 1e-6
+
+    async def test_upsert_edge_with_embedding(self, sa_client, sa_clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_enodes", realm=realm)
+        await sa_client.create_edge_table(
+            "sa_elinks", from_vertex_table="sa_enodes", to_vertex_table="sa_enodes",
+            realm=realm, vector_dim=3
+        )
+        a = await sa_client.add_vertex("sa_enodes", realm=realm, payload={"n": "A"})
+        b = await sa_client.add_vertex("sa_enodes", realm=realm, payload={"n": "B"})
+        e1 = await sa_client.add_edge(
+            "sa_elinks", realm=realm, from_id=a.id, to_id=b.id,
+            relation_type="linked", edge_id=1, embedding=[1.0, 0.0, 0.0]
+        )
+        e2 = await sa_client.upsert_edge(
+            "sa_elinks", realm=realm, from_id=a.id, to_id=b.id,
+            relation_type="linked", edge_id=1, embedding=[0.0, 1.0, 0.0]
+        )
+        assert e2.embedding is not None
+        assert abs(e2.embedding[1] - 1.0) < 1e-6
+
+    async def test_add_edge_without_embedding(self, sa_client, sa_clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_enodes", realm=realm)
+        await sa_client.create_edge_table(
+            "sa_elinks", from_vertex_table="sa_enodes", to_vertex_table="sa_enodes",
+            realm=realm, vector_dim=3
+        )
+        a = await sa_client.add_vertex("sa_enodes", realm=realm, payload={"n": "A"})
+        b = await sa_client.add_vertex("sa_enodes", realm=realm, payload={"n": "B"})
+        e = await sa_client.add_edge(
+            "sa_elinks", realm=realm, from_id=a.id, to_id=b.id,
+            relation_type="linked"
+        )
+        assert e.embedding is None
+
+
+class TestEdgeVectorSearch:
+    async def test_vector_search_edges(self, sa_client, sa_clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = sa_clean_realm
+        dim = 4
+        await sa_client.create_vertex_table("sa_vnodes", realm=realm)
+        await sa_client.create_edge_table(
+            "sa_vrels", from_vertex_table="sa_vnodes", to_vertex_table="sa_vnodes",
+            realm=realm, vector_dim=dim
+        )
+        a = await sa_client.add_vertex("sa_vnodes", realm=realm, payload={"n": "A"})
+        b = await sa_client.add_vertex("sa_vnodes", realm=realm, payload={"n": "B"})
+        await sa_client.add_edge(
+            "sa_vrels", realm=realm, from_id=a.id, to_id=b.id,
+            relation_type="linked", embedding=[1.0, 0.0, 0.0, 0.0]
+        )
+        results = await sa_client.vector_search_edges(
+            "sa_vrels", realm=realm, query_vector=[1.0, 0.0, 0.0, 0.0], top_k=5
+        )
+        assert len(results) == 1
+        assert results[0][0].relation_type == "linked"
+
+    async def test_edge_vector_search_by_relation_type(self, sa_client, sa_clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = sa_clean_realm
+        dim = 4
+        await sa_client.create_vertex_table("sa_vnodes", realm=realm)
+        await sa_client.create_edge_table(
+            "sa_vrels", from_vertex_table="sa_vnodes", to_vertex_table="sa_vnodes",
+            realm=realm, vector_dim=dim
+        )
+        a = await sa_client.add_vertex("sa_vnodes", realm=realm, payload={"n": "A"})
+        b = await sa_client.add_vertex("sa_vnodes", realm=realm, payload={"n": "B"})
+        c = await sa_client.add_vertex("sa_vnodes", realm=realm, payload={"n": "C"})
+        await sa_client.add_edge(
+            "sa_vrels", realm=realm, from_id=a.id, to_id=b.id,
+            relation_type="alpha", embedding=[1.0, 0.0, 0.0, 0.0]
+        )
+        await sa_client.add_edge(
+            "sa_vrels", realm=realm, from_id=a.id, to_id=c.id,
+            relation_type="beta", embedding=[0.9, 0.1, 0.0, 0.0]
+        )
+        results = await sa_client.vector_search_edges(
+            "sa_vrels", realm=realm, query_vector=[1.0, 0.0, 0.0, 0.0],
+            top_k=10, relation_type="alpha"
+        )
+        assert len(results) == 1
+        assert results[0][0].relation_type == "alpha"
+
+    async def test_edge_vector_search_by_space(self, sa_client, sa_clean_realm, has_pgvector):
+        if not has_pgvector:
+            pytest.skip("pgvector not available")
+        realm = sa_clean_realm
+        dim = 4
+        await sa_client.create_vertex_table("sa_vnodes", realm=realm)
+        await sa_client.create_edge_table(
+            "sa_vrels", from_vertex_table="sa_vnodes", to_vertex_table="sa_vnodes",
+            realm=realm, vector_dim=dim
+        )
+        a = await sa_client.add_vertex("sa_vnodes", realm=realm, payload={"n": "A"})
+        b = await sa_client.add_vertex("sa_vnodes", realm=realm, payload={"n": "B"})
+        c = await sa_client.add_vertex("sa_vnodes", realm=realm, payload={"n": "C"})
+        await sa_client.add_edge(
+            "sa_vrels", realm=realm, from_id=a.id, to_id=b.id,
+            relation_type="r", space="prod", embedding=[1.0, 0.0, 0.0, 0.0]
+        )
+        await sa_client.add_edge(
+            "sa_vrels", realm=realm, from_id=a.id, to_id=c.id,
+            relation_type="r", space="staging", embedding=[0.9, 0.1, 0.0, 0.0]
+        )
+        results = await sa_client.vector_search_edges(
+            "sa_vrels", realm=realm, query_vector=[1.0, 0.0, 0.0, 0.0],
+            top_k=10, space="prod"
+        )
+        assert len(results) == 1
+        assert results[0][0].space == "prod"
+
+
 class TestConnectionMode:
     async def test_works_with_async_connection(self, sa_engine, sa_clean_realm):
         """Test that SQLAlchemyPostGraph works when given an AsyncConnection."""

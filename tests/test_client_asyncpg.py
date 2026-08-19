@@ -1978,3 +1978,58 @@ class TestPublicQueryAPI:
         assert type(pg_client).fetch is type(pg_client)._fetch
         assert type(pg_client).execute is type(pg_client)._execute
         assert type(pg_client).fetchrow is type(pg_client)._fetchrow
+
+
+class TestFulltextSearch:
+    @pytest.fixture(autouse=True)
+    async def _setup(self, pg_client, clean_realm):
+        self.client = pg_client
+        self.realm = clean_realm
+        await pg_client.create_vertex_table("ft_verts")
+        self.v1 = await pg_client.add_vertex("ft_verts", clean_realm,
+                                              payload={"title": "PostgreSQL Performance Tuning", "body": "Indexes improve query speed"})
+        self.v2 = await pg_client.add_vertex("ft_verts", clean_realm,
+                                              payload={"title": "Python Web Development", "body": "Flask and Django are popular frameworks"})
+        self.v3 = await pg_client.add_vertex("ft_verts", clean_realm,
+                                              payload={"title": "Graph Databases Overview", "body": "Vertices and edges form a graph structure"})
+        await pg_client.create_edge_table("ft_edges", from_vertex_table="ft_verts", to_vertex_table="ft_verts")
+        await pg_client.add_edge("ft_edges", clean_realm, from_id=self.v1.id, to_id=self.v2.id,
+                                 relation_type="related_to",
+                                 payload={"note": "PostgreSQL can power Python web apps"})
+        await pg_client.add_edge("ft_edges", clean_realm, from_id=self.v2.id, to_id=self.v3.id,
+                                 relation_type="related_to",
+                                 payload={"note": "Graph databases use different paradigms"})
+
+    @pytest.mark.asyncio
+    async def test_search_all_fields(self):
+        results = await self.client.fulltext_search_vertices("ft_verts", self.realm, "PostgreSQL")
+        assert len(results) >= 1
+        assert any(r.id == self.v1.id for r in results)
+
+    @pytest.mark.asyncio
+    async def test_search_specific_field(self):
+        results = await self.client.fulltext_search_vertices("ft_verts", self.realm, "popular frameworks", fields=["body"])
+        assert len(results) >= 1
+        assert any(r.id == self.v2.id for r in results)
+
+    @pytest.mark.asyncio
+    async def test_search_no_match(self):
+        results = await self.client.fulltext_search_vertices("ft_verts", self.realm, "kubernetes containerization")
+        assert len(results) == 0
+
+    @pytest.mark.asyncio
+    async def test_search_edges(self):
+        results = await self.client.fulltext_search_edges("ft_edges", self.realm, "PostgreSQL Python")
+        assert len(results) >= 1
+        found_ids = {r.from_id for r in results}
+        assert self.v1.id in found_ids
+
+    @pytest.mark.asyncio
+    async def test_search_edges_specific_field(self):
+        results = await self.client.fulltext_search_edges("ft_edges", self.realm, "graph paradigms", fields=["note"])
+        assert len(results) >= 1
+
+    @pytest.mark.asyncio
+    async def test_search_with_limit(self):
+        results = await self.client.fulltext_search_vertices("ft_verts", self.realm, "PostgreSQL graph", limit=1)
+        assert len(results) <= 1

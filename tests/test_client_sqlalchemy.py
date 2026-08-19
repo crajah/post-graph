@@ -1320,6 +1320,61 @@ class TestEdgeSchema:
             assert s1 is s2
 
 
+class TestFulltextSearch:
+    @pytest.fixture(autouse=True)
+    async def _setup(self, sa_client, sa_clean_realm):
+        self.client = sa_client
+        self.realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_ft_verts")
+        self.v1 = await sa_client.add_vertex("sa_ft_verts", sa_clean_realm,
+                                              payload={"title": "PostgreSQL Performance Tuning", "body": "Indexes improve query speed"})
+        self.v2 = await sa_client.add_vertex("sa_ft_verts", sa_clean_realm,
+                                              payload={"title": "Python Web Development", "body": "Flask and Django are popular frameworks"})
+        self.v3 = await sa_client.add_vertex("sa_ft_verts", sa_clean_realm,
+                                              payload={"title": "Graph Databases Overview", "body": "Vertices and edges form a graph structure"})
+        await sa_client.create_edge_table("sa_ft_edges", from_vertex_table="sa_ft_verts", to_vertex_table="sa_ft_verts")
+        await sa_client.add_edge("sa_ft_edges", sa_clean_realm, from_id=self.v1.id, to_id=self.v2.id,
+                                 relation_type="related_to",
+                                 payload={"note": "PostgreSQL can power Python web apps"})
+        await sa_client.add_edge("sa_ft_edges", sa_clean_realm, from_id=self.v2.id, to_id=self.v3.id,
+                                 relation_type="related_to",
+                                 payload={"note": "Graph databases use different paradigms"})
+
+    @pytest.mark.asyncio
+    async def test_search_all_fields(self):
+        results = await self.client.fulltext_search_vertices("sa_ft_verts", self.realm, "PostgreSQL")
+        assert len(results) >= 1
+        assert any(r.id == self.v1.id for r in results)
+
+    @pytest.mark.asyncio
+    async def test_search_specific_field(self):
+        results = await self.client.fulltext_search_vertices("sa_ft_verts", self.realm, "popular frameworks", fields=["body"])
+        assert len(results) >= 1
+        assert any(r.id == self.v2.id for r in results)
+
+    @pytest.mark.asyncio
+    async def test_search_no_match(self):
+        results = await self.client.fulltext_search_vertices("sa_ft_verts", self.realm, "kubernetes containerization")
+        assert len(results) == 0
+
+    @pytest.mark.asyncio
+    async def test_search_edges(self):
+        results = await self.client.fulltext_search_edges("sa_ft_edges", self.realm, "PostgreSQL Python")
+        assert len(results) >= 1
+        found_ids = {r.from_id for r in results}
+        assert self.v1.id in found_ids
+
+    @pytest.mark.asyncio
+    async def test_search_edges_specific_field(self):
+        results = await self.client.fulltext_search_edges("sa_ft_edges", self.realm, "graph paradigms", fields=["note"])
+        assert len(results) >= 1
+
+    @pytest.mark.asyncio
+    async def test_search_with_limit(self):
+        results = await self.client.fulltext_search_vertices("sa_ft_verts", self.realm, "PostgreSQL graph", limit=1)
+        assert len(results) <= 1
+
+
 class TestConnectionMode:
     async def test_works_with_async_connection(self, sa_engine, sa_clean_realm):
         """Test that SQLAlchemyPostGraph works when given an AsyncConnection."""

@@ -1121,6 +1121,144 @@ class SQLAlchemyPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
+    async def fulltext_search_vertices(
+        self,
+        table_name: str,
+        realm: str,
+        query: str,
+        fields: Optional[List[str]] = None,
+        config: str = "english",
+        limit: int = 20,
+        space: Optional[str] = None,
+    ) -> List[Vertex]:
+        """Full-text search on vertex payload fields using tsvector/tsquery."""
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        if fields:
+            ts_expr = " || ' ' || ".join(f"COALESCE(t.payload->>'{f}', '')" for f in fields)
+        else:
+            ts_expr = """(SELECT string_agg(value::text, ' ') FROM jsonb_each_text(t.payload))"""
+
+        async def _op(conn):
+            params: Dict[str, Any] = {"realm": realm, "query": query, "lim": limit}
+            space_clause = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params["space"] = space
+                space_clause = " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            sql = f"""
+            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text,
+                   ts_rank(to_tsvector('{config}', {ts_expr}), plainto_tsquery('{config}', :query)) AS rank
+            FROM {table_ref} t
+            WHERE t.realm = :realm
+              AND to_tsvector('{config}', {ts_expr}) @@ plainto_tsquery('{config}', :query){space_clause}
+            ORDER BY rank DESC
+            LIMIT :lim
+            """
+            try:
+                result = await conn.execute(text(sql), params)
+                rows = result.mappings().all()
+                vertices = []
+                for row in rows:
+                    payload = row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload'])
+                    vertices.append(Vertex(
+                        realm=row['realm'],
+                        id=str(row['id']),
+                        space=row.get('space') or 'default',
+                        fqid=row['fqid'],
+                        payload=payload,
+                        created_at=row['created_at'],
+                        updated_at=row['updated_at'],
+                        table_name=table_name,
+                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
+                        _client=self
+                    ))
+                return vertices
+            except ProgrammingError as e:
+                if "does not exist" in str(e).lower():
+                    raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+                raise PostGraphError(f"Programming error: {e}")
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            return await _op(self.engine_or_connection)
+        else:
+            async with self.engine_or_connection.connect() as conn:
+                result = await _op(conn)
+                await conn.commit()
+                return result
+
+    async def fulltext_search_edges(
+        self,
+        table_name: str,
+        realm: str,
+        query: str,
+        fields: Optional[List[str]] = None,
+        config: str = "english",
+        limit: int = 20,
+        space: Optional[str] = None,
+    ) -> List[Edge]:
+        """Full-text search on edge payload fields using tsvector/tsquery."""
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        if fields:
+            ts_expr = " || ' ' || ".join(f"COALESCE(t.payload->>'{f}', '')" for f in fields)
+        else:
+            ts_expr = """(SELECT string_agg(value::text, ' ') FROM jsonb_each_text(t.payload))"""
+
+        async def _op(conn):
+            params: Dict[str, Any] = {"realm": realm, "query": query, "lim": limit}
+            space_clause = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params["space"] = space
+                space_clause = " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            sql = f"""
+            SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id,
+                   t.relation_type, t.payload, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text,
+                   ts_rank(to_tsvector('{config}', {ts_expr}), plainto_tsquery('{config}', :query)) AS rank
+            FROM {table_ref} t
+            WHERE t.realm = :realm
+              AND to_tsvector('{config}', {ts_expr}) @@ plainto_tsquery('{config}', :query){space_clause}
+            ORDER BY rank DESC
+            LIMIT :lim
+            """
+            try:
+                result = await conn.execute(text(sql), params)
+                rows = result.mappings().all()
+                edges = []
+                for row in rows:
+                    payload = row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload'])
+                    edges.append(Edge(
+                        realm=row['realm'],
+                        id=str(row['id']),
+                        fqid=row['fqid'],
+                        from_id=str(row['from_id']),
+                        to_id=str(row['to_id']),
+                        relation_type=row['relation_type'],
+                        space=row.get('space') or 'default',
+                        payload=payload,
+                        created_at=row['created_at'],
+                        updated_at=row['updated_at'],
+                        table_name=table_name,
+                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
+                        _client=self
+                    ))
+                return edges
+            except ProgrammingError as e:
+                if "does not exist" in str(e).lower():
+                    raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
+                raise PostGraphError(f"Programming error: {e}")
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            return await _op(self.engine_or_connection)
+        else:
+            async with self.engine_or_connection.connect() as conn:
+                result = await _op(conn)
+                await conn.commit()
+                return result
+
     async def add_edge(
         self,
         table_name: str,

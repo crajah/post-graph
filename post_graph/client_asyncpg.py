@@ -1286,6 +1286,150 @@ class AsyncPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
+    async def fulltext_search_vertices(
+        self,
+        table_name: str,
+        realm: str,
+        query: str,
+        fields: Optional[List[str]] = None,
+        config: str = "english",
+        limit: int = 20,
+        space: Optional[str] = None,
+    ) -> List[Vertex]:
+        """Full-text search on vertex payload fields using tsvector/tsquery.
+
+        *fields* lists payload keys to search (default: all text values).
+        *config* is the PostgreSQL text search configuration.
+        """
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        if fields:
+            ts_expr = " || ' ' || ".join(f"COALESCE(t.payload->>'{f}', '')" for f in fields)
+        else:
+            ts_expr = """(SELECT string_agg(value::text, ' ') FROM jsonb_each_text(t.payload))"""
+
+        async def _op(conn):
+            params: list = [realm, query, limit]
+            space_clause = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params.append(space)
+                space_clause = f" AND (t.space = ${len(params)} OR (${len(params)} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            sql = f"""
+            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text,
+                   to_jsonb(t)->>'embedding' AS embedding_text,
+                   ts_rank(to_tsvector('{config}', {ts_expr}), plainto_tsquery('{config}', $2)) AS rank
+            FROM {table_ref} t
+            WHERE t.realm = $1
+              AND to_tsvector('{config}', {ts_expr}) @@ plainto_tsquery('{config}', $2){space_clause}
+            ORDER BY rank DESC
+            LIMIT $3
+            """
+            try:
+                rows = await conn.fetch(sql, *params)
+                vertices = []
+                for row in rows:
+                    emb = None
+                    if 'embedding_text' in row and row['embedding_text']:
+                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                    vertices.append(Vertex(
+                        realm=row['realm'],
+                        id=str(row['id']),
+                        space=row.get('space') or 'default',
+                        fqid=row['fqid'],
+                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                        created_at=row['created_at'],
+                        updated_at=row['updated_at'],
+                        table_name=table_name,
+                        embedding=emb,
+                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
+                        _client=self
+                    ))
+                return vertices
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+
+        if isinstance(self.connection, asyncpg.Pool):
+            async with self.connection.acquire() as conn:
+                return await _op(conn)
+        else:
+            return await _op(self.connection)
+
+    async def fulltext_search_edges(
+        self,
+        table_name: str,
+        realm: str,
+        query: str,
+        fields: Optional[List[str]] = None,
+        config: str = "english",
+        limit: int = 20,
+        space: Optional[str] = None,
+    ) -> List[Edge]:
+        """Full-text search on edge payload fields using tsvector/tsquery.
+
+        *fields* lists payload keys to search (default: all text values).
+        *config* is the PostgreSQL text search configuration.
+        """
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        if fields:
+            ts_expr = " || ' ' || ".join(f"COALESCE(t.payload->>'{f}', '')" for f in fields)
+        else:
+            ts_expr = """(SELECT string_agg(value::text, ' ') FROM jsonb_each_text(t.payload))"""
+
+        async def _op(conn):
+            params: list = [realm, query, limit]
+            space_clause = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params.append(space)
+                space_clause = f" AND (t.space = ${len(params)} OR (${len(params)} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            sql = f"""
+            SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id,
+                   t.relation_type, t.payload, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text,
+                   to_jsonb(t)->>'embedding' AS embedding_text,
+                   ts_rank(to_tsvector('{config}', {ts_expr}), plainto_tsquery('{config}', $2)) AS rank
+            FROM {table_ref} t
+            WHERE t.realm = $1
+              AND to_tsvector('{config}', {ts_expr}) @@ plainto_tsquery('{config}', $2){space_clause}
+            ORDER BY rank DESC
+            LIMIT $3
+            """
+            try:
+                rows = await conn.fetch(sql, *params)
+                edges = []
+                for row in rows:
+                    emb = None
+                    if row.get('embedding_text'):
+                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                    edges.append(Edge(
+                        realm=row['realm'],
+                        id=str(row['id']),
+                        fqid=row['fqid'],
+                        from_id=str(row['from_id']),
+                        to_id=str(row['to_id']),
+                        relation_type=row['relation_type'],
+                        space=row.get('space') or 'default',
+                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                        created_at=row['created_at'],
+                        updated_at=row['updated_at'],
+                        table_name=table_name,
+                        embedding=emb,
+                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
+                        _client=self
+                    ))
+                return edges
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
+
+        if isinstance(self.connection, asyncpg.Pool):
+            async with self.connection.acquire() as conn:
+                return await _op(conn)
+        else:
+            return await _op(self.connection)
+
     async def add_edge(
         self,
         table_name: str,

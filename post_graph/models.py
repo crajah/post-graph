@@ -14,6 +14,7 @@ class Vertex:
     table_name: Optional[str] = None
     fqid: Optional[str] = None
     embedding: Optional[List[float]] = None
+    embeddings: Optional[Dict[str, List[float]]] = None
     uuid: Optional[str] = None
     _client: Optional[Any] = field(default=None, repr=False, compare=False)
 
@@ -23,7 +24,7 @@ class Vertex:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert the Vertex object to a dictionary."""
-        return {
+        d: Dict[str, Any] = {
             "realm": self.realm,
             "id": self.id,
             "space": self.space,
@@ -33,8 +34,11 @@ class Vertex:
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "table_name": self.table_name,
-            "embedding": self.embedding
+            "embedding": self.embedding,
         }
+        if self.embeddings:
+            d["embeddings"] = self.embeddings
+        return d
 
     async def to(self, edge_table: str, direction: str = 'out') -> List['TraversalStep']:
         """Traverse to neighboring vertices via the specified edge table (defaults to outgoing)."""
@@ -197,6 +201,7 @@ class Edge:
     table_name: Optional[str] = None
     fqid: Optional[str] = None
     embedding: Optional[List[float]] = None
+    embeddings: Optional[Dict[str, List[float]]] = None
     uuid: Optional[str] = None
     _client: Optional[Any] = field(default=None, repr=False, compare=False)
 
@@ -206,7 +211,7 @@ class Edge:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert the Edge object to a dictionary."""
-        return {
+        d: Dict[str, Any] = {
             "realm": self.realm,
             "id": self.id,
             "space": self.space,
@@ -219,8 +224,11 @@ class Edge:
             "embedding": self.embedding,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-            "table_name": self.table_name
+            "table_name": self.table_name,
         }
+        if self.embeddings:
+            d["embeddings"] = self.embeddings
+        return d
 
     async def delete(self, user_id: Optional[str] = None) -> bool:
         """Delete this edge."""

@@ -5,6 +5,7 @@ Tests are skipped when the database is unreachable.
 """
 
 import json
+import uuid
 
 import pytest
 from post_graph import (
@@ -649,6 +650,46 @@ class TestFindEdges:
         await pg_client.add_edge("knows", realm=realm, from_id=v1.id, to_id=v2.id, relation_type="friends", payload={"w": "1"})
         results = await pg_client.find_edges("knows", realm=realm, filters={"w": "999"})
         assert results == []
+
+
+class TestMultiRealm:
+    async def test_get_vertices_multi_realm(self, pg_client):
+        r1 = f"test_mr_{uuid.uuid4().hex[:8]}"
+        r2 = f"test_mr_{uuid.uuid4().hex[:8]}"
+        try:
+            await pg_client.create_vertex_table("people", realm=r1)
+            await pg_client.create_vertex_table("people", realm=r2)
+            await pg_client.add_vertex("people", realm=r1, payload={"name": "Alice"})
+            await pg_client.add_vertex("people", realm=r2, payload={"name": "Bob"})
+            results = await pg_client.get_vertices_multi_realm("people", realms=[r1, r2])
+            assert len(results) == 2
+            names = {v.payload["name"] for v in results}
+            assert names == {"Alice", "Bob"}
+        finally:
+            await pg_client.delete_realm(r1)
+            await pg_client.delete_realm(r2)
+
+    async def test_get_edges_multi_realm(self, pg_client):
+        r1 = f"test_mr_{uuid.uuid4().hex[:8]}"
+        r2 = f"test_mr_{uuid.uuid4().hex[:8]}"
+        try:
+            await pg_client.create_vertex_table("people", realm=r1)
+            await pg_client.create_vertex_table("people", realm=r2)
+            await pg_client.create_edge_table("knows", from_vertex_table="people", to_vertex_table="people", realm=r1)
+            await pg_client.create_edge_table("knows", from_vertex_table="people", to_vertex_table="people", realm=r2)
+            v1 = await pg_client.add_vertex("people", realm=r1, payload={"name": "A"})
+            v2 = await pg_client.add_vertex("people", realm=r1, payload={"name": "B"})
+            v3 = await pg_client.add_vertex("people", realm=r2, payload={"name": "C"})
+            v4 = await pg_client.add_vertex("people", realm=r2, payload={"name": "D"})
+            await pg_client.add_edge("knows", realm=r1, from_id=v1.id, to_id=v2.id, relation_type="friends")
+            await pg_client.add_edge("knows", realm=r2, from_id=v3.id, to_id=v4.id, relation_type="colleagues")
+            results = await pg_client.get_edges_multi_realm("knows", realms=[r1, r2])
+            assert len(results) == 2
+            realms_found = {e.realm for e in results}
+            assert realms_found == {r1, r2}
+        finally:
+            await pg_client.delete_realm(r1)
+            await pg_client.delete_realm(r2)
 
 
 class TestCycleDetection:

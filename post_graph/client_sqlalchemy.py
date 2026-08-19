@@ -1221,6 +1221,99 @@ class SQLAlchemyPostGraph:
             async with self.engine_or_connection.connect() as conn:
                 return await _op(conn)
 
+    async def vector_search_edges(
+        self,
+        table_name: str,
+        realm: str,
+        query_vector: List[float],
+        top_k: int = 5,
+        distance_metric: str = "cosine",
+        space: Optional[str] = None,
+        relation_type: Optional[str] = None,
+        column_name: str = "embedding",
+    ) -> List[Tuple[Edge, float]]:
+        """Perform vector similarity search over edge embeddings using pgvector.
+
+        Requires the edge table to have been created with a ``vector_dim``
+        or ``vector_columns``.
+
+        Distance metrics match :meth:`vector_search`: 'cosine', 'l2', 'inner_product'.
+        """
+        self._validate_identifier(table_name)
+        self._validate_identifier(column_name)
+        col = f'"{column_name}"'
+        table_ref = self._get_table_ref(table_name, realm)
+        vec_str = f"[{','.join(str(x) for x in query_vector)}]"
+
+        op = "<=>"
+        if distance_metric == "l2":
+            op = "<->"
+        elif distance_metric == "inner_product":
+            op = "<#>"
+
+        effective_space = space if space and space != RESERVED_SPACE_ALL else None
+        filters = ""
+        if effective_space:
+            filters += " AND t.space = :space"
+        if relation_type:
+            filters += " AND t.relation_type = :rel_type"
+
+        query = f"""
+        SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type,
+               t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text,
+               CAST(t.{col} AS TEXT) AS embedding_text,
+               (t.{col} {op} CAST(:vec AS vector)) AS distance
+        FROM {table_ref} t
+        WHERE t.realm = :realm AND t.{col} IS NOT NULL{filters}
+        ORDER BY t.{col} {op} CAST(:vec AS vector) ASC
+        LIMIT :top_k
+        """
+
+        fetch_params: Dict[str, Any] = {"realm": realm, "vec": vec_str, "top_k": top_k}
+        if effective_space:
+            fetch_params["space"] = effective_space
+        if relation_type:
+            fetch_params["rel_type"] = relation_type
+
+        async def _op(conn):
+            try:
+                rows = await self._fetch(conn, query, **fetch_params)
+            except ProgrammingError as e:
+                if "does not exist" in str(e).lower():
+                    raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
+                logger.warning(f"Vector search on edges failed: {e}")
+                return []
+
+            results = []
+            for r in rows:
+                emb = None
+                if r['embedding_text']:
+                    emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+                e = Edge(
+                    realm=r['realm'],
+                    id=str(r['id']),
+                    from_id=str(r['from_id']),
+                    to_id=str(r['to_id']),
+                    relation_type=r['relation_type'],
+                    space=r.get('space') or 'default',
+                    fqid=r['fqid'],
+                    payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
+                    embedding=emb,
+                    created_at=r['created_at'],
+                    updated_at=r['updated_at'],
+                    table_name=table_name,
+                    uuid=str(r['uuid_text']) if r.get('uuid_text') else None,
+                    _client=self
+                )
+                results.append((e, float(r['distance'])))
+            return results
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            return await _op(self.engine_or_connection)
+        else:
+            async with self.engine_or_connection.connect() as conn:
+                return await _op(conn)
+
     async def delete_vertex(self, table_name: str, realm: str, vertex_id: str, user_id: Optional[str] = None) -> bool:
         """Delete a vertex. Cascading foreign keys will automatically delete referencing edges."""
         self._validate_identifier(table_name)
@@ -1229,7 +1322,7 @@ class SQLAlchemyPostGraph:
 
         async def _op(conn):
             query = f"""
-            DELETE FROM {table_ref} 
+            DELETE FROM {table_ref}
             WHERE realm = :realm AND ((CASE WHEN :id ~ '^[0-9]+$' THEN id = CAST(:id AS BIGINT) ELSE FALSE END) OR fqid = :id)
             """
             try:
@@ -1391,14 +1484,20 @@ class SQLAlchemyPostGraph:
         payload: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
         check_cycle: Union[bool, List[str]] = False,
-        space: Optional[str] = "default"
+        space: Optional[str] = "default",
+        embedding: Optional[List[float]] = None
     ) -> Edge:
-        """Add a new edge. Raises TableExistsError if it already exists."""
+        """Add a new edge. Raises TableExistsError if it already exists.
+
+        ``embedding`` is stored when the edge table was created with a
+        ``vector_dim``, enabling semantic search over relationships.
+        """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
             raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
+        vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
         eff_space = space or "default"
 
         async def _op(conn):
@@ -1421,7 +1520,7 @@ class SQLAlchemyPostGraph:
 
             if check_cycle:
                 cycle_tables = check_cycle if isinstance(check_cycle, list) else [table_name]
-                
+
                 path = await self.shortest_path(
                     realm=realm,
                     start_table=to_table,
@@ -1438,21 +1537,32 @@ class SQLAlchemyPostGraph:
                         f"Existing path: {' -> '.join(path['path'])}"
                     )
 
-            query = f"""
-            INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
-            VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB))
-            RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
-            """
+            if vec_str:
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload, embedding)
+                VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB), CAST(:vec AS vector))
+                RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
+                """
+                kwargs = {"realm": realm, "id": e_id_int, "space": eff_space, "from_id": from_id_int,
+                          "to_id": to_id_int, "relation_type": relation_type, "payload": payload_json, "vec": vec_str}
+            else:
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
+                VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB))
+                RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
+                """
+                kwargs = {"realm": realm, "id": e_id_int, "space": eff_space, "from_id": from_id_int,
+                          "to_id": to_id_int, "relation_type": relation_type, "payload": payload_json}
+
             try:
-                row = await self._fetchrow(
-                    conn, query,
-                    realm=realm, id=e_id_int, space=eff_space, from_id=from_id_int, to_id=to_id_int,
-                    relation_type=relation_type, payload=payload_json
-                )
+                row = await self._fetchrow(conn, query, **kwargs)
                 if edge_id is not None:
                     await conn.execute(
                         text(f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))")
                     )
+                emb = None
+                if 'embedding_text' in row and row['embedding_text']:
+                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
                 return Edge(
                     realm=row['realm'],
                     id=str(row['id']),
@@ -1462,6 +1572,7 @@ class SQLAlchemyPostGraph:
                     relation_type=row['relation_type'],
                     space=row.get('space') or 'default',
                     payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                    embedding=emb,
                     created_at=row['created_at'],
                     updated_at=row['updated_at'],
                     table_name=table_name,
@@ -1494,14 +1605,20 @@ class SQLAlchemyPostGraph:
         payload: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
         check_cycle: Union[bool, List[str]] = False,
-        space: Optional[str] = "default"
+        space: Optional[str] = "default",
+        embedding: Optional[List[float]] = None
     ) -> Edge:
-        """Upsert an edge (merges payload JSONB on conflict)."""
+        """Upsert an edge (merges payload JSONB on conflict).
+
+        ``embedding`` is stored when the edge table has a vector column, and
+        replaces any previous embedding for the edge.
+        """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
             raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
+        vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
         eff_space = space or "default"
 
         async def _op(conn):
@@ -1524,7 +1641,7 @@ class SQLAlchemyPostGraph:
 
             if check_cycle:
                 cycle_tables = check_cycle if isinstance(check_cycle, list) else [table_name]
-                
+
                 path = await self.shortest_path(
                     realm=realm,
                     start_table=to_table,
@@ -1539,24 +1656,43 @@ class SQLAlchemyPostGraph:
                     from post_graph.errors import CyclicReferenceError
                     raise CyclicReferenceError(f"Adding edge from '{from_id}' to '{to_id}' in table '{table_name}' would create a cycle.")
 
-            query = f"""
-            INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
-            VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB))
-            ON CONFLICT (realm, id) DO UPDATE
-            SET space = EXCLUDED.space,
-                from_id = EXCLUDED.from_id,
-                to_id = EXCLUDED.to_id,
-                relation_type = EXCLUDED.relation_type,
-                payload = {table_ref}.payload || EXCLUDED.payload,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
-            """
+            if vec_str:
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload, embedding)
+                VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB), CAST(:vec AS vector))
+                ON CONFLICT (realm, id) DO UPDATE
+                SET space = EXCLUDED.space,
+                    from_id = EXCLUDED.from_id,
+                    to_id = EXCLUDED.to_id,
+                    relation_type = EXCLUDED.relation_type,
+                    payload = {table_ref}.payload || EXCLUDED.payload,
+                    embedding = EXCLUDED.embedding,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
+                """
+                kwargs = {"realm": realm, "id": e_id_int, "space": eff_space, "from_id": from_id_int,
+                          "to_id": to_id_int, "relation_type": relation_type, "payload": payload_json, "vec": vec_str}
+            else:
+                query = f"""
+                INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
+                VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB))
+                ON CONFLICT (realm, id) DO UPDATE
+                SET space = EXCLUDED.space,
+                    from_id = EXCLUDED.from_id,
+                    to_id = EXCLUDED.to_id,
+                    relation_type = EXCLUDED.relation_type,
+                    payload = {table_ref}.payload || EXCLUDED.payload,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
+                """
+                kwargs = {"realm": realm, "id": e_id_int, "space": eff_space, "from_id": from_id_int,
+                          "to_id": to_id_int, "relation_type": relation_type, "payload": payload_json}
+
             try:
-                row = await self._fetchrow(
-                    conn, query,
-                    realm=realm, id=e_id_int, space=eff_space, from_id=from_id_int, to_id=to_id_int,
-                    relation_type=relation_type, payload=payload_json
-                )
+                row = await self._fetchrow(conn, query, **kwargs)
+                emb = None
+                if 'embedding_text' in row and row['embedding_text']:
+                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
                 return Edge(
                     realm=row['realm'],
                     id=str(row['id']),
@@ -1566,6 +1702,7 @@ class SQLAlchemyPostGraph:
                     relation_type=row['relation_type'],
                     space=row.get('space') or 'default',
                     payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                    embedding=emb,
                     created_at=row['created_at'],
                     updated_at=row['updated_at'],
                     table_name=table_name,

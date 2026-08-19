@@ -725,6 +725,75 @@ class SQLAlchemyPostGraph:
             async with self.engine_or_connection.connect() as conn:
                 return await _op(conn)
 
+    async def find_vertices(
+        self,
+        table_name: str,
+        realm: str,
+        filters: Dict[str, Any],
+        space: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Vertex]:
+        """Find vertices whose payload matches the given key-value filters.
+
+        Each entry in *filters* becomes a ``payload->>'key' = value`` clause
+        (all ANDed together).
+        """
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            params: Dict[str, Any] = {"realm": realm}
+            clauses = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params["space"] = space
+                clauses += " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            for i, (key, val) in enumerate(filters.items()):
+                pname = f"fv{i}"
+                params[pname] = str(val)
+                clauses += f" AND t.payload->>'{key}' = :{pname}"
+            limit_clause = ""
+            if limit:
+                params["limit"] = limit
+                limit_clause = " LIMIT :limit"
+            query = f"""
+            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text,
+                   to_jsonb(t)->>'embedding' AS embedding_text
+            FROM {table_ref} t
+            WHERE t.realm = :realm{clauses}
+            ORDER BY t.id ASC{limit_clause}
+            """
+            try:
+                result = await conn.execute(text(query), params)
+                rows = result.mappings().all()
+                vertices = []
+                for row in rows:
+                    emb = None
+                    if 'embedding_text' in row and row['embedding_text']:
+                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                    vertices.append(Vertex(
+                        realm=row['realm'],
+                        id=str(row['id']),
+                        space=row.get('space') or 'default',
+                        fqid=row['fqid'],
+                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                        created_at=row['created_at'],
+                        updated_at=row['updated_at'],
+                        table_name=table_name,
+                        embedding=emb,
+                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
+                        _client=self
+                    ))
+                return vertices
+            except ProgrammingError:
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            return await _op(self.engine_or_connection)
+        else:
+            async with self.engine_or_connection.connect() as conn:
+                return await _op(conn)
+
     async def get_vertex_by_uuid(self, table_name: str, realm: str, uuid: str, strict: bool = False) -> Optional[Vertex]:
         """Fetch a vertex record by its UUID.
 
@@ -1260,6 +1329,83 @@ class SQLAlchemyPostGraph:
                    to_jsonb(t)->>'embedding' AS embedding_text
             FROM {table_ref} t
             WHERE t.realm = :realm{filters}
+            ORDER BY t.id ASC{limit_clause}
+            """
+            try:
+                result = await conn.execute(text(query), params)
+                rows = result.mappings().all()
+                edges = []
+                for row in rows:
+                    emb = None
+                    if 'embedding_text' in row and row['embedding_text']:
+                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                    edges.append(Edge(
+                        realm=row['realm'],
+                        id=str(row['id']),
+                        fqid=row['fqid'],
+                        from_id=str(row['from_id']),
+                        to_id=str(row['to_id']),
+                        relation_type=row['relation_type'],
+                        space=row.get('space') or 'default',
+                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                        created_at=row['created_at'],
+                        updated_at=row['updated_at'],
+                        table_name=table_name,
+                        embedding=emb,
+                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
+                        _client=self
+                    ))
+                return edges
+            except ProgrammingError:
+                raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            return await _op(self.engine_or_connection)
+        else:
+            async with self.engine_or_connection.connect() as conn:
+                return await _op(conn)
+
+    async def find_edges(
+        self,
+        table_name: str,
+        realm: str,
+        filters: Dict[str, Any],
+        space: Optional[str] = None,
+        relation_type: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Edge]:
+        """Find edges whose payload matches the given key-value filters.
+
+        Each entry in *filters* becomes a ``payload->>'key' = value`` clause
+        (all ANDed together).  Optional *relation_type* further restricts results.
+        """
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            params: Dict[str, Any] = {"realm": realm}
+            clauses = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params["space"] = space
+                clauses += " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            if relation_type:
+                params["relation_type"] = relation_type
+                clauses += " AND t.relation_type = :relation_type"
+            for i, (key, val) in enumerate(filters.items()):
+                pname = f"fe{i}"
+                params[pname] = str(val)
+                clauses += f" AND t.payload->>'{key}' = :{pname}"
+            limit_clause = ""
+            if limit:
+                params["limit"] = limit
+                limit_clause = " LIMIT :limit"
+            query = f"""
+            SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id,
+                   t.relation_type, t.payload, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text,
+                   to_jsonb(t)->>'embedding' AS embedding_text
+            FROM {table_ref} t
+            WHERE t.realm = :realm{clauses}
             ORDER BY t.id ASC{limit_clause}
             """
             try:

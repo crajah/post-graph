@@ -578,6 +578,79 @@ class TestStrictMode:
             await pg_client.get_edge_by_uuid("knows", realm=realm, uuid="00000000-0000-0000-0000-000000000000", strict=True)
 
 
+class TestFindVertices:
+    async def test_find_by_payload(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people", realm=realm)
+        await pg_client.add_vertex("people", realm=realm, payload={"name": "Alice", "role": "eng"})
+        await pg_client.add_vertex("people", realm=realm, payload={"name": "Bob", "role": "pm"})
+        await pg_client.add_vertex("people", realm=realm, payload={"name": "Carol", "role": "eng"})
+        results = await pg_client.find_vertices("people", realm=realm, filters={"role": "eng"})
+        assert len(results) == 2
+        names = {v.payload["name"] for v in results}
+        assert names == {"Alice", "Carol"}
+
+    async def test_find_multiple_filters(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people", realm=realm)
+        await pg_client.add_vertex("people", realm=realm, payload={"name": "Alice", "role": "eng"})
+        await pg_client.add_vertex("people", realm=realm, payload={"name": "Bob", "role": "eng"})
+        results = await pg_client.find_vertices("people", realm=realm, filters={"role": "eng", "name": "Alice"})
+        assert len(results) == 1
+        assert results[0].payload["name"] == "Alice"
+
+    async def test_find_no_match(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people", realm=realm)
+        await pg_client.add_vertex("people", realm=realm, payload={"name": "Alice"})
+        results = await pg_client.find_vertices("people", realm=realm, filters={"name": "Nobody"})
+        assert results == []
+
+    async def test_find_with_limit(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people", realm=realm)
+        for i in range(5):
+            await pg_client.add_vertex("people", realm=realm, payload={"group": "a"})
+        results = await pg_client.find_vertices("people", realm=realm, filters={"group": "a"}, limit=2)
+        assert len(results) == 2
+
+
+class TestFindEdges:
+    async def test_find_by_payload(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people", realm=realm)
+        await pg_client.create_edge_table("knows", from_vertex_table="people", to_vertex_table="people", realm=realm)
+        v1 = await pg_client.add_vertex("people", realm=realm, payload={"name": "A"})
+        v2 = await pg_client.add_vertex("people", realm=realm, payload={"name": "B"})
+        await pg_client.add_edge("knows", realm=realm, from_id=v1.id, to_id=v2.id, relation_type="friends", payload={"weight": "5"})
+        await pg_client.add_edge("knows", realm=realm, from_id=v2.id, to_id=v1.id, relation_type="friends", payload={"weight": "3"})
+        results = await pg_client.find_edges("knows", realm=realm, filters={"weight": "5"})
+        assert len(results) == 1
+        assert results[0].payload["weight"] == "5"
+
+    async def test_find_with_relation_type(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people", realm=realm)
+        await pg_client.create_edge_table("knows", from_vertex_table="people", to_vertex_table="people", realm=realm)
+        v1 = await pg_client.add_vertex("people", realm=realm, payload={"name": "A"})
+        v2 = await pg_client.add_vertex("people", realm=realm, payload={"name": "B"})
+        await pg_client.add_edge("knows", realm=realm, from_id=v1.id, to_id=v2.id, relation_type="friends", payload={"tag": "x"})
+        await pg_client.add_edge("knows", realm=realm, from_id=v2.id, to_id=v1.id, relation_type="colleagues", payload={"tag": "x"})
+        results = await pg_client.find_edges("knows", realm=realm, filters={"tag": "x"}, relation_type="friends")
+        assert len(results) == 1
+        assert results[0].relation_type == "friends"
+
+    async def test_find_no_match(self, pg_client, clean_realm):
+        realm = clean_realm
+        await pg_client.create_vertex_table("people", realm=realm)
+        await pg_client.create_edge_table("knows", from_vertex_table="people", to_vertex_table="people", realm=realm)
+        v1 = await pg_client.add_vertex("people", realm=realm, payload={"name": "A"})
+        v2 = await pg_client.add_vertex("people", realm=realm, payload={"name": "B"})
+        await pg_client.add_edge("knows", realm=realm, from_id=v1.id, to_id=v2.id, relation_type="friends", payload={"w": "1"})
+        results = await pg_client.find_edges("knows", realm=realm, filters={"w": "999"})
+        assert results == []
+
+
 class TestCycleDetection:
     async def test_cycle_raises(self, pg_client, clean_realm):
         realm = clean_realm

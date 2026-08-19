@@ -1,0 +1,807 @@
+---
+layout: null
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PG19 Property Graphs × post-graph</title>
+<style>
+  /* ── Tokens ── */
+  :root {
+    --ink: #1a1e2e;
+    --ink-secondary: #4a5068;
+    --ground: #f7f6f4;
+    --surface: #ebeef2;
+    --surface-alt: #e2e6ec;
+    --accent: #2d6a8f;
+    --accent-dim: #2d6a8f22;
+    --highlight: #c4862e;
+    --highlight-dim: #c4862e18;
+    --border: #d0d4dc;
+    --code-bg: #f0f2f6;
+    --positive: #2a7d4f;
+    --positive-dim: #2a7d4f15;
+    --caution: #b07d1a;
+    --caution-dim: #b07d1a15;
+    --negative: #a03030;
+    --negative-dim: #a0303015;
+    --neutral-dim: #6b728015;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #e0e2ea;
+      --ink-secondary: #9499ae;
+      --ground: #13151e;
+      --surface: #1c1f2c;
+      --surface-alt: #252838;
+      --accent: #5ba4cc;
+      --accent-dim: #5ba4cc1a;
+      --highlight: #daa04a;
+      --highlight-dim: #daa04a18;
+      --border: #2e3244;
+      --code-bg: #1a1d28;
+      --positive: #4aad72;
+      --positive-dim: #4aad7218;
+      --caution: #d4a030;
+      --caution-dim: #d4a03018;
+      --negative: #d05050;
+      --negative-dim: #d0505018;
+      --neutral-dim: #9499ae15;
+    }
+  }
+
+  /* ── Base ── */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: "Inter", -apple-system, system-ui, "Segoe UI", sans-serif;
+    background: var(--ground);
+    color: var(--ink);
+    line-height: 1.65;
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── Layout ── */
+  .page {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 3rem 1.5rem 5rem;
+  }
+
+  /* ── Type scale ── */
+  h1, h2, h3, h4 {
+    font-family: "SF Mono", "Cascadia Code", "JetBrains Mono", "Fira Code", monospace;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+
+  .hero-label {
+    font-family: "SF Mono", "Cascadia Code", "JetBrains Mono", monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--accent);
+    margin-bottom: 0.75rem;
+  }
+
+  h1 {
+    font-size: 1.75rem;
+    font-weight: 700;
+    line-height: 1.2;
+    margin-bottom: 0.4rem;
+  }
+
+  .hero-sub {
+    font-size: 1.05rem;
+    color: var(--ink-secondary);
+    line-height: 1.55;
+    max-width: 640px;
+    margin-bottom: 2.5rem;
+  }
+
+  h2 {
+    font-size: 1.15rem;
+    font-weight: 700;
+    margin-top: 3rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 2px solid var(--border);
+  }
+
+  h3 {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin-top: 1.8rem;
+    margin-bottom: 0.6rem;
+    color: var(--accent);
+  }
+
+  p { margin-bottom: 0.9rem; max-width: 65ch; }
+
+  /* ── Verdict banner ── */
+  .verdict {
+    background: var(--accent-dim);
+    border-left: 3px solid var(--accent);
+    padding: 1rem 1.25rem;
+    margin-bottom: 2.5rem;
+    border-radius: 0 6px 6px 0;
+  }
+  .verdict p { margin: 0; font-size: 0.92rem; }
+  .verdict strong { color: var(--accent); }
+
+  /* ── Code ── */
+  code {
+    font-family: "SF Mono", "Cascadia Code", "JetBrains Mono", monospace;
+    font-size: 0.82em;
+    background: var(--code-bg);
+    padding: 0.15em 0.35em;
+    border-radius: 3px;
+  }
+
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    overflow-x: auto;
+    margin-bottom: 1.2rem;
+    font-size: 0.8rem;
+    line-height: 1.6;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+    font-size: inherit;
+  }
+
+  /* ── Tables ── */
+  .table-wrap {
+    overflow-x: auto;
+    margin-bottom: 1.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  th {
+    font-family: "SF Mono", "Cascadia Code", "JetBrains Mono", monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    text-align: left;
+    padding: 0.65rem 1rem;
+    background: var(--surface);
+    border-bottom: 2px solid var(--border);
+    color: var(--ink-secondary);
+    white-space: nowrap;
+  }
+
+  td {
+    padding: 0.6rem 1rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+
+  tr:last-child td { border-bottom: none; }
+
+  /* ── Tags ── */
+  .tag {
+    display: inline-block;
+    font-family: "SF Mono", "Cascadia Code", "JetBrains Mono", monospace;
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.15em 0.55em;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .tag-replace { background: var(--positive-dim); color: var(--positive); }
+  .tag-augment { background: var(--accent-dim); color: var(--accent); }
+  .tag-keep    { background: var(--neutral-dim); color: var(--ink-secondary); }
+  .tag-gap     { background: var(--negative-dim); color: var(--negative); }
+  .tag-new     { background: var(--highlight-dim); color: var(--highlight); }
+  .tag-caution { background: var(--caution-dim); color: var(--caution); }
+
+  /* ── Callout boxes ── */
+  .callout {
+    padding: 0.9rem 1.1rem;
+    border-radius: 6px;
+    margin-bottom: 1.2rem;
+    font-size: 0.88rem;
+  }
+  .callout p { margin: 0; }
+  .callout-gap { background: var(--negative-dim); border-left: 3px solid var(--negative); }
+  .callout-note { background: var(--accent-dim); border-left: 3px solid var(--accent); }
+  .callout-positive { background: var(--positive-dim); border-left: 3px solid var(--positive); }
+
+  /* ── Feature grid ── */
+  .feature-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  @media (max-width: 600px) {
+    .feature-grid { grid-template-columns: 1fr; }
+  }
+
+  .feature-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.1rem;
+  }
+  .feature-card h4 {
+    font-size: 0.82rem;
+    font-weight: 600;
+    margin-bottom: 0.35rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .feature-card p {
+    font-size: 0.82rem;
+    color: var(--ink-secondary);
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  /* ── Diagram ── */
+  .diagram {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+    overflow-x: auto;
+  }
+  .diagram pre {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.55;
+    color: var(--ink-secondary);
+  }
+  .diagram pre code { background: none; }
+  .diagram-caption {
+    font-size: 0.75rem;
+    color: var(--ink-secondary);
+    margin-top: 0.75rem;
+    font-style: italic;
+  }
+
+  /* ── Section numbering ── */
+  .section-num {
+    font-family: "SF Mono", "Cascadia Code", "JetBrains Mono", monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--highlight);
+    margin-right: 0.5rem;
+  }
+
+  /* ── Lists ── */
+  ul, ol {
+    margin-bottom: 1rem;
+    padding-left: 1.4rem;
+  }
+  li {
+    margin-bottom: 0.35rem;
+    font-size: 0.92rem;
+  }
+  li code { font-size: 0.8em; }
+
+  /* ── Migration phases ── */
+  .phase {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.2rem;
+    align-items: flex-start;
+  }
+  .phase-marker {
+    flex-shrink: 0;
+    width: 2.2rem;
+    height: 2.2rem;
+    background: var(--accent-dim);
+    border: 2px solid var(--accent);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: "SF Mono", "Cascadia Code", "JetBrains Mono", monospace;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .phase-body { flex: 1; }
+  .phase-body h4 {
+    font-size: 0.88rem;
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+  }
+  .phase-body p {
+    font-size: 0.85rem;
+    color: var(--ink-secondary);
+    margin: 0;
+  }
+
+  /* ── Footer ── */
+  .footer {
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.75rem;
+    color: var(--ink-secondary);
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <div class="hero-label">Architecture Exploration</div>
+  <h1>PostgreSQL 19 Property Graphs &times; post-graph</h1>
+  <p class="hero-sub">What SQL/PGQ brings to the table, where it overlaps with what post-graph already does, and a practical path for adopting it.</p>
+
+  <div class="verdict">
+    <p><strong>Bottom line:</strong> PG19 property graphs are a read-only query overlay on existing tables &mdash; they complement post-graph rather than replace it. The library's table creation, multi-tenancy, recursive traversal, shortest path, vector search, and audit system all remain essential. The opportunity is to layer <code>CREATE PROPERTY GRAPH</code> declarations on top and offer <code>GRAPH_TABLE</code> pattern matching as an alternative query surface for simple hops.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <h2><span class="section-num">01</span> What PG19 Property Graphs Are</h2>
+
+  <p>PostgreSQL 19 implements <strong>SQL/PGQ</strong> (ISO/IEC 9075-16) &mdash; a standard for declaring property graphs over relational tables and querying them with pattern-matching syntax. Two new constructs are introduced:</p>
+
+  <div class="feature-grid">
+    <div class="feature-card">
+      <h4><code>CREATE PROPERTY GRAPH</code></h4>
+      <p>Declares a named graph as a virtual overlay. Vertex and edge tables are mapped from existing relations. Columns become properties. Labels classify nodes and edges. Nothing is materialized &mdash; it's a view-like metadata layer.</p>
+    </div>
+    <div class="feature-card">
+      <h4><code>GRAPH_TABLE()</code></h4>
+      <p>A table function in <code>FROM</code> clauses. Takes a graph name, a <code>MATCH</code> pattern, and a <code>COLUMNS</code> projection. Patterns use ASCII-art syntax: <code>(v1)-[e]-&gt;(v2)</code>. Internally rewritten to joins.</p>
+    </div>
+  </div>
+
+  <h3>Declaring a property graph</h3>
+<pre><code>CREATE PROPERTY GRAPH mygraph
+  VERTEX TABLES (
+    people       KEY (realm, id)  LABEL person
+                 PROPERTIES (space, payload, created_at),
+    departments  KEY (realm, id)  LABEL department
+  )
+  EDGE TABLES (
+    works_in     KEY (realm, id)
+      SOURCE KEY (realm, from_id) REFERENCES people  (realm, id)
+      DESTINATION KEY (realm, to_id) REFERENCES departments (realm, id)
+      LABEL works_in
+      PROPERTIES (relation_type, payload, space)
+  );</code></pre>
+
+  <h3>Querying with pattern matching</h3>
+<pre><code>SELECT person_name, dept_payload
+FROM GRAPH_TABLE (
+  mygraph
+  MATCH (p IS person WHERE p.space = 'engineering')
+        -[w IS works_in]-&gt;
+        (d IS department)
+  COLUMNS (p.payload AS person_name,
+           d.payload AS dept_payload)
+);</code></pre>
+
+  <h3>What's supported vs. what's not</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Feature</th><th>PG19 Status</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Vertex/edge declaration with labels</td><td><span class="tag tag-replace">Supported</span></td></tr>
+        <tr><td>Explicit KEY &amp; REFERENCES</td><td><span class="tag tag-replace">Supported</span></td></tr>
+        <tr><td>Column &rarr; property mapping</td><td><span class="tag tag-replace">Supported</span></td></tr>
+        <tr><td>Single-hop pattern matching</td><td><span class="tag tag-replace">Supported</span></td></tr>
+        <tr><td>Multi-hop (explicit chaining)</td><td><span class="tag tag-replace">Supported</span></td></tr>
+        <tr><td>WHERE inside patterns</td><td><span class="tag tag-replace">Supported</span></td></tr>
+        <tr><td>Multi-label OR: <code>(IS a|b)</code></td><td><span class="tag tag-replace">Supported</span></td></tr>
+        <tr><td>Directed &amp; undirected edges</td><td><span class="tag tag-replace">Supported</span></td></tr>
+        <tr><td>Quantified paths <code>{1,5}</code></td><td><span class="tag tag-gap">Not in PG19</span></td></tr>
+        <tr><td>SHORTEST PATH</td><td><span class="tag tag-gap">Not in PG19</span></td></tr>
+        <tr><td>Path modes (WALK, TRAIL, SIMPLE)</td><td><span class="tag tag-gap">Not in PG19</span></td></tr>
+        <tr><td>Graph mutations via graph syntax</td><td><span class="tag tag-gap">Not in PG19</span></td></tr>
+        <tr><td>DROP PROPERTY GRAPH</td><td><span class="tag tag-replace">Supported</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout callout-gap">
+    <p><strong>Critical gap:</strong> PG19 has no variable-length path traversal. The pattern <code>(a)-[*1..5]-&gt;(b)</code> is not supported. Every hop must be spelled out explicitly. This means post-graph's recursive CTE traversal is strictly more powerful and cannot be replaced.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <h2><span class="section-num">02</span> Feature-by-Feature Impact</h2>
+
+  <p>Mapping each post-graph capability against PG19's property graph support:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>post-graph Feature</th><th>PG19 Impact</th><th>Verdict</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Table creation DDL<br><code>create_vertex_table()</code>, <code>create_edge_table()</code></td>
+          <td>PG19 property graphs overlay <em>existing</em> tables &mdash; they don&rsquo;t create them. post-graph&rsquo;s DDL generation remains the foundation.</td>
+          <td><span class="tag tag-keep">Keep as-is</span></td>
+        </tr>
+        <tr>
+          <td>Multi-tenancy<br><code>realm</code> column, composite PK</td>
+          <td>No native multi-tenancy in SQL/PGQ. The <code>realm</code> column can be exposed as a property and filtered in <code>WHERE</code> inside patterns, but there&rsquo;s no built-in isolation.</td>
+          <td><span class="tag tag-keep">Keep as-is</span></td>
+        </tr>
+        <tr>
+          <td>Schema-per-realm<br>One PG schema per tenant</td>
+          <td>Each realm&rsquo;s schema could declare its own property graph. Natural fit &mdash; <code>"tenant_a".mygraph</code> vs <code>"tenant_b".mygraph</code>.</td>
+          <td><span class="tag tag-augment">Augment</span></td>
+        </tr>
+        <tr>
+          <td>Space isolation<br>Logical sub-groups within a realm</td>
+          <td>Exposed as a property; filterable via <code>WHERE p.space = 'x'</code> in patterns.</td>
+          <td><span class="tag tag-keep">Keep as-is</span></td>
+        </tr>
+        <tr>
+          <td>Neighbor queries<br><code>get_neighbors()</code></td>
+          <td>Single-hop <code>GRAPH_TABLE MATCH</code> is a direct replacement. Cleaner syntax, same performance (rewritten to joins).</td>
+          <td><span class="tag tag-augment">Augment</span></td>
+        </tr>
+        <tr>
+          <td>Recursive traversal<br><code>traverse()</code> via <code>WITH RECURSIVE</code></td>
+          <td>PG19 cannot do variable-length traversal. Recursive CTE stays.</td>
+          <td><span class="tag tag-keep">Keep as-is</span></td>
+        </tr>
+        <tr>
+          <td>Shortest path<br><code>shortest_path()</code></td>
+          <td>Not available in PG19 SQL/PGQ. Recursive CTE stays.</td>
+          <td><span class="tag tag-keep">Keep as-is</span></td>
+        </tr>
+        <tr>
+          <td>Cycle detection<br>Pre-insert cycle check</td>
+          <td>Not available. Keep existing <code>shortest_path()</code>-based check.</td>
+          <td><span class="tag tag-keep">Keep as-is</span></td>
+        </tr>
+        <tr>
+          <td>pgvector search<br><code>vector_search()</code></td>
+          <td>Embedding columns can be exposed as properties, but PG19 pattern matching has no distance operators. Dedicated vector search stays.</td>
+          <td><span class="tag tag-keep">Keep as-is</span></td>
+        </tr>
+        <tr>
+          <td>Audit triggers<br><code>_audit</code> tables</td>
+          <td>Orthogonal &mdash; property graphs are read-only overlays and don&rsquo;t interact with triggers.</td>
+          <td><span class="tag tag-keep">Keep as-is</span></td>
+        </tr>
+        <tr>
+          <td>Data history<br><code>_data</code> append-only tables</td>
+          <td>Data tables could be included as additional vertex tables in the graph with a <code>version</code> label for temporal queries.</td>
+          <td><span class="tag tag-augment">Augment</span></td>
+        </tr>
+        <tr>
+          <td>CRUD operations<br><code>add_vertex()</code>, <code>add_edge()</code>, etc.</td>
+          <td>PG19 property graphs are read-only. All mutations go through regular SQL.</td>
+          <td><span class="tag tag-keep">Keep as-is</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <h2><span class="section-num">03</span> Architecture: Current vs. Proposed</h2>
+
+  <div class="diagram">
+<pre><code>CURRENT                                  PROPOSED (PG19+)
+═══════                                  ════════════════
+
+┌──────────────────────┐                 ┌──────────────────────┐
+│   Python Client      │                 │   Python Client      │
+│  (AsyncPostGraph /   │                 │  (AsyncPostGraph /   │
+│   SQLAlchemyPost...) │                 │   SQLAlchemyPost...) │
+└──────┬───────────────┘                 └──────┬───────────────┘
+       │                                        │
+       │  add_vertex()                          │  add_vertex()
+       │  add_edge()                            │  add_edge()
+       │  traverse()         ┌──────────────┐   │  traverse()
+       │  shortest_path()    │  NEW LAYER   │   │  shortest_path()
+       │  vector_search()    │              │   │  vector_search()
+       │  get_neighbors()    │  match()     │   │  get_neighbors()
+       │                     │  graph_query()│   │
+       ▼                     └──────┬───────┘   ▼
+┌──────────────────────┐            │    ┌──────────────────────┐
+│    Raw SQL           │            │    │    Raw SQL            │
+│  INSERT / SELECT /   │            ▼    │  + GRAPH_TABLE()     │
+│  WITH RECURSIVE      │    ┌────────────┤  + WITH RECURSIVE    │
+│                      │    │  Property  │                      │
+└──────┬───────────────┘    │  Graph     └──────┬───────────────┘
+       │                    │  Declaration      │
+       ▼                    └────────┬──────────▼
+┌──────────────────────┐             │   ┌──────────────────────┐
+│  PostgreSQL Tables   │             └──▶│  PostgreSQL Tables   │
+│  vertices, edges,    │                 │  + CREATE PROPERTY   │
+│  _audit, _data       │                 │    GRAPH overlay     │
+└──────────────────────┘                 └──────────────────────┘</code></pre>
+    <p class="diagram-caption">The property graph declaration sits alongside existing tables as metadata. All writes continue through regular SQL. The new <code>match()</code> method uses <code>GRAPH_TABLE()</code> for pattern-based reads.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <h2><span class="section-num">04</span> Concrete Changes Required</h2>
+
+  <h3>New methods on AsyncPostGraph / SQLAlchemyPostGraph</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Method</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>create_property_graph(name, realm?)</code></td>
+          <td>Generate <code>CREATE PROPERTY GRAPH</code> DDL from the client&rsquo;s known tables</td>
+          <td>Introspects <code>pg_class</code> / <code>pg_constraint</code> to discover vertex &amp; edge tables and their FK relationships. In schema-per-realm mode, scopes to the realm&rsquo;s schema.</td>
+        </tr>
+        <tr>
+          <td><code>drop_property_graph(name)</code></td>
+          <td>Execute <code>DROP PROPERTY GRAPH IF EXISTS</code></td>
+          <td>Thin wrapper. Needed for cleanup and recreation after schema changes.</td>
+        </tr>
+        <tr>
+          <td><code>refresh_property_graph(name)</code></td>
+          <td>Drop and recreate after table changes</td>
+          <td>Since property graphs reference table structure at creation time, adding a new vertex/edge table requires recreation.</td>
+        </tr>
+        <tr>
+          <td><code>match(graph, pattern, columns)</code></td>
+          <td>Execute a <code>GRAPH_TABLE()</code> query and return results</td>
+          <td>Takes a pattern string and column projections. Returns list of dicts or model objects. Adds realm filtering automatically.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Property graph generation</h3>
+
+  <p>The <code>create_property_graph()</code> method would introspect the database to build the DDL. Here's how post-graph's table structure maps to SQL/PGQ declarations:</p>
+
+<pre><code>-- Auto-generated from post-graph's table metadata:
+
+CREATE PROPERTY GRAPH post_graph_default
+  VERTEX TABLES (
+    -- Each vertex table discovered via pg_class
+    people   KEY (realm, id)
+             LABEL person
+             PROPERTIES (realm, id, space, payload, uuid,
+                         created_at, updated_at),
+    companies KEY (realm, id)
+             LABEL company
+             PROPERTIES (realm, id, space, payload, uuid,
+                         created_at, updated_at)
+  )
+  EDGE TABLES (
+    -- Each edge table discovered via FK constraints
+    peopleTOcompanies KEY (realm, id)
+      SOURCE KEY (realm, from_id) REFERENCES people    (realm, id)
+      DESTINATION KEY (realm, to_id) REFERENCES companies (realm, id)
+      LABEL employs
+      PROPERTIES (realm, id, space, from_id, to_id,
+                  relation_type, payload, uuid,
+                  created_at, updated_at)
+  );</code></pre>
+
+  <h3>Label strategy</h3>
+
+  <p>Two options for mapping post-graph concepts to PG19 labels:</p>
+
+  <div class="feature-grid">
+    <div class="feature-card">
+      <h4>Option A: Table name = Label</h4>
+      <p>Each vertex table becomes a label (e.g., <code>people</code> &rarr; <code>LABEL person</code>). Each edge table becomes a label. Simple, automatic. Edge <code>relation_type</code> is just a filterable property.</p>
+    </div>
+    <div class="feature-card">
+      <h4>Option B: relation_type = Label <span class="tag tag-caution">Complex</span></h4>
+      <p>Map edge <code>relation_type</code> values to separate labels. Requires knowing all relation types at graph creation time &mdash; either via introspection (<code>SELECT DISTINCT relation_type</code>) or user declaration. More expressive but harder to keep in sync.</p>
+    </div>
+  </div>
+
+  <div class="callout callout-note">
+    <p><strong>Recommendation:</strong> Start with Option A. The <code>relation_type</code> column is already filterable via <code>WHERE</code> in patterns, so there's no loss of expressiveness. Option B can be added later as an opt-in feature.</p>
+  </div>
+
+  <h3>Multi-tenancy considerations</h3>
+
+  <p>The <code>realm</code> column is part of every composite PK and FK. This needs careful handling:</p>
+
+  <ul>
+    <li><strong>Default mode:</strong> The property graph spans all realms. Queries must include <code>WHERE v.realm = 'tenant_a'</code> in every pattern. The <code>match()</code> wrapper injects this automatically.</li>
+    <li><strong>Schema-per-realm:</strong> Each realm schema declares its own property graph. This is cleaner &mdash; no cross-realm leakage possible. <code>create_property_graph()</code> generates one per realm.</li>
+  </ul>
+
+  <h3>Version detection</h3>
+
+<pre><code># In client initialization:
+async def _check_pg_version(self):
+    row = await self._fetchrow("SHOW server_version_num")
+    self._pg_version = int(row['server_version_num'])
+    self._has_property_graphs = self._pg_version &gt;= 190000</code></pre>
+
+  <p>All property graph methods would check <code>self._has_property_graphs</code> and raise a clear error on older versions.</p>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <h2><span class="section-num">05</span> What a match() Query Looks Like</h2>
+
+  <p>Compare the current programmatic API with the proposed pattern-matching surface:</p>
+
+  <h3>Finding neighbors (1-hop)</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th style="width:50%">Current API</th><th>With PG19 match()</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>
+<pre style="border:none;margin:0;"><code>steps = await client.get_neighbors(
+    "people", realm, vertex_id,
+    edge_tables=["knows"],
+    direction="out"
+)</code></pre>
+          </td>
+          <td>
+<pre style="border:none;margin:0;"><code>results = await client.match(
+    "mygraph", realm,
+    "(p IS person)-[k IS knows]-&gt;(f IS person)",
+    columns={"p.payload": "person",
+             "f.payload": "friend"},
+    where={"p.id": vertex_id}
+)</code></pre>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Two-hop traversal</h3>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th style="width:50%">Current API</th><th>With PG19 match()</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>
+<pre style="border:none;margin:0;"><code># Requires recursive CTE (max_depth=2)
+steps = await client.traverse(
+    "people", realm, start_id,
+    edge_tables=["knows"],
+    direction="out",
+    max_depth=2
+)</code></pre>
+          </td>
+          <td>
+<pre style="border:none;margin:0;"><code># Explicit 2-hop pattern
+results = await client.match(
+    "mygraph", realm,
+    """(a IS person)
+       -[IS knows]-&gt;(b IS person)
+       -[IS knows]-&gt;(c IS person)""",
+    columns={"a.payload": "start",
+             "b.payload": "mid",
+             "c.payload": "end"}
+)</code></pre>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout callout-gap">
+    <p><strong>Limitation:</strong> The <code>match()</code> pattern is fixed at 2 hops. For <code>traverse(max_depth=10)</code>, there's no PG19 equivalent &mdash; you'd need 10 chained pattern segments. The recursive CTE remains the only viable approach for variable-depth traversal.</p>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <h2><span class="section-num">06</span> Migration Path</h2>
+
+  <div class="phase">
+    <div class="phase-marker">1</div>
+    <div class="phase-body">
+      <h4>Version detection &amp; feature flag</h4>
+      <p>Add <code>_pg_version</code> / <code>_has_property_graphs</code> to both clients during <code>connect()</code>. Gate all new methods behind this flag. Zero impact on PG&nbsp;&lt;&nbsp;19 users.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-marker">2</div>
+    <div class="phase-body">
+      <h4>Property graph lifecycle methods</h4>
+      <p>Implement <code>create_property_graph()</code>, <code>drop_property_graph()</code>, and <code>refresh_property_graph()</code>. These introspect existing tables and FK constraints to auto-generate the DDL. Add optional <code>auto_property_graph=True</code> parameter to <code>create_vertex_table()</code> and <code>create_edge_table()</code>.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-marker">3</div>
+    <div class="phase-body">
+      <h4>Pattern matching query method</h4>
+      <p>Implement <code>match(graph, realm, pattern, columns, where)</code>. This wraps <code>GRAPH_TABLE()</code> with automatic realm injection. Returns results as dicts or Vertex/Edge model objects where possible.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-marker">4</div>
+    <div class="phase-body">
+      <h4>Optimize get_neighbors() on PG19+</h4>
+      <p>Optionally rewrite <code>get_neighbors()</code> to use <code>GRAPH_TABLE</code> internally when a property graph exists. This is transparent to callers but lets the query planner use the graph metadata for optimization.</p>
+    </div>
+  </div>
+
+  <div class="phase">
+    <div class="phase-marker">5</div>
+    <div class="phase-body">
+      <h4>Future: track PG20+ additions</h4>
+      <p>When PostgreSQL adds quantified paths and shortest path to SQL/PGQ, revisit <code>traverse()</code> and <code>shortest_path()</code> to optionally delegate to native graph operations.</p>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <h2><span class="section-num">07</span> Risks &amp; Considerations</h2>
+
+  <div class="feature-grid">
+    <div class="feature-card">
+      <h4><span class="tag tag-caution">Sync</span> Graph staleness</h4>
+      <p>Property graphs capture table structure at creation time. Adding a column or a new table requires <code>DROP</code> + <code>CREATE</code>. The library must track when to refresh &mdash; either eagerly (after every DDL) or lazily (before first <code>match()</code> call).</p>
+    </div>
+    <div class="feature-card">
+      <h4><span class="tag tag-caution">Perf</span> Planner overhead</h4>
+      <p>PG19 rewrites <code>GRAPH_TABLE</code> to joins internally. For simple 1-hop patterns this is equivalent to what post-graph already generates. Benchmark before assuming gains &mdash; the overhead of the rewrite step might offset any benefit.</p>
+    </div>
+    <div class="feature-card">
+      <h4><span class="tag tag-caution">API</span> Pattern injection</h4>
+      <p>If users can pass raw pattern strings to <code>match()</code>, SQL injection via the pattern language is possible. The <code>_validate_identifier()</code> approach won't work for GQL patterns. Need a safe parameterization strategy or a builder API.</p>
+    </div>
+    <div class="feature-card">
+      <h4><span class="tag tag-caution">Scope</span> Namespace collision</h4>
+      <p>Property graphs share the namespace with tables and views. The graph name must not collide with existing table names. Use a prefix convention like <code>pg_graph_{realm}</code> or let users choose.</p>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <h2><span class="section-num">08</span> Summary</h2>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Category</th><th>Count</th><th>Detail</th></tr></thead>
+      <tbody>
+        <tr><td>Features that stay unchanged</td><td>9</td><td>DDL, CRUD, traverse, shortest path, cycle detection, vector search, audit, data history, space isolation</td></tr>
+        <tr><td>Features to augment</td><td>3</td><td>Schema-per-realm (auto-declare graphs), neighbors (optional GRAPH_TABLE backend), data history (temporal graph queries)</td></tr>
+        <tr><td>New methods to add</td><td>4</td><td><code>create_property_graph</code>, <code>drop_property_graph</code>, <code>refresh_property_graph</code>, <code>match</code></td></tr>
+        <tr><td>PG19 gaps vs. post-graph</td><td>5</td><td>Variable-length paths, shortest path, path modes, mutations, multi-tenancy</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout callout-positive">
+    <p><strong>Net assessment:</strong> PG19 SQL/PGQ is additive. It gives post-graph users a standardized, declarative query syntax for simple graph patterns while the library's core value &mdash; multi-tenant schema management, deep traversal, vector search, and audit trails &mdash; remains unmatched by native PostgreSQL. The safest approach is to layer it in as an optional feature behind a version check, touching zero existing behavior.</p>
+  </div>
+
+  <div class="footer">
+    <p>post-graph v0.6.2 &middot; PostgreSQL 19 beta 3 &middot; August 2026</p>
+  </div>
+
+</div>
+
+</body>
+</html>

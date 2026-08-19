@@ -666,6 +666,39 @@ class TestMultiRealm:
             await sa_client.delete_realm(r2)
 
 
+class TestBatchUpsert:
+    async def test_batch_upsert_vertices(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        items = [
+            {"payload": {"name": "Alice"}},
+            {"payload": {"name": "Bob"}},
+            {"payload": {"name": "Carol"}},
+        ]
+        results = await sa_client.batch_upsert_vertices("sa_people", realm=realm, items=items)
+        assert len(results) == 3
+        assert all(isinstance(v, Vertex) for v in results)
+        names = {v.payload["name"] for v in results}
+        assert names == {"Alice", "Bob", "Carol"}
+
+    async def test_batch_upsert_edges(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
+        v1 = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "A"})
+        v2 = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "B"})
+        v3 = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "C"})
+        items = [
+            {"from_id": v1.id, "to_id": v2.id, "relation_type": "friends", "payload": {"w": 1}},
+            {"from_id": v2.id, "to_id": v3.id, "relation_type": "colleagues", "payload": {"w": 2}},
+        ]
+        results = await sa_client.batch_upsert_edges("sa_knows", realm=realm, items=items)
+        assert len(results) == 2
+        assert all(isinstance(e, Edge) for e in results)
+        assert results[0].relation_type == "friends"
+        assert results[1].relation_type == "colleagues"
+
+
 class TestCycleDetection:
     async def test_cycle_raises(self, sa_client, sa_clean_realm):
         realm = sa_clean_realm

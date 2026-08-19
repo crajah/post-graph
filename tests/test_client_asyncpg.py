@@ -2117,6 +2117,39 @@ class TestMultiVector:
         assert fact_results[0][0].payload["name"] == "b"
 
 
+class TestPoolConfig:
+    @pytest.mark.asyncio
+    async def test_default_pool_config(self, pg_client):
+        config = pg_client.get_pool_config()
+        assert "min_size" in config
+        assert "max_size" in config
+        assert "max_queries" in config
+        assert "max_inactive_connection_lifetime" in config
+
+    @pytest.mark.asyncio
+    async def test_pool_status(self, pg_client):
+        status = pg_client.get_pool_status()
+        assert status is not None
+        assert "size" in status
+        assert "free_size" in status
+
+    @pytest.mark.asyncio
+    async def test_custom_pool_config(self):
+        import os
+        dsn = os.environ.get("POST_GRAPH_TEST_DSN", "postgresql://crajah@localhost/post_graph_test")
+        client = AsyncPostGraph(dsn=dsn, pool_min_size=2, pool_max_size=5)
+        await client.connect()
+        try:
+            config = client.get_pool_config()
+            assert config["min_size"] == 2
+            assert config["max_size"] == 5
+            status = client.get_pool_status()
+            assert status is not None
+            assert status["max_size"] == 5
+        finally:
+            await client.close()
+
+
 class TestWeightedShortestPath:
     @pytest.fixture(autouse=True)
     async def _setup(self, pg_client, clean_realm):

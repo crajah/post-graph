@@ -26,30 +26,54 @@ class AsyncPostGraph:
         connection_or_pool: Union[asyncpg.Connection, asyncpg.Pool, None] = None,
         dsn: Optional[str] = None,
         schema_per_realm: bool = False,
+        pool_min_size: int = 10,
+        pool_max_size: int = 10,
+        pool_max_queries: int = 50000,
+        pool_max_inactive_connection_lifetime: float = 300.0,
         **conn_kwargs
     ):
         self.connection = connection_or_pool
         self.dsn = dsn
         self.schema_per_realm = schema_per_realm
         self.conn_kwargs = conn_kwargs
+        self._pool_config = {
+            "min_size": pool_min_size,
+            "max_size": pool_max_size,
+            "max_queries": pool_max_queries,
+            "max_inactive_connection_lifetime": pool_max_inactive_connection_lifetime,
+        }
         self._pool = None
-        self._schema_cache = {}  # Cache for edge metadata: key is edge_table (or (realm, edge_table) if schema_per_realm)
+        self._schema_cache = {}
 
     async def connect(self):
         """Establish connection or connection pool to PostgreSQL."""
         if self.connection is None:
+            kwargs = {**self._pool_config, **self.conn_kwargs}
             if self.dsn:
-                self._pool = await asyncpg.create_pool(self.dsn, **self.conn_kwargs)
+                self._pool = await asyncpg.create_pool(self.dsn, **kwargs)
             else:
-                self._pool = await asyncpg.create_pool(**self.conn_kwargs)
+                self._pool = await asyncpg.create_pool(**kwargs)
             self.connection = self._pool
 
     async def close(self):
         """Close connection pool if it was managed by this client."""
         if self._pool:
             await self._pool.close()
-            self._pool = None
-            self.connection = None
+
+    def get_pool_config(self) -> Dict[str, Any]:
+        """Return the current pool configuration."""
+        return dict(self._pool_config)
+
+    def get_pool_status(self) -> Optional[Dict[str, Any]]:
+        """Return live pool status (sizes, free count) or None if not pooled."""
+        if not self._pool:
+            return None
+        return {
+            "min_size": self._pool.get_min_size(),
+            "max_size": self._pool.get_max_size(),
+            "size": self._pool.get_size(),
+            "free_size": self._pool.get_idle_size(),
+        }
 
     def _validate_identifier(self, identifier: str):
         """Ensure identifiers are safe and valid to prevent SQL injection."""

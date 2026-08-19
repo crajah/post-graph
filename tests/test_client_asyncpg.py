@@ -488,6 +488,47 @@ class TestEdgeCRUD:
                 realm=realm
             )
 
+    async def test_get_edges(self, pg_client, clean_realm):
+        realm = clean_realm
+        v1, v2 = await self._setup(pg_client, realm)
+        await pg_client.add_edge("knows", realm=realm, from_id=v1.id, to_id=v2.id, relation_type="friends")
+        await pg_client.add_edge("knows", realm=realm, from_id=v2.id, to_id=v1.id, relation_type="colleagues")
+        edges = await pg_client.get_edges("knows", realm=realm)
+        assert len(edges) == 2
+        assert all(isinstance(e, Edge) for e in edges)
+
+    async def test_get_edges_with_limit(self, pg_client, clean_realm):
+        realm = clean_realm
+        v1, v2 = await self._setup(pg_client, realm)
+        for i in range(5):
+            await pg_client.add_edge("knows", realm=realm, from_id=v1.id, to_id=v2.id, relation_type=f"r{i}")
+        edges = await pg_client.get_edges("knows", realm=realm, limit=2)
+        assert len(edges) == 2
+
+    async def test_get_edges_filter_by_relation_type(self, pg_client, clean_realm):
+        realm = clean_realm
+        v1, v2 = await self._setup(pg_client, realm)
+        await pg_client.add_edge("knows", realm=realm, from_id=v1.id, to_id=v2.id, relation_type="friends")
+        await pg_client.add_edge("knows", realm=realm, from_id=v2.id, to_id=v1.id, relation_type="colleagues")
+        edges = await pg_client.get_edges("knows", realm=realm, relation_type="friends")
+        assert len(edges) == 1
+        assert edges[0].relation_type == "friends"
+
+    async def test_get_edges_filter_by_space(self, pg_client, clean_realm):
+        realm = clean_realm
+        v1, v2 = await self._setup(pg_client, realm)
+        await pg_client.add_edge("knows", realm=realm, from_id=v1.id, to_id=v2.id, relation_type="friends", space="prod")
+        await pg_client.add_edge("knows", realm=realm, from_id=v2.id, to_id=v1.id, relation_type="colleagues", space="staging")
+        edges = await pg_client.get_edges("knows", realm=realm, space="prod")
+        assert len(edges) == 1
+        assert edges[0].space == "prod"
+
+    async def test_get_edges_empty(self, pg_client, clean_realm):
+        realm = clean_realm
+        await self._setup(pg_client, realm)
+        edges = await pg_client.get_edges("knows", realm=realm)
+        assert edges == []
+
 
 class TestCycleDetection:
     async def test_cycle_raises(self, pg_client, clean_realm):

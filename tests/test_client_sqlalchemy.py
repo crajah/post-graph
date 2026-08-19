@@ -1448,6 +1448,26 @@ class TestMultiVector:
         assert fact_results[0][0].payload["name"] == "b"
 
 
+class TestPoolConfig:
+    @pytest.mark.asyncio
+    async def test_pool_status(self, sa_client):
+        status = sa_client.get_pool_status()
+        assert status is not None
+        assert "size" in status
+        assert "checked_in" in status
+
+    @pytest.mark.asyncio
+    async def test_from_dsn_factory(self):
+        import os
+        dsn = os.environ.get("POST_GRAPH_TEST_DSN", "postgresql+asyncpg://crajah@localhost/post_graph_test")
+        if not dsn.startswith("postgresql+asyncpg"):
+            dsn = dsn.replace("postgresql://", "postgresql+asyncpg://")
+        client = SQLAlchemyPostGraph.from_dsn(dsn, pool_size=2, max_overflow=3)
+        status = client.get_pool_status()
+        assert status is not None
+        await client.engine_or_connection.dispose()
+
+
 class TestWeightedShortestPath:
     @pytest.fixture(autouse=True)
     async def _setup(self, sa_client, sa_clean_realm):

@@ -25,7 +25,49 @@ class SQLAlchemyPostGraph:
     def __init__(self, engine_or_connection: Union[AsyncEngine, AsyncConnection], schema_per_realm: bool = False):
         self.engine_or_connection = engine_or_connection
         self.schema_per_realm = schema_per_realm
-        self._schema_cache = {}  # Cache for edge metadata
+        self._schema_cache = {}
+
+    @classmethod
+    def from_dsn(
+        cls,
+        dsn: str,
+        schema_per_realm: bool = False,
+        pool_size: int = 5,
+        max_overflow: int = 10,
+        pool_timeout: float = 30.0,
+        pool_recycle: int = 1800,
+        pool_pre_ping: bool = True,
+        **engine_kwargs,
+    ) -> "SQLAlchemyPostGraph":
+        """Create a client with a configured connection pool.
+
+        Wraps ``create_async_engine`` with pool parameters exposed as
+        keyword arguments for easy tuning.
+        """
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        engine = create_async_engine(
+            dsn,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=pool_timeout,
+            pool_recycle=pool_recycle,
+            pool_pre_ping=pool_pre_ping,
+            **engine_kwargs,
+        )
+        return cls(engine, schema_per_realm=schema_per_realm)
+
+    def get_pool_status(self) -> Optional[Dict[str, Any]]:
+        """Return live pool status or None if not backed by an engine."""
+        if not isinstance(self.engine_or_connection, AsyncEngine):
+            return None
+        pool = self.engine_or_connection.pool
+        return {
+            "size": pool.size(),
+            "checked_in": pool.checkedin(),
+            "checked_out": pool.checkedout(),
+            "overflow": pool.overflow(),
+        }
 
     def _validate_identifier(self, identifier: str):
         """Ensure identifiers are safe and valid to prevent SQL injection."""

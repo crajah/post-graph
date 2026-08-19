@@ -44,20 +44,26 @@ class SQLAlchemyPostGraph:
         else:
             return f'"{table_name}"'
 
-    async def _execute(self, conn: AsyncConnection, query: str, **params) -> Any:
+    async def execute(self, conn: AsyncConnection, query: str, **params) -> Any:
+        """Execute a SQL statement."""
         return await conn.execute(text(query), params)
 
-    async def _fetch(self, conn: AsyncConnection, query_str: str, **params) -> List[Dict[str, Any]]:
-        """Fetch multiple rows as a list of mapping dictionaries."""
+    async def fetch(self, conn: AsyncConnection, query_str: str, **params) -> List[Dict[str, Any]]:
+        """Execute a SQL query and return all rows as dicts."""
         result = await conn.execute(text(query_str), params)
         rows = result.mappings().all()
         return [dict(r) for r in rows]
 
-    async def _fetchrow(self, conn: AsyncConnection, query_str: str, **params) -> Optional[Dict[str, Any]]:
-        """Fetch a single row as a mapping dictionary."""
+    async def fetchrow(self, conn: AsyncConnection, query_str: str, **params) -> Optional[Dict[str, Any]]:
+        """Execute a SQL query and return the first row as a dict."""
         result = await conn.execute(text(query_str), params)
         row = result.mappings().first()
         return dict(row) if row else None
+
+    # Backward-compatible aliases
+    _execute = execute
+    _fetch = fetch
+    _fetchrow = fetchrow
 
     async def _run_in_tx(self, func, user_id: Optional[str] = None):
         """Helper to run a function block within a transaction and optional audit user context."""

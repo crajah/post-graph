@@ -177,11 +177,31 @@ class AsyncPostGraph:
         except Exception as e:
             raise PostGraphError(f"Failed to initialize pgvector extension or embedding column for table '{table_name}': {e}")
 
+    async def _add_vector_columns(
+        self,
+        table_name: str,
+        table_ref: str,
+        data_table_ref: str,
+        columns: Dict[str, int],
+    ):
+        """Add multiple named pgvector columns with HNSW indexes."""
+        try:
+            await self._execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            for col_name, dim in columns.items():
+                self._validate_identifier(col_name)
+                await self._execute(f'ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});')
+                await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" ON {table_ref} USING hnsw ("{col_name}" vector_cosine_ops);')
+                await self._execute(f'ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});')
+                await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_{col_name}" ON {data_table_ref} USING hnsw ("{col_name}" vector_cosine_ops);')
+        except Exception as e:
+            raise PostGraphError(f"Failed to add vector columns to table '{table_name}': {e}")
+
     async def create_vertex_table(
         self,
         table_name: str,
         realm: Optional[str] = None,
-        vector_dim: Optional[int] = None
+        vector_dim: Optional[int] = None,
+        vector_columns: Optional[Dict[str, int]] = None,
     ):
         """Create a new vertex table and its associated shadow audit table, indexes, and triggers."""
         self._validate_identifier(table_name)
@@ -308,6 +328,8 @@ class AsyncPostGraph:
         # the embedding column is added to both the main and the data table.
         if vector_dim and vector_dim > 0:
             await self._add_vector_column(table_name, table_ref, data_table_ref, vector_dim)
+        if vector_columns:
+            await self._add_vector_columns(table_name, table_ref, data_table_ref, vector_columns)
 
         # 5. Create GIN index on payload
         await self._execute(
@@ -341,7 +363,8 @@ class AsyncPostGraph:
         cascade_delete_from: bool = False,
         cascade_delete_to: bool = False,
         realm: Optional[str] = None,
-        vector_dim: Optional[int] = None
+        vector_dim: Optional[int] = None,
+        vector_columns: Optional[Dict[str, int]] = None,
     ):
         """Create a new edge table linking two vertex tables, plus shadow audit table and constraints.
 
@@ -444,6 +467,8 @@ class AsyncPostGraph:
         # 3a. Add vector columns, after both the main and data tables exist.
         if vector_dim and vector_dim > 0:
             await self._add_vector_column(table_name, table_ref, data_table_ref, vector_dim)
+        if vector_columns:
+            await self._add_vector_columns(table_name, table_ref, data_table_ref, vector_columns)
 
         # 3. Create indexes
         await self._execute(
@@ -506,6 +531,7 @@ class AsyncPostGraph:
         vertex_id: Optional[Union[str, int]] = None,
         payload: Optional[Dict[str, Any]] = None,
         embedding: Optional[List[float]] = None,
+        embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
         space: Optional[str] = "default"
     ) -> Vertex:
@@ -556,6 +582,22 @@ class AsyncPostGraph:
                     await conn.execute(
                         f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"
                     )
+
+                emb_dict = None
+                if embeddings:
+                    set_clauses = []
+                    up_params: list = [realm, row['id']]
+                    for col_name, vec in embeddings.items():
+                        self._validate_identifier(col_name)
+                        up_params.append(f"[{','.join(str(x) for x in vec)}]")
+                        set_clauses.append(f'"{col_name}" = ${len(up_params)}::vector')
+                    if set_clauses:
+                        await conn.execute(
+                            f"UPDATE {table_ref} SET {', '.join(set_clauses)} WHERE realm = $1 AND id = $2",
+                            *up_params,
+                        )
+                        emb_dict = dict(embeddings)
+
                 emb = None
                 if 'embedding_text' in row and row['embedding_text']:
                     emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
@@ -569,6 +611,7 @@ class AsyncPostGraph:
                     updated_at=row['updated_at'],
                     table_name=table_name,
                     embedding=emb,
+                    embeddings=emb_dict,
                     uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
                     _client=self
                 )
@@ -588,6 +631,7 @@ class AsyncPostGraph:
         vertex_id: Optional[Union[str, int]] = None,
         payload: Optional[Dict[str, Any]] = None,
         embedding: Optional[List[float]] = None,
+        embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
         space: Optional[str] = "default"
     ) -> Vertex:
@@ -642,6 +686,21 @@ class AsyncPostGraph:
                 """
                 row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json)
             try:
+                emb_dict = None
+                if embeddings:
+                    set_clauses = []
+                    up_params: list = [realm, row['id']]
+                    for col_name, vec in embeddings.items():
+                        self._validate_identifier(col_name)
+                        up_params.append(f"[{','.join(str(x) for x in vec)}]")
+                        set_clauses.append(f'"{col_name}" = ${len(up_params)}::vector')
+                    if set_clauses:
+                        await conn.execute(
+                            f"UPDATE {table_ref} SET {', '.join(set_clauses)} WHERE realm = $1 AND id = $2",
+                            *up_params,
+                        )
+                        emb_dict = dict(embeddings)
+
                 emb = None
                 if 'embedding_text' in row and row['embedding_text']:
                     emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
@@ -655,6 +714,7 @@ class AsyncPostGraph:
                     updated_at=row['updated_at'],
                     table_name=table_name,
                     embedding=emb,
+                    embeddings=emb_dict,
                     uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
                     _client=self
                 )
@@ -1052,7 +1112,8 @@ class AsyncPostGraph:
         distance_metric: str = "cosine",
         search_data_table: bool = False,
         search_scope: str = "main",
-        space: Optional[str] = None
+        space: Optional[str] = None,
+        column_name: str = "embedding",
     ) -> List[Tuple[Vertex, float]]:
         """Perform vector similarity search on vertex embeddings using pgvector.
         
@@ -1066,10 +1127,12 @@ class AsyncPostGraph:
           - 'inner_product': <#> (negative inner product)
         """
         self._validate_identifier(table_name)
+        self._validate_identifier(column_name)
+        col = f'"{column_name}"'
         table_ref = self._get_table_ref(table_name, realm)
         data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
         vec_str = f"[{','.join(str(x) for x in query_vector)}]"
-        
+
         op = "<=>"
         if distance_metric == "l2":
             op = "<->"
@@ -1090,11 +1153,11 @@ class AsyncPostGraph:
         if scope == "data":
             query = f"""
             SELECT v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at,
-                   to_jsonb(v)->>'embedding' AS embedding_text,
-                   MIN(d.embedding {op} $2::vector) AS distance
+                   to_jsonb(v)->>'{column_name}' AS embedding_text,
+                   MIN(d.{col} {op} $2::vector) AS distance
             FROM {data_table_ref} d
             JOIN {table_ref} v ON d.realm = v.realm AND d.id = v.id
-            WHERE d.realm = $1 AND d.embedding IS NOT NULL{space_filter_d}
+            WHERE d.realm = $1 AND d.{col} IS NOT NULL{space_filter_d}
             GROUP BY v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at, to_jsonb(v)
             ORDER BY distance ASC
             LIMIT $3
@@ -1102,15 +1165,15 @@ class AsyncPostGraph:
         elif scope == "both":
             query = f"""
             WITH combined AS (
-                SELECT realm, id, (embedding {op} $2::vector) AS distance
+                SELECT realm, id, ({col} {op} $2::vector) AS distance
                 FROM {table_ref}
-                WHERE realm = $1 AND embedding IS NOT NULL{space_filter_combined}
+                WHERE realm = $1 AND {col} IS NOT NULL{space_filter_combined}
 
                 UNION ALL
 
-                SELECT realm, id, (embedding {op} $2::vector) AS distance
+                SELECT realm, id, ({col} {op} $2::vector) AS distance
                 FROM {data_table_ref}
-                WHERE realm = $1 AND embedding IS NOT NULL{space_filter_combined}
+                WHERE realm = $1 AND {col} IS NOT NULL{space_filter_combined}
             ),
             best AS (
                 SELECT realm, id, MIN(distance) AS distance
@@ -1118,7 +1181,7 @@ class AsyncPostGraph:
                 GROUP BY realm, id
             )
             SELECT v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at,
-                   to_jsonb(v)->>'embedding' AS embedding_text,
+                   to_jsonb(v)->>'{column_name}' AS embedding_text,
                    b.distance
             FROM best b
             JOIN {table_ref} v ON b.realm = v.realm AND b.id = v.id
@@ -1128,11 +1191,11 @@ class AsyncPostGraph:
         else:
             query = f"""
             SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
-                   to_jsonb(t)->>'embedding' AS embedding_text,
-                   (t.embedding {op} $2::vector) AS distance
+                   to_jsonb(t)->>'{column_name}' AS embedding_text,
+                   (t.{col} {op} $2::vector) AS distance
             FROM {table_ref} t
-            WHERE t.realm = $1 AND t.embedding IS NOT NULL{space_filter}
-            ORDER BY t.embedding {op} $2::vector ASC
+            WHERE t.realm = $1 AND t.{col} IS NOT NULL{space_filter}
+            ORDER BY t.{col} {op} $2::vector ASC
             LIMIT $3
             """
 
@@ -1184,17 +1247,19 @@ class AsyncPostGraph:
         top_k: int = 5,
         distance_metric: str = "cosine",
         space: Optional[str] = None,
-        relation_type: Optional[str] = None
+        relation_type: Optional[str] = None,
+        column_name: str = "embedding",
     ) -> List[Tuple[Edge, float]]:
         """Perform vector similarity search over edge embeddings using pgvector.
 
-        Requires the edge table to have been created with a ``vector_dim``.
-        Lets relationships be retrieved by meaning rather than by enumerating the
-        whole edge set, which is what graph-wide ('global') retrieval needs.
+        Requires the edge table to have been created with a ``vector_dim``
+        or ``vector_columns``.
 
         Distance metrics match :meth:`vector_search`: 'cosine', 'l2', 'inner_product'.
         """
         self._validate_identifier(table_name)
+        self._validate_identifier(column_name)
+        col = f'"{column_name}"'
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in query_vector)}]"
 
@@ -1217,11 +1282,11 @@ class AsyncPostGraph:
         query = f"""
         SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type,
                t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text,
-               to_jsonb(t)->>'embedding' AS embedding_text,
-               (t.embedding {op} $2::vector) AS distance
+               to_jsonb(t)->>'{column_name}' AS embedding_text,
+               (t.{col} {op} $2::vector) AS distance
         FROM {table_ref} t
-        WHERE t.realm = $1 AND t.embedding IS NOT NULL{filters}
-        ORDER BY t.embedding {op} $2::vector ASC
+        WHERE t.realm = $1 AND t.{col} IS NOT NULL{filters}
+        ORDER BY t.{col} {op} $2::vector ASC
         LIMIT $3
         """
 

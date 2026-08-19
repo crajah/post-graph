@@ -111,7 +111,8 @@ class SQLAlchemyPostGraph:
         self,
         table_name: str,
         realm: Optional[str] = None,
-        vector_dim: Optional[int] = None
+        vector_dim: Optional[int] = None,
+        vector_columns: Optional[Dict[str, int]] = None,
     ):
         """Create a new vertex table and its associated shadow audit table, indexes, and triggers."""
         self._validate_identifier(table_name)
@@ -249,6 +250,18 @@ class SQLAlchemyPostGraph:
                 except Exception as e:
                     raise PostGraphError(f"Failed to initialize pgvector extension or embedding column for table '{table_name}': {e}")
 
+            if vector_columns:
+                try:
+                    await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                    for col_name, dim in vector_columns.items():
+                        self._validate_identifier(col_name)
+                        await conn.execute(text(f'ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'))
+                        await conn.execute(text(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" ON {table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'))
+                        await conn.execute(text(f'ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'))
+                        await conn.execute(text(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_{col_name}" ON {data_table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'))
+                except Exception as e:
+                    raise PostGraphError(f"Failed to add vector columns to table '{table_name}': {e}")
+
             await conn.execute(text(f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};'))
             await conn.execute(text(f"""
                 CREATE TRIGGER "update_{table_name}_modtime"
@@ -280,7 +293,9 @@ class SQLAlchemyPostGraph:
         to_vertex_table: str,
         cascade_delete_from: bool = False,
         cascade_delete_to: bool = False,
-        realm: Optional[str] = None
+        realm: Optional[str] = None,
+        vector_dim: Optional[int] = None,
+        vector_columns: Optional[Dict[str, int]] = None,
     ):
         """Create a new edge table linking two vertex tables, plus shadow audit table and constraints."""
         # Validate vertex table identifiers
@@ -384,6 +399,29 @@ class SQLAlchemyPostGraph:
                 f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_payload" ON {table_ref} USING gin (payload);'
             ))
 
+            # 3a. Add vector columns
+            if vector_dim and vector_dim > 0:
+                try:
+                    await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                    await conn.execute(text(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"))
+                    await conn.execute(text(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);'))
+                    await conn.execute(text(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"))
+                    await conn.execute(text(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);'))
+                except Exception as e:
+                    raise PostGraphError(f"Failed to initialize pgvector extension or embedding column for edge table '{table_name}': {e}")
+
+            if vector_columns:
+                try:
+                    await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                    for col_name, dim in vector_columns.items():
+                        self._validate_identifier(col_name)
+                        await conn.execute(text(f'ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'))
+                        await conn.execute(text(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" ON {table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'))
+                        await conn.execute(text(f'ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'))
+                        await conn.execute(text(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_{col_name}" ON {data_table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'))
+                except Exception as e:
+                    raise PostGraphError(f"Failed to add vector columns to edge table '{table_name}': {e}")
+
             # 4. Create trigger for updated_at
             await conn.execute(text(f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};'))
             await conn.execute(text(f"""
@@ -443,6 +481,7 @@ class SQLAlchemyPostGraph:
         vertex_id: Optional[Union[str, int]] = None,
         payload: Optional[Dict[str, Any]] = None,
         embedding: Optional[List[float]] = None,
+        embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
         space: Optional[str] = "default"
     ) -> Vertex:
@@ -487,6 +526,23 @@ class SQLAlchemyPostGraph:
                     await conn.execute(
                         text(f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))")
                     )
+
+                emb_dict = None
+                if embeddings:
+                    set_parts = []
+                    up_params: Dict[str, Any] = {"_emb_realm": realm, "_emb_id": row['id']}
+                    for i, (col_name, vec) in enumerate(embeddings.items()):
+                        self._validate_identifier(col_name)
+                        pname = f"_emb_v{i}"
+                        up_params[pname] = f"[{','.join(str(x) for x in vec)}]"
+                        set_parts.append(f'"{col_name}" = CAST(:{pname} AS vector)')
+                    if set_parts:
+                        await conn.execute(
+                            text(f"UPDATE {table_ref} SET {', '.join(set_parts)} WHERE realm = :_emb_realm AND id = :_emb_id"),
+                            up_params,
+                        )
+                        emb_dict = dict(embeddings)
+
                 emb = None
                 if 'embedding_text' in row and row['embedding_text']:
                     emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
@@ -500,6 +556,7 @@ class SQLAlchemyPostGraph:
                     updated_at=row['updated_at'],
                     table_name=table_name,
                     embedding=emb,
+                    embeddings=emb_dict,
                     uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
                     _client=self
                 )
@@ -523,6 +580,7 @@ class SQLAlchemyPostGraph:
         vertex_id: Optional[Union[str, int]] = None,
         payload: Optional[Dict[str, Any]] = None,
         embedding: Optional[List[float]] = None,
+        embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
         space: Optional[str] = "default"
     ) -> Vertex:
@@ -572,6 +630,23 @@ class SQLAlchemyPostGraph:
 
             try:
                 row = await self._fetchrow(conn, query, **kwargs)
+
+                emb_dict = None
+                if embeddings:
+                    set_parts = []
+                    up_params: Dict[str, Any] = {"_emb_realm": realm, "_emb_id": row['id']}
+                    for i, (col_name, vec) in enumerate(embeddings.items()):
+                        self._validate_identifier(col_name)
+                        pname = f"_emb_v{i}"
+                        up_params[pname] = f"[{','.join(str(x) for x in vec)}]"
+                        set_parts.append(f'"{col_name}" = CAST(:{pname} AS vector)')
+                    if set_parts:
+                        await conn.execute(
+                            text(f"UPDATE {table_ref} SET {', '.join(set_parts)} WHERE realm = :_emb_realm AND id = :_emb_id"),
+                            up_params,
+                        )
+                        emb_dict = dict(embeddings)
+
                 emb = None
                 if 'embedding_text' in row and row['embedding_text']:
                     emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
@@ -585,6 +660,7 @@ class SQLAlchemyPostGraph:
                     updated_at=row['updated_at'],
                     table_name=table_name,
                     embedding=emb,
+                    embeddings=emb_dict,
                     uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
                     _client=self
                 )
@@ -988,14 +1064,17 @@ class SQLAlchemyPostGraph:
         distance_metric: str = "cosine",
         search_data_table: bool = False,
         search_scope: str = "main",
-        space: Optional[str] = None
+        space: Optional[str] = None,
+        column_name: str = "embedding",
     ) -> List[Tuple[Vertex, float]]:
         """Perform vector similarity search on vertex embeddings using pgvector."""
         self._validate_identifier(table_name)
+        self._validate_identifier(column_name)
+        col = f'"{column_name}"'
         table_ref = self._get_table_ref(table_name, realm)
         data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
         vec_str = f"[{','.join(str(x) for x in query_vector)}]"
-        
+
         op = "<=>"
         if distance_metric == "l2":
             op = "<->"
@@ -1014,11 +1093,11 @@ class SQLAlchemyPostGraph:
         if scope == "data":
             query = f"""
             SELECT v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at,
-                   to_jsonb(v)->>'embedding' AS embedding_text,
-                   MIN(d.embedding {op} CAST(:vec AS vector)) AS distance
+                   to_jsonb(v)->>'{column_name}' AS embedding_text,
+                   MIN(d.{col} {op} CAST(:vec AS vector)) AS distance
             FROM {data_table_ref} d
             JOIN {table_ref} v ON d.realm = v.realm AND d.id = v.id
-            WHERE d.realm = :realm AND d.embedding IS NOT NULL{space_filter_d}
+            WHERE d.realm = :realm AND d.{col} IS NOT NULL{space_filter_d}
             GROUP BY v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at, to_jsonb(v)
             ORDER BY distance ASC
             LIMIT :top_k
@@ -1026,15 +1105,15 @@ class SQLAlchemyPostGraph:
         elif scope == "both":
             query = f"""
             WITH combined AS (
-                SELECT realm, id, (embedding {op} CAST(:vec AS vector)) AS distance
+                SELECT realm, id, ({col} {op} CAST(:vec AS vector)) AS distance
                 FROM {table_ref}
-                WHERE realm = :realm AND embedding IS NOT NULL{space_filter_combined}
+                WHERE realm = :realm AND {col} IS NOT NULL{space_filter_combined}
 
                 UNION ALL
 
-                SELECT realm, id, (embedding {op} CAST(:vec AS vector)) AS distance
+                SELECT realm, id, ({col} {op} CAST(:vec AS vector)) AS distance
                 FROM {data_table_ref}
-                WHERE realm = :realm AND embedding IS NOT NULL{space_filter_combined}
+                WHERE realm = :realm AND {col} IS NOT NULL{space_filter_combined}
             ),
             best AS (
                 SELECT realm, id, MIN(distance) AS distance
@@ -1042,7 +1121,7 @@ class SQLAlchemyPostGraph:
                 GROUP BY realm, id
             )
             SELECT v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at,
-                   to_jsonb(v)->>'embedding' AS embedding_text,
+                   to_jsonb(v)->>'{column_name}' AS embedding_text,
                    b.distance
             FROM best b
             JOIN {table_ref} v ON b.realm = v.realm AND b.id = v.id
@@ -1052,11 +1131,11 @@ class SQLAlchemyPostGraph:
         else:
             query = f"""
             SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
-                   CAST(t.embedding AS TEXT) AS embedding_text,
-                   (t.embedding {op} CAST(:vec AS vector)) AS distance
+                   CAST(t.{col} AS TEXT) AS embedding_text,
+                   (t.{col} {op} CAST(:vec AS vector)) AS distance
             FROM {table_ref} t
-            WHERE t.realm = :realm AND t.embedding IS NOT NULL{space_filter_t}
-            ORDER BY t.embedding {op} CAST(:vec AS vector) ASC
+            WHERE t.realm = :realm AND t.{col} IS NOT NULL{space_filter_t}
+            ORDER BY t.{col} {op} CAST(:vec AS vector) ASC
             LIMIT :top_k
             """
 

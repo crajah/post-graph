@@ -2033,3 +2033,85 @@ class TestFulltextSearch:
     async def test_search_with_limit(self):
         results = await self.client.fulltext_search_vertices("ft_verts", self.realm, "PostgreSQL graph", limit=1)
         assert len(results) <= 1
+
+
+class TestMultiVector:
+    @pytest.fixture(autouse=True)
+    async def _setup(self, pg_client, clean_realm):
+        self.client = pg_client
+        self.realm = clean_realm
+        await pg_client.create_vertex_table(
+            "mv_verts",
+            vector_columns={"entity_emb": 3, "fact_emb": 3},
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_table_with_vector_columns(self):
+        row = await self.client.fetchrow(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'mv_verts' AND column_name = 'entity_emb'"
+        )
+        assert row is not None
+
+    @pytest.mark.asyncio
+    async def test_add_vertex_with_named_embeddings(self):
+        v = await self.client.add_vertex(
+            "mv_verts", self.realm,
+            payload={"name": "test"},
+            embeddings={"entity_emb": [0.1, 0.2, 0.3], "fact_emb": [0.4, 0.5, 0.6]},
+        )
+        assert v.embeddings is not None
+        assert "entity_emb" in v.embeddings
+        assert len(v.embeddings["entity_emb"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_upsert_vertex_with_named_embeddings(self):
+        v = await self.client.upsert_vertex(
+            "mv_verts", self.realm,
+            payload={"name": "upserted"},
+            embeddings={"entity_emb": [0.7, 0.8, 0.9]},
+        )
+        assert v.embeddings is not None
+        assert "entity_emb" in v.embeddings
+
+    @pytest.mark.asyncio
+    async def test_vector_search_on_named_column(self):
+        await self.client.add_vertex(
+            "mv_verts", self.realm,
+            payload={"name": "close"},
+            embeddings={"entity_emb": [0.1, 0.2, 0.3]},
+        )
+        await self.client.add_vertex(
+            "mv_verts", self.realm,
+            payload={"name": "far"},
+            embeddings={"entity_emb": [0.9, 0.8, 0.7]},
+        )
+        results = await self.client.vector_search(
+            "mv_verts", self.realm,
+            query_vector=[0.1, 0.2, 0.3],
+            top_k=2,
+            column_name="entity_emb",
+        )
+        assert len(results) == 2
+        assert results[0][0].payload["name"] == "close"
+
+    @pytest.mark.asyncio
+    async def test_search_different_columns_return_different_order(self):
+        await self.client.add_vertex(
+            "mv_verts", self.realm,
+            payload={"name": "a"},
+            embeddings={"entity_emb": [1.0, 0.0, 0.0], "fact_emb": [0.0, 0.0, 1.0]},
+        )
+        await self.client.add_vertex(
+            "mv_verts", self.realm,
+            payload={"name": "b"},
+            embeddings={"entity_emb": [0.0, 0.0, 1.0], "fact_emb": [1.0, 0.0, 0.0]},
+        )
+        entity_results = await self.client.vector_search(
+            "mv_verts", self.realm, [1.0, 0.0, 0.0], top_k=2, column_name="entity_emb",
+        )
+        fact_results = await self.client.vector_search(
+            "mv_verts", self.realm, [1.0, 0.0, 0.0], top_k=2, column_name="fact_emb",
+        )
+        assert entity_results[0][0].payload["name"] == "a"
+        assert fact_results[0][0].payload["name"] == "b"

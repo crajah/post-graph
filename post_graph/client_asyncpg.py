@@ -1,9 +1,10 @@
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import asyncpg
 
+from post_graph import promoted as _promoted
 from post_graph.errors import (
     VertexNotFoundError,
     EdgeNotFoundError,
@@ -44,6 +45,7 @@ class AsyncPostGraph:
         }
         self._pool = None
         self._schema_cache = {}
+        self._promoted_cache = {}
 
     async def connect(self):
         """Establish connection or connection pool to PostgreSQL."""
@@ -226,6 +228,8 @@ class AsyncPostGraph:
         realm: Optional[str] = None,
         vector_dim: Optional[int] = None,
         vector_columns: Optional[Dict[str, int]] = None,
+        temporal_keys: Optional[Sequence[str]] = None,
+        promoted_keys: Optional[Sequence[str]] = None,
     ):
         """Create a new vertex table and its associated shadow audit table, indexes, and triggers."""
         self._validate_identifier(table_name)
@@ -315,6 +319,12 @@ class AsyncPostGraph:
         await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();")
         await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);')
 
+        # Hot payload keys as generated, indexed columns. Maintained by
+        # PostgreSQL from payload, so writers are unaffected; see promoted.py.
+        for stmt in _promoted.all_column_ddl(table_ref, table_name, temporal_keys, promoted_keys):
+            await self._execute(stmt)
+        self._promoted_cache.pop((realm, table_name), None)
+
         # 2. Create shadow audit table
         audit_query = f"""
         CREATE TABLE IF NOT EXISTS {audit_table_ref} (
@@ -389,6 +399,8 @@ class AsyncPostGraph:
         realm: Optional[str] = None,
         vector_dim: Optional[int] = None,
         vector_columns: Optional[Dict[str, int]] = None,
+        temporal_keys: Optional[Sequence[str]] = None,
+        promoted_keys: Optional[Sequence[str]] = None,
     ):
         """Create a new edge table linking two vertex tables, plus shadow audit table and constraints.
 
@@ -454,6 +466,12 @@ class AsyncPostGraph:
         await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{from_vertex_table}-{to_vertex_table}' || '/' || id::text) STORED;")
         await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();")
         await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);')
+
+        # Hot payload keys as generated, indexed columns. Maintained by
+        # PostgreSQL from payload, so writers are unaffected; see promoted.py.
+        for stmt in _promoted.all_column_ddl(table_ref, table_name, temporal_keys, promoted_keys):
+            await self._execute(stmt)
+        self._promoted_cache.pop((realm, table_name), None)
 
         # 2. Create shadow audit table
         audit_query = f"""
@@ -2299,6 +2317,27 @@ class AsyncPostGraph:
             f"COALESCE(NULLIF(split_part({expr}, '-', 3), ''), '01'))"
         )
 
+    async def _promoted_columns(self, table_name: str, realm: Optional[str] = None) -> set:
+        """Promoted column names present on a table, cached.
+
+        A table created before promotion existed, or created with different
+        keys, simply lacks the column — callers fall back to the payload
+        expression, which returns the same rows more slowly.
+        """
+        cache_key = (realm, table_name)
+        if cache_key in self._promoted_cache:
+            return self._promoted_cache[cache_key]
+        schema = realm if self.schema_per_realm else 'public'
+        rows = await self._fetch(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = $1 AND table_name = $2 "
+            "AND (column_name LIKE 'pt\\_%' OR column_name LIKE 'p\\_%')",
+            schema, table_name,
+        )
+        cols = {r['column_name'] for r in rows}
+        self._promoted_cache[cache_key] = cols
+        return cols
+
     def _edge_filter_sql(
         self,
         relation_types: Optional[List[str]],
@@ -2308,6 +2347,7 @@ class AsyncPostGraph:
         valid_from_key: str,
         valid_to_key: str,
         first_param: int,
+        promoted_columns: Optional[set] = None,
     ) -> Tuple[str, List[Any]]:
         """Build the WHERE fragment applied to every edge step of a traversal.
 
@@ -2332,19 +2372,33 @@ class AsyncPostGraph:
         # A relation with no stated period holds at every date: silence about
         # when a fact applied means it applied throughout, not that it never did.
         if as_of:
-            vf = f"payload->>'{valid_from_key}'"
-            vt = f"payload->>'{valid_to_key}'"
             at = self._padded_date_sql(f"${n}::text")
-            clauses.append(
-                f"(({vf} IS NULL OR {self._padded_date_sql(vf)} <= {at}) AND "
-                f"({vt} IS NULL OR {self._padded_date_sql(vt)} >= {at}))"
-            )
+            vf_col = _promoted.temporal_column(valid_from_key)
+            vt_col = _promoted.temporal_column(valid_to_key)
+            if promoted_columns and vf_col in promoted_columns and vt_col in promoted_columns:
+                # Indexed generated columns holding the same normalised date the
+                # expression below computes: identical rows, index instead of scan.
+                clauses.append(
+                    f'(("{vf_col}" IS NULL OR "{vf_col}" <= {at}) AND '
+                    f'("{vt_col}" IS NULL OR "{vt_col}" >= {at}))'
+                )
+            else:
+                vf = f"payload->>'{valid_from_key}'"
+                vt = f"payload->>'{valid_to_key}'"
+                clauses.append(
+                    f"(({vf} IS NULL OR {self._padded_date_sql(vf)} <= {at}) AND "
+                    f"({vt} IS NULL OR {self._padded_date_sql(vt)} >= {at}))"
+                )
             params.append(as_of)
             n += 1
 
         for key in payload_null_keys or []:
             self._validate_identifier(key)
-            clauses.append(f"payload->>'{key}' IS NULL")
+            col = _promoted.generic_column(key)
+            if promoted_columns and col in promoted_columns:
+                clauses.append(f'"{col}" IS NULL')
+            else:
+                clauses.append(f"payload->>'{key}' IS NULL")
 
         return ("".join(f" AND {c}" for c in clauses), params)
 
@@ -2386,10 +2440,19 @@ class AsyncPostGraph:
 
         start_id_str = str(start_id).split('/')[-1] if '/' in str(start_id) else str(start_id)
 
+        # One filter fragment is shared by every edge table in the walk, so a
+        # promoted column may only be used when *all* of them have it. Mixed
+        # tables fall back to the payload expression: same rows, slower.
+        promoted_columns = None
+        for edge_table in edge_tables:
+            cols = await self._promoted_columns(edge_table, realm)
+            promoted_columns = cols if promoted_columns is None else (promoted_columns & cols)
+
         # $1..$4 are realm, start id, start table and depth; filters follow.
         filter_sql, filter_params = self._edge_filter_sql(
             relation_types, as_of, payload_null_keys, space,
             valid_from_key, valid_to_key, first_param=5,
+            promoted_columns=promoted_columns,
         )
 
         subqueries = []

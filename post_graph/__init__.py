@@ -9,6 +9,11 @@ from post_graph.errors import (
 )
 from post_graph.models import Vertex, Edge, TraversalStep
 from post_graph.client_asyncpg import AsyncPostGraph, RESERVED_SPACE_ALL
+from post_graph.cypher import (
+    CypherSession,
+    CypherSyntaxError,
+    CypherTranslationError,
+)
 
 try:
     from post_graph.client_sqlalchemy import SQLAlchemyPostGraph
@@ -18,6 +23,9 @@ except ImportError:
 __version__ = "0.8.0"
 
 __all__ = [
+    'CypherSession',
+    'CypherSyntaxError',
+    'CypherTranslationError',
     "__version__",
     "PostGraphError",
     "VertexNotFoundError",

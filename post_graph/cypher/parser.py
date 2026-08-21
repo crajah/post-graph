@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from .ast import (
     BoolOp, Comparison, Create, Delete, FunctionCall, IsNull, Literal, Match,
     Merge, Not, NodePattern, OrderItem, Param, PathPattern, Property, Query,
-    RelPattern, Remove, Return, ReturnItem, SetClause, Unwind, Variable, With,
+    RelPattern, Remove, Return, ReturnItem, SetClause, UnaryOp, Unwind, Variable,
+    With,
 )
 from .lexer import CypherSyntaxError, Token, tokenize
 
@@ -389,11 +390,26 @@ class Parser:
         return left
 
     def parse_multiplicative(self) -> Any:
-        left = self.parse_atom()
+        left = self.parse_unary()
         while self.cur.kind == 'OP' and self.cur.value in ('*', '/', '%'):
             op = self.advance().value
-            left = Comparison(op, left, self.parse_atom())
+            left = Comparison(op, left, self.parse_unary())
         return left
+
+    def parse_unary(self) -> Any:
+        if self.cur.kind == 'OP' and self.cur.value in ('-', '+'):
+            op = self.advance().value
+            operand = self.parse_unary()          # right-associative: --a
+            # Fold a negated numeric literal so it stays a literal, which keeps
+            # numeric comparison detection working for WHERE n.x > -1.
+            if op == '-' and isinstance(operand, Literal) \
+                    and isinstance(operand.value, (int, float)) \
+                    and not isinstance(operand.value, bool):
+                return Literal(-operand.value)
+            if op == '+':
+                return operand
+            return UnaryOp(op, operand)
+        return self.parse_atom()
 
     def parse_atom(self) -> Any:
         t = self.cur

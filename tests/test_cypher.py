@@ -398,3 +398,53 @@ class TestCypherExecution:
         s, _, _ = graph
         sql = await s.explain("MATCH (p:Person) RETURN p.name AS name")
         assert sql.upper().startswith('SELECT')
+
+
+class TestUnaryAndRowCounts:
+    """Gaps the openCypher TCK harness surfaced."""
+
+    def test_unary_minus_on_property(self):
+        from post_graph.cypher.ast import UnaryOp
+        expr = parse("MATCH (n) RETURN -n.a AS neg").clauses[1].items[0].expression
+        assert isinstance(expr, UnaryOp) and expr.op == '-'
+
+    def test_unary_minus_binds_tighter_than_multiplication(self):
+        from post_graph.cypher.ast import UnaryOp
+        expr = parse("MATCH (n) RETURN -n.a * n.b AS x").clauses[1].items[0].expression
+        assert isinstance(expr.left, UnaryOp)
+
+    def test_negative_literal_folds_to_a_literal(self):
+        # Folding keeps numeric-comparison detection working for n.a > -1.
+        w = parse("MATCH (n) WHERE n.a > -1 RETURN n").clauses[0].where
+        assert isinstance(w.right, A.Literal) and w.right.value == -1
+
+    def test_unary_plus_is_identity(self):
+        expr = parse("MATCH (n) RETURN +n.a AS x").clauses[1].items[0].expression
+        assert isinstance(expr, A.Property)
+
+    def test_double_negation(self):
+        from post_graph.cypher.ast import UnaryOp
+        expr = parse("MATCH (n) RETURN --n.a AS x").clauses[1].items[0].expression
+        assert isinstance(expr, UnaryOp) and isinstance(expr.operand, UnaryOp)
+
+    def test_unary_minus_translates(self):
+        sql, _, _ = _sql("MATCH (n:Person) RETURN -n.age AS neg")
+        assert '::numeric' in sql
+
+    @pytest.mark.parametrize("clause,value", [
+        ("LIMIT", "-1"), ("SKIP", "-1"), ("LIMIT", "1.5"), ("SKIP", "2.5"),
+    ])
+    def test_row_counts_must_be_non_negative_integers(self, clause, value):
+        # Passed through, these surface as a driver error naming a SQL clause
+        # the caller never wrote.
+        with pytest.raises(CypherTranslationError):
+            _sql(f"MATCH (n:Person) RETURN n.name {clause} {value}")
+
+    @pytest.mark.parametrize("clause", ["LIMIT", "SKIP"])
+    def test_valid_row_counts_are_accepted(self, clause):
+        sql, _, _ = _sql(f"MATCH (n:Person) RETURN n.name {clause} 5")
+        assert clause.replace('SKIP', 'OFFSET') in sql
+
+    def test_negative_row_count_via_parameter_is_caught(self):
+        with pytest.raises(CypherTranslationError):
+            _sql("MATCH (n:Person) RETURN n.name LIMIT $n", parameters={'n': -3})

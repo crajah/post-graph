@@ -226,3 +226,6 @@ reports/
 
 # Claude Code
 .claude/
+
+# openCypher TCK corpus, fetched by tests/tck/fetch_tck.sh
+tests/tck/features/

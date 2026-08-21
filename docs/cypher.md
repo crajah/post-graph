@@ -56,7 +56,7 @@ which must begin and end on the same label.
 
 **Predicates** — `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `XOR`, `NOT`,
 `IS NULL`, `IS NOT NULL`, `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~`,
-and arithmetic.
+arithmetic, and unary `-`/`+`.
 
 **Functions** — `count`, `sum`, `avg`, `min`, `max`, `collect` (with `DISTINCT`),
 `id`, `labels`, `type`, `properties`, `keys`, `toUpper`, `toLower`, `trim`,
@@ -112,3 +112,42 @@ await client.create_edge_table(
 
 Variable-length patterns become a recursive CTE bounded at 8 hops when you give
 no upper bound, so an unbounded `*` cannot walk a cyclic graph forever.
+
+## Conformance
+
+Conformance is measured against the [openCypher TCK](https://github.com/opencypher/openCypher/tree/master/tck),
+not asserted. Fetch the corpus and run it:
+
+```bash
+tests/tck/fetch_tck.sh
+pytest tests/test_tck.py
+```
+
+Of 1,615 TCK scenarios:
+
+| | |
+| :--- | ---: |
+| passed | 179 |
+| failed | 0 |
+| errored | 0 |
+| unsupported — refused by this dialect | 1,132 |
+| skipped — needs TCK machinery this harness does not model | 304 |
+
+Read that honestly. 179 is not a coverage score: most of the corpus assumes a
+schema-free graph where `CREATE (:Foo)` invents a label and `MATCH (n)` scans
+every node, which is not post-graph's model — a label is a table that has to
+exist. Those scenarios are counted as *unsupported*, which is the documented
+behaviour, rather than hidden.
+
+What the harness is for is the two numbers that must stay at zero. **errored**
+means a scenario raised something other than a clean refusal — always a bug.
+**failed** means a query ran and returned the wrong answer — always a bug. The
+suite asserts both are zero and that the passing count does not regress.
+
+It has already earned that: it found unary minus missing entirely, and negative
+and fractional `SKIP`/`LIMIT` being passed through to PostgreSQL, where they
+surfaced as a driver error naming a SQL clause the caller never wrote.
+
+The 304 skipped scenarios need `CALL` procedures, side-effect assertions, or the
+TCK's named fixture graphs — machinery this harness does not model, and separate
+from what the dialect supports.

@@ -53,6 +53,14 @@ class Not:
 
 
 @dataclass
+class UnaryOp:
+    """-x or +x. A precedence level of its own, above multiplication, so
+    -a * b parses as (-a) * b and -a.b reads the property before negating."""
+    op: str          # '-' | '+'
+    operand: Any
+
+
+@dataclass
 class BoolOp:
     op: str          # AND / OR / XOR
     left: Any

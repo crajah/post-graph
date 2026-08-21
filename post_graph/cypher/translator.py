@@ -20,7 +20,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .. import promoted as _promoted
 from .ast import (
     BoolOp, Comparison, FunctionCall, IsNull, Literal, Match, Not, NodePattern,
-    Param, PathPattern, Property, Query, RelPattern, Return, Variable, With,
+    Param, PathPattern, Property, Query, RelPattern, Return, UnaryOp, Variable,
+    With,
 )
 from .lexer import CypherSyntaxError
 
@@ -122,6 +123,9 @@ class Translator:
             return f"({inner} IS {'NOT ' if node.negated else ''}NULL)"
         if isinstance(node, Not):
             return f"(NOT {self.expr(node.operand)})"
+        if isinstance(node, UnaryOp):
+            # Payload values are text, so negation has to be numeric explicitly.
+            return f"({node.op}({self.expr(node.operand)})::numeric)"
         if isinstance(node, BoolOp):
             left, right = self.expr(node.left), self.expr(node.right)
             if node.op == 'XOR':
@@ -253,6 +257,8 @@ class Translator:
         if isinstance(node, BoolOp):
             return Translator.has_aggregate(node.left) or Translator.has_aggregate(node.right)
         if isinstance(node, Not):
+            return Translator.has_aggregate(node.operand)
+        if isinstance(node, UnaryOp):
             return Translator.has_aggregate(node.operand)
         if isinstance(node, IsNull):
             return Translator.has_aggregate(node.operand)
@@ -485,12 +491,34 @@ class Translator:
                     terms.append(f'{self.expr(o.expression)}{" DESC" if o.descending else ""}')
             sql += ' ORDER BY ' + ', '.join(terms)
         if ret.limit is not None:
-            sql += f' LIMIT {self.expr(ret.limit)}'
+            sql += f' LIMIT {self._row_count(ret.limit, "LIMIT")}'
         if ret.skip is not None:
-            sql += f' OFFSET {self.expr(ret.skip)}'
+            sql += f' OFFSET {self._row_count(ret.skip, "SKIP")}'
         if self._ctes:
             sql = 'WITH RECURSIVE ' + ', '.join(self._ctes) + ' ' + sql
         return sql, self.params, columns
+
+    def _row_count(self, node: Any, clause: str) -> str:
+        """SKIP/LIMIT take a non-negative integer.
+
+        Cypher rejects a negative or fractional row count when the query is
+        compiled. Passing it through would surface as a driver error naming a
+        SQL clause the caller never wrote, so it is refused here instead.
+        """
+        value = None
+        if isinstance(node, Literal):
+            value = node.value
+        elif isinstance(node, Param):
+            value = self.parameters.get(node.name)
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise CypherTranslationError(f"{clause} requires an integer")
+            if isinstance(value, float) and not value.is_integer():
+                raise CypherTranslationError(f"{clause} requires an integer, not {value}")
+            if value < 0:
+                raise CypherTranslationError(f"{clause} must not be negative")
+            return self._bind(int(value))
+        return self.expr(node)
 
     @staticmethod
     def _default_name(expression: Any, idx: int) -> str:

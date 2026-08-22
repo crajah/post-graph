@@ -448,3 +448,109 @@ class TestUnaryAndRowCounts:
     def test_negative_row_count_via_parameter_is_caught(self):
         with pytest.raises(CypherTranslationError):
             _sql("MATCH (n:Person) RETURN n.name LIMIT $n", parameters={'n': -3})
+
+
+@requires_pg
+class TestExplain:
+    """explain() must describe reads and writes differently, because they are
+    executed differently — one SQL statement versus a sequence of client calls."""
+
+    @pytest.fixture()
+    async def session(self, pg_client_spr, clean_realm_spr):
+        from post_graph import CypherSession
+        realm = clean_realm_spr
+        await pg_client_spr.create_vertex_table("person", realm=realm)
+        await pg_client_spr.create_edge_table("knows", from_vertex_table="person",
+                                              to_vertex_table="person", realm=realm)
+        return CypherSession(pg_client_spr, realm)
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_read_returns_sql(self, session):
+        sql = await session.explain("MATCH (p:Person) RETURN p.name AS n")
+        assert sql.upper().startswith('SELECT')
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_create_describes_client_operations(self, session):
+        plan = await session.explain("CREATE (p:Person {name: 'X'})")
+        assert 'add_vertex' in plan
+        # It must not look like SQL: a write is not one statement, and saying so
+        # is the point of the header line.
+        assert 'not as one SQL statement' in plan
+        assert not plan.upper().startswith('SELECT')
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_create_relationship_lists_both_endpoints_and_the_edge(self, session):
+        plan = await session.explain(
+            "CREATE (a:Person {name:'A'})-[:KNOWS]->(b:Person {name:'B'})")
+        assert plan.count('add_vertex') == 2 and 'add_edge' in plan
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_merge_shows_both_branches(self, session):
+        plan = await session.explain("MERGE (p:Person {name:'X'}) ON MATCH SET p.seen = 'y'")
+        assert 'if found' in plan and 'if absent' in plan
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_set_is_described(self, session):
+        plan = await session.explain("CREATE (p:Person {name:'Y'}) SET p.age = 44")
+        assert 'upsert_vertex' in plan and 'age' in plan
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_delete_is_described(self, session):
+        plan = await session.explain("CREATE (p:Person {name:'Z'}) DETACH DELETE p")
+        assert 'delete_vertex' in plan and 'DETACH' in plan
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_explain_does_not_execute(self, session):
+        await session.explain("CREATE (p:Person {name: 'ghost'})")
+        rows = await session.run("MATCH (p:Person) WHERE p.name = 'ghost' RETURN count(*) AS c")
+        assert rows[0]['c'] == 0
+
+
+@requires_pg
+class TestWriteAtomicity:
+    """Cypher treats a query as a unit. A CREATE that fails partway must leave
+    nothing behind — otherwise a rejected query silently half-applies, which is
+    worse than either succeeding or failing."""
+
+    @pytest.fixture()
+    async def session(self, pg_client_spr, clean_realm_spr):
+        from post_graph import CypherSession
+        realm = clean_realm_spr
+        await pg_client_spr.create_vertex_table("person", realm=realm)
+        await pg_client_spr.create_vertex_table("company", realm=realm)
+        await pg_client_spr.create_edge_table("knows", from_vertex_table="person",
+                                              to_vertex_table="person", realm=realm)
+        return CypherSession(pg_client_spr, realm)
+
+    @staticmethod
+    async def _people(session):
+        return (await session.run("MATCH (p:Person) RETURN count(*) AS n"))[0]['n']
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_failed_relationship_rolls_back_its_vertices(self, session):
+        # Both vertices are created before the relationship is found to be
+        # unroutable, so a non-transactional write would leave them behind.
+        with pytest.raises(CypherTranslationError):
+            await session.run(
+                "CREATE (a:Person {name:'A'})-[:WORKS_AT]->(b:Company {name:'Acme'})")
+        assert await self._people(session) == 0
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_failed_second_pattern_rolls_back_the_first(self, session):
+        with pytest.raises(CypherTranslationError):
+            await session.run(
+                "CREATE (x:Person {name:'P1'}), (y:Person {name:'P2'}), (z:Unicorn {name:'P3'})")
+        assert await self._people(session) == 0
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_successful_write_still_commits(self, session):
+        await session.run("CREATE (a:Person {name:'A'})-[:KNOWS]->(b:Person {name:'B'})")
+        assert await self._people(session) == 2
+        rows = await session.run("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.name AS b")
+        assert rows == [{'b': 'B'}]
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_set_on_an_unknown_variable_rolls_back_the_create(self, session):
+        with pytest.raises(CypherTranslationError):
+            await session.run("CREATE (p:Person {name:'X'}) SET q.age = 1")
+        assert await self._people(session) == 0

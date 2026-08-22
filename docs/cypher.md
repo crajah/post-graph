@@ -23,8 +23,9 @@ rows = await session.run(
 )
 ```
 
-`session.explain(query)` returns the SQL a read becomes, which is the honest way
-to check what you are actually asking the database.
+`session.explain(query)` shows what a query will do without doing it: the SQL for
+a read, and for a write the sequence of client operations it will perform, since
+a write is not one statement. Running it changes nothing.
 
 ## How Cypher maps onto post-graph
 
@@ -67,6 +68,12 @@ arithmetic, and unary `-`/`+`.
 with `ON CREATE SET` and `ON MATCH SET`, `SET`, `DELETE`. Writes go through the
 client's own methods rather than generated SQL, so audit tables, triggers and
 realm rules behave exactly as they do for any other caller.
+
+A write query is **atomic**. The whole query runs in one transaction, so a
+`CREATE` whose relationship cannot be routed does not leave its nodes behind.
+If you constructed the client with a bare connection rather than a pool, you are
+managing the transaction yourself and the query joins yours rather than opening
+a second one.
 
 **Parameters** — `$name`, supplied as a dict. Every literal and parameter is
 bound, never interpolated, so a value that looks like SQL is data.

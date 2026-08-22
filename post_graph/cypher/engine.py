@@ -81,10 +81,70 @@ class CypherSession:
         return await self._run_read(ast, parameters or {})
 
     async def explain(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> str:
-        """The SQL a read query becomes — for debugging and for trusting it."""
+        """What a query will do, without doing it.
+
+        A read becomes one SQL statement and that statement is returned. A write
+        does not: CREATE, MERGE, SET and DELETE are carried out through the
+        client's own methods so audit tables and triggers behave, which means
+        there is no single statement to show. For those, the plan of client
+        operations is returned instead — labelled as operations, because
+        presenting them as SQL would misrepresent what runs.
+        """
         await self._discover()
-        sql, params, _ = self._translate(parse(query), parameters or {})
+        ast = parse(query)
+        kinds = {type(c).__name__ for c in ast.clauses}
+        if kinds & {'Create', 'Merge', 'SetClause', 'Delete', 'Remove'}:
+            return self._explain_write(ast, parameters or {})
+        sql, params, _ = self._translate(ast, parameters or {})
         return sql
+
+    def _explain_write(self, ast: Query, parameters: Dict[str, Any]) -> str:
+        """Describe the client calls a write query will make."""
+        lines = ["-- write query: executed as client operations, not as one SQL statement"]
+        for clause in ast.clauses:
+            if isinstance(clause, Create):
+                for pattern in clause.patterns:
+                    for node in pattern.nodes:
+                        table = self._label_table(node.labels)
+                        payload = {k: self._static_value(v, parameters)
+                                   for k, v in node.properties.items()}
+                        name = node.variable or '_'
+                        lines.append(f"add_vertex({table!r}, realm={self.realm!r}, "
+                                     f"payload={payload!r})  -> {name}")
+                    for rel, left, right in zip(pattern.rels, pattern.nodes, pattern.nodes[1:]):
+                        a, b = left.variable or '_', right.variable or '_'
+                        if rel.direction == 'in':
+                            a, b = b, a
+                        rtype = rel.types[0] if rel.types else '?'
+                        payload = {k: self._static_value(v, parameters)
+                                   for k, v in rel.properties.items()}
+                        try:
+                            table = self._edge_table_for(
+                                self._label_table(left.labels),
+                                self._label_table(right.labels), rel.direction)
+                        except CypherTranslationError as exc:
+                            table = f"<{exc}>"
+                        lines.append(f"add_edge({table!r}, realm={self.realm!r}, "
+                                     f"from={a}, to={b}, type={rtype!r}, payload={payload!r})")
+            elif isinstance(clause, Merge):
+                node = clause.pattern.nodes[0]
+                table = self._label_table(node.labels)
+                props = {k: self._static_value(v, parameters)
+                         for k, v in node.properties.items()}
+                lines.append(f"SELECT id FROM {table} WHERE payload matches {props!r}")
+                lines.append(f"  if found: upsert_vertex({table!r}) applying ON MATCH SET "
+                             f"{[p.key for p, _ in clause.on_match]!r}")
+                lines.append(f"  if absent: add_vertex({table!r}, payload={props!r}) "
+                             f"plus ON CREATE SET {[p.key for p, _ in clause.on_create]!r}")
+            elif isinstance(clause, SetClause):
+                for prop, value in clause.assignments:
+                    lines.append(f"upsert_vertex(<{prop.variable}>) setting "
+                                 f"{prop.key!r} = {self._static_value(value, parameters)!r}")
+            elif isinstance(clause, Delete):
+                for name in clause.variables:
+                    lines.append(f"delete_vertex(<{name}>)"
+                                 + ("  [DETACH]" if clause.detach else ""))
+        return "\n".join(lines)
 
     def _translate(self, ast: Query, parameters: Dict[str, Any]):
         self._last_json_columns: List[str] = []

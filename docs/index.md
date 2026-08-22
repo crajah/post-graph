@@ -49,7 +49,7 @@ There is also a practical constraint worth checking before adopting: AGE's setup
 |  | Neo4j | Apache AGE | post-graph |
 | :--- | :---: | :---: | :---: |
 | Runs inside your PostgreSQL | ❌ | ✅ | ✅ |
-| openCypher | ✅ | ✅ | ❌ |
+| openCypher | ✅ | ✅ | ⚠️ documented subset |
 | Tables you may index and constrain | n/a | ❌ discouraged | ✅ |
 | Vector search on vertices *and* edges | via plugin | ❌ | ✅ |
 | Shadow audit log of every mutation | enterprise | ❌ | ✅ |
@@ -147,9 +147,53 @@ That distinction is the whole design. Filtering a result set still allows a path
 
 `payload_null_keys` is deliberately generic. post-graph does not know what "superseded" means; it knows how to skip edges whose payload key is absent. The meaning stays in the layer that has it.
 
+## Properties you filter on, as indexed columns
+
+Properties live in `payload` JSONB, which is flexible and opaque to the planner. `payload->>'valid_from' <= '2024-01-01'` cannot use an index, so the `as_of` filter — running on every step of every walk — degraded to a sequential scan.
+
+Since 1.0.0 the hot keys are promoted to generated columns that PostgreSQL maintains from `payload`. Nothing about writing changes:
+
+```python
+await pg.create_edge_table(
+    "relations",
+    from_vertex_table="entities", to_vertex_table="entities",
+    realm=realm,
+    promoted_keys=["superseded_by"],   # p_superseded_by, indexed
+)
+
+await pg.add_edge("relations", realm, a, b, "generates_cash_flow",
+                  payload={"valid_from": "2024-06"})   # unchanged
+```
+
+`valid_from` and `valid_to` are promoted by default as `pt_valid_from` and `pt_valid_to`, holding the date normalised to `YYYY-MM-DD` so a partial date like `'2024'` orders correctly against a full one. On 65k rows the temporal filter moved from a 588-buffer sequential scan to a 27-buffer bitmap index scan — roughly 31ms to 2.5ms warm — and the margin grows with the table.
+
+Two things this deliberately does not do. It does not change the model: `Vertex` and `Edge` carry no new fields, because a promoted column is derived, read-only, and present only on tables created since the feature existed. And it does not touch existing tables — a realm created earlier keeps working and returns the same rows through `payload->>`, without the index.
+
+## A Cypher subset, measured rather than claimed
+
+```python
+from post_graph import CypherSession
+
+session = CypherSession(pg, realm="my_realm")
+await session.run(
+    "MATCH (p:Person)-[:KNOWS*1..3]->(f:Person) "
+    "WHERE p.name = $name AND f.age > 30 "
+    "RETURN DISTINCT f.name AS friend ORDER BY friend",
+    {"name": "Alice"},
+)
+```
+
+A label is a vertex table, a relationship type is a value in `relation_type`, a property is a payload key — read through a promoted column when one exists, so Cypher inherits the index work for free.
+
+Reads compile to a single SQL statement. Writes do not: `CREATE`, `MERGE`, `SET` and `DELETE` run through the client's own methods so audit tables, triggers and realm rules behave as for any other caller, and the whole query runs in one transaction, so a `CREATE` whose relationship cannot be routed leaves nothing behind. `session.explain(query)` shows either — the SQL for a read, the operation sequence for a write — without running it.
+
+The interesting part is what it refuses. `WITH`, `UNION`, `OPTIONAL MATCH`, path variables, multiple labels and `RETURN *` all raise, with a position or a reason. A query answered slightly differently from how it was written is worse than one that is rejected, because the caller cannot tell which happened.
+
+Conformance is measured, not asserted. The openCypher TCK is 1,615 Cucumber scenarios; run against post-graph, 179 pass, 0 fail and 0 error, with 1,132 refused as outside the subset and 304 needing TCK machinery the harness does not model. That 179 is not a coverage score — most of the corpus assumes a schema-free graph where `CREATE (:Foo)` invents a label and `MATCH (n)` scans every node, which is not this model. The numbers that matter are the two held at zero, and the harness has already earned its place: it found unary minus missing entirely, and negative `SKIP`/`LIMIT` reaching PostgreSQL as a driver error naming a clause the caller never wrote.
+
 ## What this is not
 
-**There is no openCypher.** For multi-hop patterns with predicates and projections, Cypher is more ergonomic than a Python API, and if that is your primary interface then Neo4j or AGE is the better tool. What post-graph offers instead is filtered traversal that composes with the tenancy, temporal and vector predicates the same query already needs — which a separate graph engine cannot do.
+**Cypher is a subset, not the whole language.** Since 1.0.0 there is a Cypher query surface (see below), but it is a documented subset and it refuses what it cannot express. If full Cypher is your primary interface, Neo4j or AGE remains the better tool. What post-graph offers is filtered traversal that composes with the tenancy, temporal and vector predicates the same query already needs — which a separate graph engine cannot do — with Cypher available on top of it.
 
 **There is no query planner for graph patterns.** Recursive CTEs are executed by PostgreSQL's planner, which is excellent at set operations and knows nothing about graph cardinality. Deep unbounded traversal on a dense graph will find that out: three hops from one well-connected vertex in a real 3,000-vertex graph reached over 25,000 rows. Bound your depth and cap your fan-out.
 

@@ -201,19 +201,47 @@ class CypherSession:
         return table
 
     async def _run_write(self, ast: Query, parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Run a write query atomically.
+
+        Cypher treats a query as a unit: a CREATE that fails partway must leave
+        nothing behind. Each client call opens its own transaction, so running
+        them in sequence would commit the vertices of a pattern whose
+        relationship then failed. One transaction spans the whole query instead.
+
+        When the caller already handed us a bare connection rather than a pool,
+        they are managing the transaction themselves and we run inside theirs.
+        """
+        pool = self.client.connection
+        if pool is None or not hasattr(pool, 'acquire'):
+            return await self._apply_write(self.client, ast, parameters)
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                tx_client = type(self.client)(
+                    connection_or_pool=conn,
+                    schema_per_realm=self.client.schema_per_realm,
+                )
+                # The schema and promotion caches are expensive to rebuild and
+                # describe the database, not the connection.
+                tx_client._schema_cache = self.client._schema_cache
+                tx_client._promoted_cache = self.client._promoted_cache
+                return await self._apply_write(tx_client, ast, parameters)
+
+    async def _apply_write(self, client, ast: Query,
+                           parameters: Dict[str, Any]) -> List[Dict[str, Any]]:
         created: Dict[str, Any] = {}
         results: List[Dict[str, Any]] = []
 
         for clause in ast.clauses:
             if isinstance(clause, Create):
                 for pattern in clause.patterns:
-                    await self._create_pattern(pattern, parameters, created)
+                    await self._create_pattern(client, pattern, parameters, created)
             elif isinstance(clause, Merge):
-                await self._merge_pattern(clause, parameters, created)
+                await self._merge_pattern(client, clause, parameters, created)
             elif isinstance(clause, Delete):
-                await self._delete(clause, created)
+                await self._delete(client, clause, created)
             elif isinstance(clause, SetClause):
-                await self._set(clause, parameters, created)
+                await self._set(client, clause, parameters, created)
             elif isinstance(clause, Match):
                 raise CypherTranslationError(
                     "MATCH combined with a write clause is not supported; "
@@ -233,13 +261,13 @@ class CypherSession:
         return {'id': node.id, 'uuid': getattr(node, 'uuid', None),
                 'properties': getattr(node, 'payload', None)}
 
-    async def _create_pattern(self, pattern: PathPattern, parameters, created) -> None:
+    async def _create_pattern(self, client, pattern: PathPattern, parameters, created) -> None:
         for node in pattern.nodes:
             if node.variable and node.variable in created:
                 continue
             table = self._label_table(node.labels)
             payload = {k: self._static_value(v, parameters) for k, v in node.properties.items()}
-            vertex = await self.client.add_vertex(table, self.realm, payload=payload)
+            vertex = await client.add_vertex(table, self.realm, payload=payload)
             if node.variable:
                 created[node.variable] = vertex
             else:
@@ -258,7 +286,7 @@ class CypherSession:
             table = self._edge_table_for(
                 self._label_table(left.labels), self._label_table(right.labels), rel.direction)
             payload = {k: self._static_value(v, parameters) for k, v in rel.properties.items()}
-            edge = await self.client.add_edge(table, self.realm, a.id, b.id, rel.types[0],
+            edge = await client.add_edge(table, self.realm, a.id, b.id, rel.types[0],
                                               payload=payload)
             if rel.variable:
                 created[rel.variable] = edge
@@ -271,7 +299,7 @@ class CypherSession:
                 return tbl
         raise CypherTranslationError(f"No edge table joins {from_table} to {to_table}")
 
-    async def _merge_pattern(self, clause: Merge, parameters, created) -> None:
+    async def _merge_pattern(self, client, clause: Merge, parameters, created) -> None:
         """MERGE is match-or-create on the pattern's stated properties."""
         pattern = clause.pattern
         if pattern.rels:
@@ -281,30 +309,30 @@ class CypherSession:
         props = {k: self._static_value(v, parameters) for k, v in node.properties.items()}
         if not props:
             raise CypherTranslationError("MERGE needs at least one property to match on")
-        ref = self.client._get_table_ref(table, self.realm)
+        ref = client._get_table_ref(table, self.realm)
         conds, params = ['realm = $1'], [self.realm]
         for key, value in props.items():
             params.append(str(value))
             conds.append(f"payload->>'{key}' = ${len(params)}")
-        row = await self.client._fetchrow(
+        row = await client._fetchrow(
             f"SELECT id FROM {ref} WHERE {' AND '.join(conds)} LIMIT 1", *params)
         if row:
-            existing = await self.client.get_vertex(table, self.realm, str(row['id']))
+            existing = await client.get_vertex(table, self.realm, str(row['id']))
             for prop, value in clause.on_match:
                 existing.payload[prop.key] = self._static_value(value, parameters)
             if clause.on_match:
-                await self.client.upsert_vertex(table, self.realm, vertex_id=existing.id,
+                await client.upsert_vertex(table, self.realm, vertex_id=existing.id,
                                                 payload=existing.payload)
             if node.variable:
                 created[node.variable] = existing
             return
         for prop, value in clause.on_create:
             props[prop.key] = self._static_value(value, parameters)
-        vertex = await self.client.add_vertex(table, self.realm, payload=props)
+        vertex = await client.add_vertex(table, self.realm, payload=props)
         if node.variable:
             created[node.variable] = vertex
 
-    async def _set(self, clause: SetClause, parameters, created) -> None:
+    async def _set(self, client, clause: SetClause, parameters, created) -> None:
         for prop, value in clause.assignments:
             target = created.get(prop.variable)
             if target is None:
@@ -313,14 +341,14 @@ class CypherSession:
             payload = dict(getattr(target, 'payload', {}) or {})
             payload[prop.key] = self._static_value(value, parameters)
             table = getattr(target, 'table_name', None)
-            await self.client.upsert_vertex(table, self.realm, vertex_id=target.id, payload=payload)
+            await client.upsert_vertex(table, self.realm, vertex_id=target.id, payload=payload)
             target.payload = payload
 
-    async def _delete(self, clause: Delete, created) -> None:
+    async def _delete(self, client, clause: Delete, created) -> None:
         for name in clause.variables:
             target = created.get(name)
             if target is None:
                 raise CypherTranslationError(
                     f"DELETE target {name!r} must be created in the same query")
             table = getattr(target, 'table_name', None)
-            await self.client.delete_vertex(table, self.realm, target.id)
+            await client.delete_vertex(table, self.realm, target.id)

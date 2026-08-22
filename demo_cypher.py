@@ -120,10 +120,30 @@ async def main():
     print("   ", [r['name'] for r in rows])
 
     # ------------------------------------------------------------ inspectable
-    print("\n-- The SQL a query becomes --")
+    print("\n-- What a read becomes: one SQL statement --")
     sql = await session.explain("MATCH (p:Person) WHERE p.age > $min RETURN p.name AS name",
                                 {"min": 30})
     print("   ", sql[:160], "...")
+
+    # A write has no SQL to show. CREATE, MERGE, SET and DELETE run through the
+    # client's own methods so audit tables and triggers behave, which makes a
+    # write a sequence of calls rather than one statement. explain() returns
+    # that sequence, and running it changes nothing.
+    print("\n-- What a write becomes: client operations, not one statement --")
+    for query in [
+        "CREATE (p:Person {name: 'Frank', age: 51, city: 'Leeds'})",
+        "CREATE (a:Person {name: 'Gina'})-[:KNOWS {since: '2023'}]->(b:Person {name: 'Hank'})",
+        "MERGE (c:Company {name: 'Acme'}) ON MATCH SET c.seen = 'again'",
+        "CREATE (p:Person {name: 'Iris'}) SET p.age = 29",
+    ]:
+        print(f"\n   {query}")
+        for line in (await session.explain(query)).splitlines():
+            print(f"     {line}")
+
+    before = (await session.run("MATCH (p:Person) RETURN count(*) AS n"))[0]['n']
+    await session.explain("CREATE (p:Person {name: 'NeverCreated'})")
+    after = (await session.run("MATCH (p:Person) RETURN count(*) AS n"))[0]['n']
+    print(f"\n   explaining a CREATE does not run it: {before} people before, {after} after")
 
     # ---------------------------------------------------------------- refusals
     # The subset is bounded and says so. A query it cannot express is rejected

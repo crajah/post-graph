@@ -37,6 +37,14 @@ A high-performance Python library for using PostgreSQL as a native graph databas
   - Recursive CTE queries for neighbor exploration, path discovery, and cycle-free shortest path calculation.
   - Optional `check_cycle=True` raising `CyclicReferenceError` during edge creation.
   - Direct object-oriented traversal APIs (`vertex.to()`, `vertex.from_()`, `step.vertex()`, `step.add_edge_to()`).
+- **Promoted Payload Columns**:
+  - Hot JSONB keys become generated, indexed columns maintained by PostgreSQL, so the planner can use an index where it previously scanned.
+  - `valid_from` and `valid_to` are promoted by default as `pt_valid_from` / `pt_valid_to`, holding the date normalised to `YYYY-MM-DD`; any other key can be promoted via `promoted_keys` as `p_{key}`.
+  - The write path is unchanged — callers keep writing plain JSON — and a table without the columns falls back to `payload->>`, returning the same rows.
+- **openCypher Queries (`CypherSession`)**:
+  - A documented Cypher subset over the same tables: a label is a vertex table, a relationship type is a `relation_type` value, a property is a payload key.
+  - Reads compile to a single SQL statement; writes run through the client's own methods, in one transaction, so audit tables and triggers behave and a failed query leaves nothing behind.
+  - Conformance is measured against the openCypher TCK rather than asserted. See [docs/cypher.md](docs/cypher.md).
 - **Multiple Async Client Drivers**:
   - High-speed `asyncpg` client (`AsyncPostGraph`).
   - `SQLAlchemy` v2.0 async client (`SQLAlchemyPostGraph`).
@@ -207,18 +215,23 @@ Initializes the `SQLAlchemy` v2.0 async graph client.
 
 ### Schema Definition APIs
 
-#### `create_vertex_table(table_name, realm=None, vector_dim=None)`
+#### `create_vertex_table(table_name, realm=None, vector_dim=None, temporal_keys=None, promoted_keys=None)`
 Creates a vertex table, associated audit table (`{table_name}_audit`), and append-only data history table (`{table_name}_data`).
 
 ```python
 await client.create_vertex_table(
     table_name="agents",
     realm="proj_alpha",
-    vector_dim=1536  # Enables pgvector HNSW index
+    vector_dim=1536,             # Enables pgvector HNSW index
+    promoted_keys=["status"],    # Indexed column for a hot payload key
 )
 ```
 
-#### `create_edge_table(table_name=None, from_vertex_table=..., to_vertex_table=..., cascade_delete_from=False, cascade_delete_to=False, realm=None, vector_dim=None)`
+`temporal_keys` overrides which pair of payload keys is promoted as dates
+(default `('valid_from', 'valid_to')`); `promoted_keys` promotes further keys
+verbatim. See **Promoted Payload Columns** below.
+
+#### `create_edge_table(table_name=None, from_vertex_table=..., to_vertex_table=..., cascade_delete_from=False, cascade_delete_to=False, realm=None, vector_dim=None, temporal_keys=None, promoted_keys=None)`
 Creates a directed edge table linking two vertex tables.
 
 Pass `vector_dim` to give edges their own pgvector `embedding` column and HNSW
@@ -403,6 +416,91 @@ sp = await client.shortest_path(
 if sp:
     print(f"Shortest path found at depth {sp['depth']}: {sp['path']}")
 ```
+
+---
+
+### Promoted Payload Columns
+
+Properties live in `payload` JSONB, which is flexible but opaque to the planner:
+`payload->>'valid_from' <= '2024-01-01'` cannot use an index, so the as-of filter
+— which runs on every step of every traversal — degraded to a sequential scan.
+
+A promoted column fixes that without touching the write path. PostgreSQL
+maintains it from `payload` on insert and update, so you keep writing plain JSON:
+
+```python
+await client.create_edge_table(
+    "relations",
+    from_vertex_table="entities", to_vertex_table="entities",
+    realm=realm,
+    promoted_keys=["t_expired"],     # p_t_expired, indexed
+)
+
+# Unchanged: nothing about writing has to know a column exists.
+await client.add_edge("relations", realm, a.id, b.id, "WORKS_AT",
+                      payload={"valid_from": "2024-06"})
+```
+
+| Column | Holds | From |
+| :--- | :--- | :--- |
+| `pt_valid_from`, `pt_valid_to` | ISO date normalised to `YYYY-MM-DD` | promoted by default |
+| `p_{key}` | `payload->>'{key}'` verbatim | each entry in `promoted_keys` |
+
+Measured on 65k rows, the temporal filter moves from a 588-buffer sequential scan
+to a 27-buffer bitmap index scan — about 31ms to 2.5ms warm — and the margin
+grows with the table.
+
+Three things worth knowing:
+
+- **The names are prefixed.** `valid_from` stays in `payload`; the column beside
+  it is `pt_valid_from`. Prefixes keep a promoted column from ever colliding
+  with a real column.
+- **They are database-side only.** `Vertex` and `Edge` carry no `pt_` fields.
+  The column is derived and read-only, and whether it exists depends on when the
+  table was created, so exposing it on the model would offer a field you can
+  read but never assign, present on some objects and not others.
+- **Existing tables do not gain them retroactively.** The DDL runs at table
+  creation. A realm created before this feature keeps working and returns the
+  same rows via `payload->>`, just without the index.
+
+Temporal columns hold normalised text rather than `DATE` because casting text to
+date is only `STABLE` and PostgreSQL rejects non-immutable expressions in a
+generated column. ISO-8601 sorts lexically, so text and date comparison agree —
+including partial dates, where `'2024'` normalises to `'2024-01-01'` rather than
+sorting as a short string.
+
+---
+
+### openCypher Queries
+
+```python
+from post_graph import AsyncPostGraph, CypherSession
+
+session = CypherSession(client, realm="my_realm")
+rows = await session.run(
+    "MATCH (p:Person)-[:KNOWS]->(f:Person) "
+    "WHERE p.name = $name AND f.age > 30 "
+    "RETURN f.name AS friend ORDER BY friend",
+    {"name": "Alice"},
+)
+```
+
+A label is a vertex table, a relationship type is a value in `relation_type`, and
+a property is a payload key — read through a promoted column when one exists.
+
+Reads compile to one SQL statement. Writes do not: `CREATE`, `MERGE`, `SET` and
+`DELETE` go through the client's own methods so audit tables, triggers and realm
+rules behave as for any other caller, and the whole query runs in one
+transaction, so a `CREATE` that fails part-way leaves nothing behind.
+
+`session.explain(query)` shows what will happen — the SQL for a read, the
+sequence of client operations for a write — without running it.
+
+The subset is bounded and every boundary raises rather than being approximated;
+`WITH`, `UNION`, `OPTIONAL MATCH`, path variables and `RETURN *` are refused.
+Conformance is measured against the openCypher TCK rather than asserted. See
+[docs/cypher.md](docs/cypher.md) for what is supported and the current numbers,
+and `demo_cypher.py` for a runnable tour.
 
 ---
 

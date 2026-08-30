@@ -15,7 +15,7 @@ from post_graph.errors import (
     PostGraphError,
     ReservedSpaceError,
 )
-from post_graph.models import Vertex, Edge, DataRecord
+from post_graph.models import JSON_NULL, ABSENT, Vertex, Edge, DataRecord
 
 logger = logging.getLogger("post_graph")
 
@@ -77,6 +77,32 @@ class SQLAlchemyPostGraph:
             raise ValueError("Identifier must be a non-empty string.")
         if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
             raise ValueError(f"Invalid identifier name: '{identifier}'. Only alphanumeric characters and underscores are allowed.")
+
+    @staticmethod
+    def _prepare_filters(filters):
+        """Split filters into a containment dict and a list of absent keys.
+
+        Returns ``(containment_json_or_None, absent_keys)``. ``None`` as a
+        value is rejected outright: it could mean JSON null, a missing key, or
+        "skip this filter", and each reading returns different rows. The
+        sentinels say which one is meant.
+        """
+        containment = {}
+        absent = []
+        for key, val in (filters or {}).items():
+            if val is None:
+                raise ValueError(
+                    f"Filter value for {key!r} is None, which is ambiguous. "
+                    f"Use post_graph.JSON_NULL to match an explicit JSON null, "
+                    f"or post_graph.ABSENT to match a key that is not present."
+                )
+            if val is ABSENT:
+                absent.append(key)
+            elif val is JSON_NULL:
+                containment[key] = None
+            else:
+                containment[key] = val
+        return (json.dumps(containment) if containment else None), absent
 
     def _get_table_ref(self, table_name: str, realm: Optional[str] = None) -> str:
         """Construct table reference string based on schema_per_realm setting."""
@@ -999,8 +1025,20 @@ class SQLAlchemyPostGraph:
     ) -> List[Vertex]:
         """Find vertices whose payload matches the given key-value filters.
 
-        Each entry in *filters* becomes a ``payload->>'key' = value`` clause
-        (all ANDed together).
+        Matching is by JSONB containment (``payload @> filters``), which makes
+        it type-sensitive: ``True`` matches JSON ``true``, and the number
+        ``42`` matches ``42`` but not the string ``"42"``. Keys never enter
+        the SQL text, so any JSON key is legal, and the comparison uses the
+        payload GIN index.
+
+        Containment, not equality, for nested values: a filter of
+        ``{"tags": ["a"]}`` matches a payload whose ``tags`` is
+        ``["a", "b"]``. Scalar filters are unaffected.
+
+        ``None`` is rejected as a filter value because it is ambiguous. Use
+        :data:`post_graph.JSON_NULL` to match a key holding an explicit JSON
+        null, and :data:`post_graph.ABSENT` to match a key that is not present
+        --- those are different states, and each has its own name.
         """
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
@@ -1011,10 +1049,17 @@ class SQLAlchemyPostGraph:
             if space and space != RESERVED_SPACE_ALL:
                 params["space"] = space
                 clauses += " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
-            for i, (key, val) in enumerate(filters.items()):
-                pname = f"fv{i}"
-                params[pname] = str(val)
-                clauses += f" AND t.payload->>'{key}' = :{pname}"
+            # Containment, for the same reasons as the asyncpg client: the
+            # previous per-key text comparison could never match a boolean, and
+            # this form keeps keys out of the SQL and uses the GIN index.
+            containment, absent_keys = self._prepare_filters(filters)
+            if containment is not None:
+                params["fjson"] = containment
+                clauses += " AND t.payload @> CAST(:fjson AS jsonb)"
+            for i, key in enumerate(absent_keys):
+                pname = f"fabs{i}"
+                params[pname] = key
+                clauses += f" AND NOT jsonb_exists(t.payload, :{pname})"
             limit_clause = ""
             if limit:
                 params["limit"] = limit
@@ -1364,6 +1409,10 @@ class SQLAlchemyPostGraph:
         table_ref = self._get_table_ref(table_name, realm)
 
         if fields:
+            # Field names are interpolated into the tsvector expression, so
+            # they get the same identifier check as table names.
+            for f in fields:
+                self._validate_identifier(f)
             ts_expr = " || ' ' || ".join(f"COALESCE(t.payload->>'{f}', '')" for f in fields)
         else:
             ts_expr = """(SELECT string_agg(value::text, ' ') FROM jsonb_each_text(t.payload))"""
@@ -1431,6 +1480,10 @@ class SQLAlchemyPostGraph:
         table_ref = self._get_table_ref(table_name, realm)
 
         if fields:
+            # Field names are interpolated into the tsvector expression, so
+            # they get the same identifier check as table names.
+            for f in fields:
+                self._validate_identifier(f)
             ts_expr = " || ' ' || ".join(f"COALESCE(t.payload->>'{f}', '')" for f in fields)
         else:
             ts_expr = """(SELECT string_agg(value::text, ' ') FROM jsonb_each_text(t.payload))"""
@@ -2008,8 +2061,10 @@ class SQLAlchemyPostGraph:
     ) -> List[Edge]:
         """Find edges whose payload matches the given key-value filters.
 
-        Each entry in *filters* becomes a ``payload->>'key' = value`` clause
-        (all ANDed together).  Optional *relation_type* further restricts results.
+        Matching is by JSONB containment; see :meth:`find_vertices` for the
+        semantics (type-sensitive, index-backed, containment for nested
+        values, sentinels for null and absent keys). Optional *relation_type*
+        further restricts results.
         """
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
@@ -2023,10 +2078,14 @@ class SQLAlchemyPostGraph:
             if relation_type:
                 params["relation_type"] = relation_type
                 clauses += " AND t.relation_type = :relation_type"
-            for i, (key, val) in enumerate(filters.items()):
-                pname = f"fe{i}"
-                params[pname] = str(val)
-                clauses += f" AND t.payload->>'{key}' = :{pname}"
+            containment, absent_keys = self._prepare_filters(filters)
+            if containment is not None:
+                params["fjson"] = containment
+                clauses += " AND t.payload @> CAST(:fjson AS jsonb)"
+            for i, key in enumerate(absent_keys):
+                pname = f"fabs{i}"
+                params[pname] = key
+                clauses += f" AND NOT jsonb_exists(t.payload, :{pname})"
             limit_clause = ""
             if limit:
                 params["limit"] = limit
@@ -2720,6 +2779,8 @@ class SQLAlchemyPostGraph:
     ) -> Optional[Dict[str, Any]]:
         """Dijkstra-style weighted shortest path using a payload field as weight."""
         self._validate_identifier(start_table)
+        # weight_field is interpolated into the traversal subqueries.
+        self._validate_identifier(weight_field)
         self._validate_identifier(target_table)
         if direction not in ("out", "in", "both"):
             raise ValueError("direction must be 'out', 'in', or 'both'")

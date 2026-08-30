@@ -7,7 +7,7 @@ from post_graph.errors import (
     CyclicReferenceError,
     ReservedSpaceError,
 )
-from post_graph.models import Vertex, Edge, TraversalStep
+from post_graph.models import Vertex, Edge, TraversalStep, JSON_NULL, ABSENT
 from post_graph.client_asyncpg import AsyncPostGraph, RESERVED_SPACE_ALL
 from post_graph.cypher import (
     CypherSession,
@@ -23,6 +23,8 @@ except ImportError:
 __version__ = "1.0.1"
 
 __all__ = [
+    "JSON_NULL",
+    "ABSENT",
     'CypherSession',
     'CypherSyntaxError',
     'CypherTranslationError',

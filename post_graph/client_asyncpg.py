@@ -13,7 +13,7 @@ from post_graph.errors import (
     PostGraphError,
     ReservedSpaceError,
 )
-from post_graph.models import Vertex, Edge, DataRecord
+from post_graph.models import JSON_NULL, ABSENT, Vertex, Edge, DataRecord
 
 logger = logging.getLogger("post_graph")
 
@@ -86,6 +86,32 @@ class AsyncPostGraph:
                 f"Invalid identifier: '{identifier}'. Must be alphanumeric and underscores only, "
                 f"starting with a letter or underscore."
             )
+
+    @staticmethod
+    def _prepare_filters(filters):
+        """Split filters into a containment dict and a list of absent keys.
+
+        Returns ``(containment_json_or_None, absent_keys)``. ``None`` as a
+        value is rejected outright: it could mean JSON null, a missing key, or
+        "skip this filter", and each reading returns different rows. The
+        sentinels say which one is meant.
+        """
+        containment = {}
+        absent = []
+        for key, val in (filters or {}).items():
+            if val is None:
+                raise ValueError(
+                    f"Filter value for {key!r} is None, which is ambiguous. "
+                    f"Use post_graph.JSON_NULL to match an explicit JSON null, "
+                    f"or post_graph.ABSENT to match a key that is not present."
+                )
+            if val is ABSENT:
+                absent.append(key)
+            elif val is JSON_NULL:
+                containment[key] = None
+            else:
+                containment[key] = val
+        return (json.dumps(containment) if containment else None), absent
 
     def _get_table_ref(self, table_name: str, realm: Optional[str] = None) -> str:
         """Get the table reference. Qualifies with schema (realm) if schema_per_realm is active."""
@@ -1035,8 +1061,19 @@ class AsyncPostGraph:
     ) -> List[Vertex]:
         """Find vertices whose payload matches the given key-value filters.
 
-        Each entry in *filters* becomes a ``payload->>'key' = value`` clause
-        (all ANDed together).
+        Matching is by JSONB containment (``payload @> filters``), which makes
+        it type-sensitive: ``True`` matches JSON ``true``, and the number
+        ``42`` matches ``42`` but not the string ``"42"``. Keys never enter the SQL text, so any JSON key is
+        legal, and the comparison uses the payload GIN index.
+
+        Containment, not equality, for nested values: a filter of
+        ``{"tags": ["a"]}`` matches a payload whose ``tags`` is
+        ``["a", "b"]``. Scalar filters are unaffected.
+
+        ``None`` is rejected as a filter value because it is ambiguous. Use
+        :data:`post_graph.JSON_NULL` to match a key holding an explicit JSON
+        null, and :data:`post_graph.ABSENT` to match a key that is not present
+        --- those are different states, and each has its own name.
         """
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
@@ -1047,9 +1084,18 @@ class AsyncPostGraph:
             if space and space != RESERVED_SPACE_ALL:
                 params.append(space)
                 clauses += f" AND (t.space = ${len(params)} OR (${len(params)} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
-            for key, val in filters.items():
-                params.append(str(val))
-                clauses += f" AND t.payload->>'{key}' = ${len(params)}"
+            # Containment is what makes matching type-correct: str(True) is
+            # 'True' but payload->>'k' renders JSON true as 'true', so the
+            # previous per-key text comparison could never match a boolean.
+            # It also keeps every key out of the SQL text and lets the payload
+            # GIN index serve the lookup.
+            containment, absent_keys = self._prepare_filters(filters)
+            if containment is not None:
+                params.append(containment)
+                clauses += f" AND t.payload @> ${len(params)}::jsonb"
+            for key in absent_keys:
+                params.append(key)
+                clauses += f" AND NOT jsonb_exists(t.payload, ${len(params)})"
             limit_clause = ""
             if limit:
                 params.append(limit)
@@ -1412,6 +1458,10 @@ class AsyncPostGraph:
         table_ref = self._get_table_ref(table_name, realm)
 
         if fields:
+            # Field names are interpolated into the tsvector expression, so
+            # they get the same identifier check as table names.
+            for f in fields:
+                self._validate_identifier(f)
             ts_expr = " || ' ' || ".join(f"COALESCE(t.payload->>'{f}', '')" for f in fields)
         else:
             ts_expr = """(SELECT string_agg(value::text, ' ') FROM jsonb_each_text(t.payload))"""
@@ -1482,6 +1532,10 @@ class AsyncPostGraph:
         table_ref = self._get_table_ref(table_name, realm)
 
         if fields:
+            # Field names are interpolated into the tsvector expression, so
+            # they get the same identifier check as table names.
+            for f in fields:
+                self._validate_identifier(f)
             ts_expr = " || ' ' || ".join(f"COALESCE(t.payload->>'{f}', '')" for f in fields)
         else:
             ts_expr = """(SELECT string_agg(value::text, ' ') FROM jsonb_each_text(t.payload))"""
@@ -2047,8 +2101,9 @@ class AsyncPostGraph:
     ) -> List[Edge]:
         """Find edges whose payload matches the given key-value filters.
 
-        Each entry in *filters* becomes a ``payload->>'key' = value`` clause
-        (all ANDed together).  Optional *relation_type* further restricts results.
+        Matching is by JSONB containment; see :meth:`find_vertices` for the
+        semantics (type-sensitive, index-backed, containment for nested
+        values). Optional *relation_type* further restricts results.
         """
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
@@ -2062,9 +2117,13 @@ class AsyncPostGraph:
             if relation_type:
                 params.append(relation_type)
                 clauses += f" AND t.relation_type = ${len(params)}"
-            for key, val in filters.items():
-                params.append(str(val))
-                clauses += f" AND t.payload->>'{key}' = ${len(params)}"
+            containment, absent_keys = self._prepare_filters(filters)
+            if containment is not None:
+                params.append(containment)
+                clauses += f" AND t.payload @> ${len(params)}::jsonb"
+            for key in absent_keys:
+                params.append(key)
+                clauses += f" AND NOT jsonb_exists(t.payload, ${len(params)})"
             limit_clause = ""
             if limit:
                 params.append(limit)
@@ -2752,6 +2811,8 @@ class AsyncPostGraph:
         ``depth``, ``path``, ``edge_path``, ``edge_ids``, and ``total_weight``.
         """
         self._validate_identifier(start_table)
+        # weight_field is interpolated into the traversal subqueries.
+        self._validate_identifier(weight_field)
         self._validate_identifier(target_table)
         if direction not in ("out", "in", "both"):
             raise ValueError("direction must be 'out', 'in', or 'both'")

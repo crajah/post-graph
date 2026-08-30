@@ -363,3 +363,27 @@ class TraversalStep:
             payload=payload,
             user_id=user_id
         )
+
+
+class _FilterSentinel:
+    """A named marker for a filter state that no ordinary Python value can spell.
+
+    ``None`` is deliberately not a filter value: it could mean "the key holds
+    JSON null", "the key is missing", or "ignore this filter", and each reading
+    silently produces different rows. The find methods reject it and take one
+    of these instead.
+    """
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __repr__(self) -> str:
+        return self._name
+
+
+#: Matches a key that is present and holds an explicit JSON ``null``.
+JSON_NULL = _FilterSentinel("JSON_NULL")
+
+#: Matches a key that is not present in the payload at all.
+ABSENT = _FilterSentinel("ABSENT")

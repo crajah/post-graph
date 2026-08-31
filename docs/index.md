@@ -169,6 +169,32 @@ await pg.add_edge("relations", realm, a, b, "generates_cash_flow",
 
 Two things this deliberately does not do. It does not change the model: `Vertex` and `Edge` carry no new fields, because a promoted column is derived, read-only, and present only on tables created since the feature existed. And it does not touch existing tables — a realm created earlier keeps working and returns the same rows through `payload->>`, without the index.
 
+## Filters that match by type, not by string luck
+
+*New in 1.1.0.*
+
+`find_vertices` and `find_edges` used to compare `str(value)` against `payload->>'key'` — text against text. That silently matched nothing for booleans, because Python renders `True` where JSONB text extraction renders `true`, and for `None`, which compares against SQL `NULL` where `=` is never true. Numbers worked only because their text forms happen to coincide.
+
+Matching is now JSONB containment — `payload @> filters`, serialised once:
+
+```python
+await pg.find_vertices("things", realm, filters={"active": True})   # matches JSON true
+await pg.find_vertices("things", realm, filters={"count": 42})      # 42, not "42"
+```
+
+Three properties fall out of the operator choice. It is **type-correct by construction**. It is **key-safe**: filter keys never enter the SQL text, so any legal JSON key works — spaces, hyphens, hostile input — and the previous path, which interpolated keys unvalidated, is gone. And it is **served by the GIN index** every payload column already carries, which per-key `->>` comparisons never were.
+
+`None` is rejected rather than reinterpreted, because it could mean three different things. Each state gets a name instead:
+
+```python
+from post_graph import JSON_NULL, ABSENT
+
+filters={"ended": JSON_NULL}   # key present, explicitly null
+filters={"ended": ABSENT}      # key not present at all
+```
+
+One behaviour to know: containment, not equality, for nested values — `{"tags": ["a"]}` matches a payload whose `tags` is `["a", "b"]`. For scalar filters the two are identical.
+
 ## A Cypher subset, measured rather than claimed
 
 ```python
@@ -214,7 +240,7 @@ createdb mydb && psql -d mydb -c "CREATE EXTENSION vector;"
 
 `post-graph` is Apache 2.0 licensed and on PyPI. It is also the storage layer beneath **[post-graph-rag](https://github.com/crajah/post-graph-rag)** ([write-up](https://crajah.github.io/post-graph-rag/)), a Graph RAG library that leans on every feature described here — the vector columns for retrieval, the composite keys for tenancy, the audit history for re-indexing, and the filtered traversal for multi-hop question answering over corpora whose facts change.
 
-A paper covering the architecture and evaluation methodology is going to arXiv — link to follow.
+The paper covering the combined architecture and its evaluation is at [arXiv:2608.24921](https://arxiv.org/abs/2608.24921).
 
 **GitHub:** https://github.com/crajah/post-graph · **PyPI:** `pip install post-graph`
 

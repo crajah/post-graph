@@ -1,4 +1,6 @@
 import json
+import asyncio
+import random
 import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -27,7 +29,7 @@ class AsyncPostGraph:
         connection_or_pool: Union[asyncpg.Connection, asyncpg.Pool, None] = None,
         dsn: Optional[str] = None,
         schema_per_realm: bool = False,
-        pool_min_size: int = 10,
+        pool_min_size: int = 1,
         pool_max_size: int = 10,
         pool_max_queries: int = 50000,
         pool_max_inactive_connection_lifetime: float = 300.0,
@@ -47,14 +49,43 @@ class AsyncPostGraph:
         self._schema_cache = {}
         self._promoted_cache = {}
 
-    async def connect(self):
-        """Establish connection or connection pool to PostgreSQL."""
+    async def connect(self, retries: int = 5, retry_base_delay: float = 0.5):
+        """Establish connection or connection pool to PostgreSQL.
+
+        The pool opens ``pool_min_size`` connections eagerly (default 1) and
+        grows to ``pool_max_size`` under load. The lazy default matters for
+        fleets: N workers at the old eager default of 10 demanded 10N server
+        connections at deploy time, before any of them had done any work.
+
+        ``sorry, too many clients`` at startup is usually a deploy herd, not a
+        steady state, so connect retries it -- and ``cannot connect now``
+        (server still starting) -- with exponential backoff and jitter,
+        ``retries`` times. Set ``retries=0`` to fail immediately. Sizing rule
+        for fleets: workers x pool_max_size must stay below the server's
+        max_connections with headroom for everything else; past that point no
+        client-side setting helps and a pooler such as PgBouncer belongs in
+        between.
+        """
         if self.connection is None:
             kwargs = {**self._pool_config, **self.conn_kwargs}
-            if self.dsn:
-                self._pool = await asyncpg.create_pool(self.dsn, **kwargs)
-            else:
-                self._pool = await asyncpg.create_pool(**kwargs)
+            attempt = 0
+            while True:
+                try:
+                    if self.dsn:
+                        self._pool = await asyncpg.create_pool(self.dsn, **kwargs)
+                    else:
+                        self._pool = await asyncpg.create_pool(**kwargs)
+                    break
+                except (asyncpg.TooManyConnectionsError,
+                        asyncpg.CannotConnectNowError) as e:
+                    if attempt >= retries:
+                        raise
+                    delay = retry_base_delay * (2 ** attempt) * (0.5 + random.random())
+                    logger.warning(
+                        "connect(): %s; retry %d/%d in %.1fs",
+                        e.__class__.__name__, attempt + 1, retries, delay)
+                    await asyncio.sleep(delay)
+                    attempt += 1
             self.connection = self._pool
 
     async def close(self):

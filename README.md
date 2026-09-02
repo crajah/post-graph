@@ -230,6 +230,19 @@ the numeric cast when a numeric predicate references the same key.
 `delete_realm`. `create_payload_index(..., numeric=True)` indexes the cast
 expression; idempotent, deterministically named.
 
+## 🔌 Connection Pooling for Fleets
+
+Each client manages an asyncpg pool. `pool_min_size` defaults to **1** (lazy):
+a fleet of N workers holds N idle connections and grows to `pool_max_size`
+(default 10) only under load. `connect()` retries "too many clients" and
+"cannot connect now" with exponential backoff and jitter (`retries=5` by
+default), so a deploy herd staggers in instead of crashing.
+
+Sizing rule: `workers × pool_max_size` must stay below the server's
+`max_connections`, with headroom for everything else that talks to the
+database. Past that point no client-side setting helps — put PgBouncer in
+between.
+
 ## 📚 Comprehensive API Reference
 
 ### Client Initialization & Management

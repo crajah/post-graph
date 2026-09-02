@@ -239,3 +239,64 @@ class TestSchemaPerRealm:
                 await c.delete_realm(realm)
             except Exception:
                 pass
+
+
+class TestEdgeRangeQueries:
+    """The same where/order_by semantics on edges, which is what a bi-temporal
+    relation store needs: t_created/t_expired live on edge payloads."""
+
+    async def _seed_edges(self, c, realm):
+        await c.create_vertex_table("rq_nodes2", realm=realm)
+        await c.create_edge_table("rq_rel", from_vertex_table="rq_nodes2",
+                                  to_vertex_table="rq_nodes2", realm=realm)
+        a = await c.add_vertex("rq_nodes2", realm=realm, payload={"name": "a"})
+        b = await c.add_vertex("rq_nodes2", realm=realm, payload={"name": "b"})
+        stamps = ["2026-01-01T00:00:00", "2026-02-01T00:00:00", "2026-03-01T00:00:00"]
+        for i, ts in enumerate(stamps):
+            payload = {"t_created": ts, "k": i}
+            if i == 0:
+                payload["t_expired"] = "2026-02-15T00:00:00"
+            await c.add_edge("rq_rel", realm=realm, from_id=a.id, to_id=b.id,
+                             relation_type=f"r{i}", payload=payload)
+        return "rq_rel"
+
+    async def test_edge_where_text_range_and_order(self, any_client, clean_realm):
+        c, realm = any_client, clean_realm
+        t = await self._seed_edges(c, realm)
+        got = await c.find_edges(t, realm=realm,
+                                 where=[("t_created", ">", "2026-01-15T00:00:00")],
+                                 order_by="t_created", descending=True)
+        assert [e.payload["k"] for e in got] == [2, 1]
+
+    async def test_edge_is_null_and_not_null(self, any_client, clean_realm):
+        c, realm = any_client, clean_realm
+        t = await self._seed_edges(c, realm)
+        expired = await c.find_edges(t, realm=realm,
+                                     where=[("t_expired", "not_null", None)])
+        assert [e.payload["k"] for e in expired] == [0]
+        live = await c.find_edges(t, realm=realm,
+                                  where=[("t_expired", "is_null", None)])
+        assert sorted(e.payload["k"] for e in live) == [1, 2]
+
+    async def test_count_edges(self, any_client, clean_realm):
+        c, realm = any_client, clean_realm
+        t = await self._seed_edges(c, realm)
+        assert await c.count_edges(t, realm=realm) == 3
+        assert await c.count_edges(
+            t, realm=realm,
+            where=[("t_created", ">=", "2026-02-01T00:00:00")]) == 2
+        assert await c.count_edges(t, realm=realm, relation_type="r0") == 1
+
+    async def test_edge_numeric_where(self, any_client, clean_realm):
+        c, realm = any_client, clean_realm
+        t = await self._seed_edges(c, realm)
+        got = await c.find_edges(t, realm=realm, where=[("k", ">=", 1)],
+                                 order_by="k")
+        assert [e.payload["k"] for e in got] == [1, 2]
+
+    async def test_edge_payload_index(self, any_client, clean_realm):
+        c, realm = any_client, clean_realm
+        t = await self._seed_edges(c, realm)
+        n1 = await c.create_payload_index(t, realm=realm, key="t_created")
+        n2 = await c.create_payload_index(t, realm=realm, key="t_created")
+        assert n1 == n2 == f"idx_{t}_payload_t_created"

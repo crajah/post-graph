@@ -1289,6 +1289,50 @@ class AsyncPostGraph:
         else:
             return await _op(self.connection)
 
+    async def count_edges(
+        self,
+        table_name: str,
+        realm: str,
+        filters: Optional[Dict[str, Any]] = None,
+        space: Optional[str] = None,
+        relation_type: Optional[str] = None,
+        where: Optional[List[tuple]] = None,
+    ) -> int:
+        """COUNT(*) over edges under the same predicates as :meth:`find_edges`."""
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            params: list = [realm]
+            clauses = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params.append(space)
+                clauses += f" AND (t.space = ${len(params)} OR (${len(params)} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            if relation_type:
+                params.append(relation_type)
+                clauses += f" AND t.relation_type = ${len(params)}"
+            containment, absent_keys = self._prepare_filters(filters)
+            if containment is not None:
+                params.append(containment)
+                clauses += f" AND t.payload @> ${len(params)}::jsonb"
+            for key in absent_keys:
+                params.append(key)
+                clauses += f" AND NOT jsonb_exists(t.payload, ${len(params)})"
+            where_sql, _ = self._compile_where(where, params)
+            clauses += where_sql
+            try:
+                return await conn.fetchval(
+                    f"SELECT COUNT(*) FROM {table_ref} t WHERE t.realm = $1{clauses}",
+                    *params)
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
+
+        if isinstance(self.connection, asyncpg.Pool):
+            async with self.connection.acquire() as conn:
+                return await _op(conn)
+        else:
+            return await _op(self.connection)
+
     async def delete_vertices(
         self,
         table_name: str,
@@ -2328,18 +2372,23 @@ class AsyncPostGraph:
         self,
         table_name: str,
         realm: str,
-        filters: Dict[str, Any],
+        filters: Optional[Dict[str, Any]] = None,
         space: Optional[str] = None,
         relation_type: Optional[str] = None,
         limit: Optional[int] = None,
+        where: Optional[List[tuple]] = None,
+        order_by: Optional[str] = None,
+        descending: bool = False,
     ) -> List[Edge]:
         """Find edges whose payload matches the given key-value filters.
 
-        Matching is by JSONB containment; see :meth:`find_vertices` for the
-        semantics (type-sensitive, index-backed, containment for nested
-        values). Optional *relation_type* further restricts results.
+        Matching is by JSONB containment; *where*, *order_by* and *descending*
+        behave exactly as on :meth:`find_vertices`. Optional *relation_type*
+        further restricts results.
         """
         self._validate_identifier(table_name)
+        if order_by is not None:
+            self._validate_payload_key(order_by)
         table_ref = self._get_table_ref(table_name, realm)
 
         async def _op(conn):
@@ -2358,6 +2407,15 @@ class AsyncPostGraph:
             for key in absent_keys:
                 params.append(key)
                 clauses += f" AND NOT jsonb_exists(t.payload, ${len(params)})"
+            where_sql, numeric_keys = self._compile_where(where, params)
+            clauses += where_sql
+            if order_by is not None:
+                acc = f"t.payload->>'{order_by}'"
+                if order_by in numeric_keys:
+                    acc = f"({acc})::numeric"
+                order_clause = f"ORDER BY {acc} {'DESC' if descending else 'ASC'}, t.id ASC"
+            else:
+                order_clause = "ORDER BY t.id ASC"
             limit_clause = ""
             if limit:
                 params.append(limit)
@@ -2369,7 +2427,7 @@ class AsyncPostGraph:
                    to_jsonb(t)->>'embedding' AS embedding_text
             FROM {table_ref} t
             WHERE t.realm = $1{clauses}
-            ORDER BY t.id ASC{limit_clause}
+            {order_clause}{limit_clause}
             """
             try:
                 rows = await conn.fetch(query, *params)

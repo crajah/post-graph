@@ -193,6 +193,43 @@ if __name__ == "__main__":
 
 ---
 
+## ⏱️ Range Queries, Ordering and Bulk Deletion
+
+Polling a growing table must not mean fetching it. `where` pushes range
+predicates into SQL over the JSONB payload (parameter-bound, key-validated),
+`order_by`/`limit` shape the result server-side, and `count_vertices` /
+`delete_vertices` complete the poll–work–purge loop without transferring rows.
+
+```python
+# An event scheduler's tick: the few due, undone events — not the whole table.
+due = await pg.find_vertices("events", realm=world,
+    where=[("done_at", "is_null", None), ("due_at", "<=", now_str)],
+    order_by="due_at", limit=200)
+
+# A work queue's pending slice.
+pending = await pg.find_vertices("decision_queue", realm="genome_agents",
+    where=[("done_at", "is_null", None)], limit=500)
+
+# Periodic purge of completed history, returning rows deleted.
+purged = await pg.delete_vertices("events", realm=world,
+    where=[("done_at", "not_null", None), ("done_at", "<", cutoff_str)])
+
+# Queue depth without row transfer; index the hot predicate once at startup.
+depth = await pg.count_vertices("decision_queue", realm="genome_agents",
+    where=[("done_at", "is_null", None)])
+await pg.create_payload_index("events", realm=world, key="due_at")
+```
+
+Ops: `=  !=  <  <=  >  >=  is_null  not_null  in`. Values always bind as
+parameters. **int/float compare numerically** (`(payload->>'k')::numeric`);
+**str compares as text**, so zero-padded sortable strings (fixed-width
+timestamps) keep their text ordering. `is_null` matches absent keys and JSON
+null alike — a scheduler's "not done yet" in one predicate. `order_by` follows
+the numeric cast when a numeric predicate references the same key.
+`delete_vertices` refuses an empty `where`: a full wipe must be the explicit
+`delete_realm`. `create_payload_index(..., numeric=True)` indexes the cast
+expression; idempotent, deterministically named.
+
 ## 📚 Comprehensive API Reference
 
 ### Client Initialization & Management

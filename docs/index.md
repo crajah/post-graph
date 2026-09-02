@@ -169,6 +169,42 @@ await pg.add_edge("relations", realm, a, b, "generates_cash_flow",
 
 Two things this deliberately does not do. It does not change the model: `Vertex` and `Edge` carry no new fields, because a promoted column is derived, read-only, and present only on tables created since the feature existed. And it does not touch existing tables — a realm created earlier keeps working and returns the same rows through `payload->>`, without the index.
 
+## Polling without fetching the table
+
+*New in 1.2.0.*
+
+The consumer that motivated this runs a genome simulation whose event tables
+only grow. Its scheduler needs the few rows whose `due_at` has passed; its
+work queue needs the undone rows. With only equality filters, every poll
+fetched the entire table and filtered client-side — which worked until it
+OOMed a worker.
+
+`where` pushes the predicate into SQL over the payload:
+
+```python
+due = await pg.find_vertices("events", realm=world,
+    where=[("done_at", "is_null", None), ("due_at", "<=", now_str)],
+    order_by="due_at", limit=200)
+
+purged = await pg.delete_vertices("events", realm=world,
+    where=[("done_at", "not_null", None), ("done_at", "<", cutoff_str)])
+```
+
+Triples of `(key, op, value)` with `=  !=  <  <=  >  >=  is_null  not_null
+in`, ANDed together and with the containment filters. Three rules carry the
+design. **Values always bind as parameters and keys are validated** — nothing
+interpolates. **int/float compare numerically, str compares as text**: a
+caller storing fixed-width timestamps relies on text ordering, and a numeric
+cast would wreck exactly the rows it was polling for. And **`is_null` matches
+both an absent key and an explicit JSON null**, because `payload->>'k' IS
+NULL` covers both — which is what "not done yet" means to a queue.
+
+`count_vertices` answers "how deep is the queue" without transferring rows;
+`delete_vertices` refuses an empty `where`, because a full-table delete must
+be the explicit `delete_realm`; and `create_payload_index` puts an expression
+index under the hot predicate — idempotent, so calling it at startup is the
+whole deployment story.
+
 ## Filters that match by type, not by string luck
 
 *New in 1.1.0.*

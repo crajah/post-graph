@@ -113,6 +113,87 @@ class AsyncPostGraph:
                 containment[key] = val
         return (json.dumps(containment) if containment else None), absent
 
+    _PAYLOAD_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+    _WHERE_OPS = ("=", "!=", "<", "<=", ">", ">=", "is_null", "not_null", "in")
+
+    @classmethod
+    def _validate_payload_key(cls, key):
+        """Keys interpolate into the payload accessor, so they are constrained.
+
+        Broader than table identifiers -- dots and dashes are ordinary in JSON
+        keys -- but still nothing that could escape a single-quoted string.
+        """
+        if not isinstance(key, str) or not cls._PAYLOAD_KEY_RE.match(key):
+            raise ValueError(
+                f"Invalid payload key: {key!r}. Allowed: letters, digits, "
+                f"underscore, dot and dash."
+            )
+        return key
+
+    @staticmethod
+    def _where_value_is_numeric(value) -> bool:
+        """The cast rule: int/float compare numerically, str compares as text.
+
+        bool is excluded from numeric although it subclasses int -- JSONB
+        renders booleans as true/false, and casting those to numeric raises.
+        Callers storing zero-padded sortable strings (fixed-width timestamps)
+        rely on text ordering, which is why str never casts.
+        """
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    @classmethod
+    def _compile_where(cls, where, params):
+        """Compile [(key, op, value)] triples into ' AND ...' SQL, appending
+        bound parameters to *params*. Keys are validated; values always bind.
+
+        Returns (sql, numeric_keys) -- the keys that were compared numerically,
+        so ORDER BY on the same key can pick the matching cast.
+        """
+        sql = ""
+        numeric_keys = set()
+        for item in where or []:
+            try:
+                key, op, value = item
+            except (TypeError, ValueError):
+                raise ValueError(f"where entries are (key, op, value) triples; got {item!r}")
+            cls._validate_payload_key(key)
+            if op not in cls._WHERE_OPS:
+                raise ValueError(f"Unknown where op {op!r}. Allowed: {cls._WHERE_OPS}")
+            accessor = f"t.payload->>'{key}'"
+            if op == "is_null":
+                # ->> yields SQL NULL for an absent key AND for JSON null, so
+                # one predicate covers both -- which is what a scheduler's
+                # "not done yet" means.
+                sql += f" AND {accessor} IS NULL"
+            elif op == "not_null":
+                sql += f" AND {accessor} IS NOT NULL"
+            elif op == "in":
+                if not isinstance(value, (list, tuple, set)) or not value:
+                    raise ValueError(f"'in' needs a non-empty list/tuple for {key!r}")
+                value = list(value)
+                if all(cls._where_value_is_numeric(v) for v in value):
+                    params.append([float(v) for v in value])
+                    sql += f" AND ({accessor})::numeric = ANY(${len(params)}::numeric[])"
+                    numeric_keys.add(key)
+                else:
+                    params.append([("true" if v is True else "false" if v is False
+                                    else str(v)) for v in value])
+                    sql += f" AND {accessor} = ANY(${len(params)}::text[])"
+            else:
+                if value is None:
+                    raise ValueError(
+                        f"({key!r}, {op!r}, None): comparisons with None are "
+                        f"ambiguous; use the 'is_null' / 'not_null' ops.")
+                if cls._where_value_is_numeric(value):
+                    params.append(value)
+                    sql += f" AND ({accessor})::numeric {op} ${len(params)}::numeric"
+                    numeric_keys.add(key)
+                else:
+                    params.append("true" if value is True else
+                                  "false" if value is False else str(value))
+                    sql += f" AND {accessor} {op} ${len(params)}"
+        return sql, numeric_keys
+
     def _get_table_ref(self, table_name: str, realm: Optional[str] = None) -> str:
         """Get the table reference. Qualifies with schema (realm) if schema_per_realm is active."""
         self._validate_identifier(table_name)
@@ -1055,9 +1136,12 @@ class AsyncPostGraph:
         self,
         table_name: str,
         realm: str,
-        filters: Dict[str, Any],
+        filters: Optional[Dict[str, Any]] = None,
         space: Optional[str] = None,
         limit: Optional[int] = None,
+        where: Optional[List[tuple]] = None,
+        order_by: Optional[str] = None,
+        descending: bool = False,
     ) -> List[Vertex]:
         """Find vertices whose payload matches the given key-value filters.
 
@@ -1074,9 +1158,23 @@ class AsyncPostGraph:
         :data:`post_graph.JSON_NULL` to match a key holding an explicit JSON
         null, and :data:`post_graph.ABSENT` to match a key that is not present
         --- those are different states, and each has its own name.
+
+        *where* adds range predicates as ``(key, op, value)`` triples with ops
+        ``= != < <= > >= is_null not_null in``, ANDed with *filters*. Values
+        bind as parameters; int/float compare via ``(payload->>'k')::numeric``,
+        str compares as text (zero-padded sortable strings keep their text
+        ordering). ``is_null`` matches absent keys and JSON null alike. The
+        numeric cast raises on rows whose value is non-numeric text, so a key
+        compared numerically should hold numbers wherever it is present.
+
+        *order_by* sorts on a payload key (then ``id`` as a stable tie-break);
+        it compares numerically when a numeric *where* predicate references the
+        same key, and as text otherwise.
         """
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
+        if order_by is not None:
+            self._validate_payload_key(order_by)
 
         async def _op(conn):
             params: list = [realm]
@@ -1096,6 +1194,15 @@ class AsyncPostGraph:
             for key in absent_keys:
                 params.append(key)
                 clauses += f" AND NOT jsonb_exists(t.payload, ${len(params)})"
+            where_sql, numeric_keys = self._compile_where(where, params)
+            clauses += where_sql
+            if order_by is not None:
+                acc = f"t.payload->>'{order_by}'"
+                if order_by in numeric_keys:
+                    acc = f"({acc})::numeric"
+                order_clause = f"ORDER BY {acc} {'DESC' if descending else 'ASC'}, t.id ASC"
+            else:
+                order_clause = "ORDER BY t.id ASC"
             limit_clause = ""
             if limit:
                 params.append(limit)
@@ -1106,7 +1213,7 @@ class AsyncPostGraph:
                    to_jsonb(t)->>'embedding' AS embedding_text
             FROM {table_ref} t
             WHERE t.realm = $1{clauses}
-            ORDER BY t.id ASC{limit_clause}
+            {order_clause}{limit_clause}
             """
             try:
                 rows = await conn.fetch(query, *params)
@@ -1129,6 +1236,133 @@ class AsyncPostGraph:
                         _client=self
                     ))
                 return vertices
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+
+        if isinstance(self.connection, asyncpg.Pool):
+            async with self.connection.acquire() as conn:
+                return await _op(conn)
+        else:
+            return await _op(self.connection)
+
+    async def count_vertices(
+        self,
+        table_name: str,
+        realm: str,
+        filters: Optional[Dict[str, Any]] = None,
+        space: Optional[str] = None,
+        where: Optional[List[tuple]] = None,
+    ) -> int:
+        """COUNT(*) under the same predicates as :meth:`find_vertices`.
+
+        A poller sizing its next batch, or a queue reporting its depth, needs
+        the number and not the rows; this transfers neither rows nor payloads.
+        """
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            params: list = [realm]
+            clauses = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params.append(space)
+                clauses += f" AND (t.space = ${len(params)} OR (${len(params)} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            containment, absent_keys = self._prepare_filters(filters)
+            if containment is not None:
+                params.append(containment)
+                clauses += f" AND t.payload @> ${len(params)}::jsonb"
+            for key in absent_keys:
+                params.append(key)
+                clauses += f" AND NOT jsonb_exists(t.payload, ${len(params)})"
+            where_sql, _ = self._compile_where(where, params)
+            clauses += where_sql
+            try:
+                return await conn.fetchval(
+                    f"SELECT COUNT(*) FROM {table_ref} t WHERE t.realm = $1{clauses}",
+                    *params)
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+
+        if isinstance(self.connection, asyncpg.Pool):
+            async with self.connection.acquire() as conn:
+                return await _op(conn)
+        else:
+            return await _op(self.connection)
+
+    async def delete_vertices(
+        self,
+        table_name: str,
+        realm: str,
+        where: List[tuple],
+        space: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> int:
+        """Bulk-delete vertices matching *where*; returns the rows deleted.
+
+        Referencing edges cascade away, as with :meth:`delete_vertex`, and the
+        audit triggers record each deletion.
+
+        An empty or absent *where* is refused rather than interpreted: a
+        full-table delete must be the explicit :meth:`delete_realm`, because
+        "delete everything matching no conditions" is indistinguishable from a
+        bug at the call site.
+        """
+        if not where:
+            raise ValueError(
+                "delete_vertices requires a non-empty where; to remove an "
+                "entire realm use delete_realm, which is explicit about it.")
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            params: list = [realm]
+            clauses = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params.append(space)
+                clauses += f" AND (t.space = ${len(params)} OR (${len(params)} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            where_sql, _ = self._compile_where(where, params)
+            clauses += where_sql
+            try:
+                res = await conn.execute(
+                    f"DELETE FROM {table_ref} t WHERE t.realm = $1{clauses}",
+                    *params)
+                # asyncpg returns the command tag, e.g. 'DELETE 42'.
+                return int(res.split()[-1])
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+
+        return await self._run_in_tx(_op, user_id)
+
+    async def create_payload_index(
+        self,
+        table_name: str,
+        realm: str,
+        key: str,
+        numeric: bool = False,
+    ) -> str:
+        """Index the ``(payload->>'key')`` expression; returns the index name.
+
+        Hot predicates -- a scheduler's ``due_at``, a queue's ``done_at`` --
+        otherwise scan. Idempotent (``IF NOT EXISTS``) with a name derived
+        deterministically from table and key, so calling it at startup is
+        safe. With ``numeric=True`` the indexed expression carries the same
+        cast the numeric comparisons use; building it will fail if existing
+        rows hold non-numeric text under the key, which is the correct time
+        to find that out.
+        """
+        self._validate_identifier(table_name)
+        self._validate_payload_key(key)
+        table_ref = self._get_table_ref(table_name, realm)
+        safe = re.sub(r"[^a-z0-9_]", "_", key.lower())
+        index_name = f"idx_{table_name}_payload_{safe}" + ("_num" if numeric else "")
+        expr = (f"(((payload->>'{key}'))::numeric)" if numeric
+                else f"((payload->>'{key}'))")
+
+        async def _op(conn):
+            try:
+                await conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_ref} ({expr})")
+                return index_name
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 

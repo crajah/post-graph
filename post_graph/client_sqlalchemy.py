@@ -104,6 +104,81 @@ class SQLAlchemyPostGraph:
                 containment[key] = val
         return (json.dumps(containment) if containment else None), absent
 
+    _PAYLOAD_KEY_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+    _WHERE_OPS = ("=", "!=", "<", "<=", ">", ">=", "is_null", "not_null", "in")
+
+    @classmethod
+    def _validate_payload_key(cls, key):
+        """Keys interpolate into the payload accessor, so they are constrained.
+
+        Broader than table identifiers -- dots and dashes are ordinary in JSON
+        keys -- but still nothing that could escape a single-quoted string.
+        """
+        if not isinstance(key, str) or not cls._PAYLOAD_KEY_RE.match(key):
+            raise ValueError(
+                f"Invalid payload key: {key!r}. Allowed: letters, digits, "
+                f"underscore, dot and dash."
+            )
+        return key
+
+    @staticmethod
+    def _where_value_is_numeric(value) -> bool:
+        """int/float compare numerically; str compares as text; bool is text
+        (JSONB renders true/false, which numeric casts reject)."""
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    @classmethod
+    def _compile_where(cls, where, params):
+        """Named-parameter twin of the asyncpg client's builder: same triples,
+        same semantics, ':wN' binds instead of '$n'. Returns (sql, numeric_keys)."""
+        sql = ""
+        numeric_keys = set()
+        for n, item in enumerate(where or []):
+            try:
+                key, op, value = item
+            except (TypeError, ValueError):
+                raise ValueError(f"where entries are (key, op, value) triples; got {item!r}")
+            cls._validate_payload_key(key)
+            if op not in cls._WHERE_OPS:
+                raise ValueError(f"Unknown where op {op!r}. Allowed: {cls._WHERE_OPS}")
+            accessor = f"t.payload->>'{key}'"
+            if op == "is_null":
+                sql += f" AND {accessor} IS NULL"
+            elif op == "not_null":
+                sql += f" AND {accessor} IS NOT NULL"
+            elif op == "in":
+                if not isinstance(value, (list, tuple, set)) or not value:
+                    raise ValueError(f"'in' needs a non-empty list/tuple for {key!r}")
+                value = list(value)
+                numeric = all(cls._where_value_is_numeric(v) for v in value)
+                names = []
+                for j, v in enumerate(value):
+                    pname = f"w{n}_{j}"
+                    params[pname] = (float(v) if numeric else
+                                     "true" if v is True else
+                                     "false" if v is False else str(v))
+                    names.append(f"CAST(:{pname} AS numeric)" if numeric else f":{pname}")
+                if numeric:
+                    sql += f" AND ({accessor})::numeric IN ({', '.join(names)})"
+                    numeric_keys.add(key)
+                else:
+                    sql += f" AND {accessor} IN ({', '.join(names)})"
+            else:
+                if value is None:
+                    raise ValueError(
+                        f"({key!r}, {op!r}, None): comparisons with None are "
+                        f"ambiguous; use the 'is_null' / 'not_null' ops.")
+                pname = f"w{n}"
+                if cls._where_value_is_numeric(value):
+                    params[pname] = value
+                    sql += f" AND ({accessor})::numeric {op} CAST(:{pname} AS numeric)"
+                    numeric_keys.add(key)
+                else:
+                    params[pname] = ("true" if value is True else
+                                     "false" if value is False else str(value))
+                    sql += f" AND {accessor} {op} :{pname}"
+        return sql, numeric_keys
+
     def _get_table_ref(self, table_name: str, realm: Optional[str] = None) -> str:
         """Construct table reference string based on schema_per_realm setting."""
         if self.schema_per_realm:
@@ -1019,9 +1094,12 @@ class SQLAlchemyPostGraph:
         self,
         table_name: str,
         realm: str,
-        filters: Dict[str, Any],
+        filters: Optional[Dict[str, Any]] = None,
         space: Optional[str] = None,
         limit: Optional[int] = None,
+        where: Optional[List[tuple]] = None,
+        order_by: Optional[str] = None,
+        descending: bool = False,
     ) -> List[Vertex]:
         """Find vertices whose payload matches the given key-value filters.
 
@@ -1039,9 +1117,18 @@ class SQLAlchemyPostGraph:
         :data:`post_graph.JSON_NULL` to match a key holding an explicit JSON
         null, and :data:`post_graph.ABSENT` to match a key that is not present
         --- those are different states, and each has its own name.
+
+        *where*, *order_by* and *descending* behave exactly as on
+        :class:`AsyncPostGraph`: range predicates as ``(key, op, value)``
+        triples ANDed with *filters*, numeric casts for int/float values,
+        text comparison for str, ``is_null`` covering absent keys and JSON
+        null alike, and ordering that follows the cast of any numeric
+        predicate on the same key.
         """
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
+        if order_by is not None:
+            self._validate_payload_key(order_by)
 
         async def _op(conn):
             params: Dict[str, Any] = {"realm": realm}
@@ -1060,6 +1147,15 @@ class SQLAlchemyPostGraph:
                 pname = f"fabs{i}"
                 params[pname] = key
                 clauses += f" AND NOT jsonb_exists(t.payload, :{pname})"
+            where_sql, numeric_keys = self._compile_where(where, params)
+            clauses += where_sql
+            if order_by is not None:
+                acc = f"t.payload->>'{order_by}'"
+                if order_by in numeric_keys:
+                    acc = f"({acc})::numeric"
+                order_clause = f"ORDER BY {acc} {'DESC' if descending else 'ASC'}, t.id ASC"
+            else:
+                order_clause = "ORDER BY t.id ASC"
             limit_clause = ""
             if limit:
                 params["limit"] = limit
@@ -1070,7 +1166,7 @@ class SQLAlchemyPostGraph:
                    to_jsonb(t)->>'embedding' AS embedding_text
             FROM {table_ref} t
             WHERE t.realm = :realm{clauses}
-            ORDER BY t.id ASC{limit_clause}
+            {order_clause}{limit_clause}
             """
             try:
                 result = await conn.execute(text(query), params)
@@ -1372,6 +1468,128 @@ class SQLAlchemyPostGraph:
         else:
             async with self.engine_or_connection.connect() as conn:
                 return await _op(conn)
+
+    async def count_vertices(
+        self,
+        table_name: str,
+        realm: str,
+        filters: Optional[Dict[str, Any]] = None,
+        space: Optional[str] = None,
+        where: Optional[List[tuple]] = None,
+    ) -> int:
+        """COUNT(*) under the same predicates as :meth:`find_vertices`;
+        transfers the number, not the rows."""
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            params: Dict[str, Any] = {"realm": realm}
+            clauses = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params["space"] = space
+                clauses += " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            containment, absent_keys = self._prepare_filters(filters)
+            if containment is not None:
+                params["fjson"] = containment
+                clauses += " AND t.payload @> CAST(:fjson AS jsonb)"
+            for i, key in enumerate(absent_keys):
+                pname = f"fabs{i}"
+                params[pname] = key
+                clauses += f" AND NOT jsonb_exists(t.payload, :{pname})"
+            where_sql, _ = self._compile_where(where, params)
+            clauses += where_sql
+            try:
+                result = await conn.execute(text(
+                    f"SELECT COUNT(*) FROM {table_ref} t WHERE t.realm = :realm{clauses}"),
+                    params)
+                return int(result.scalar_one())
+            except ProgrammingError:
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            return await _op(self.engine_or_connection)
+        async with self.engine_or_connection.connect() as conn:
+            return await _op(conn)
+
+    async def delete_vertices(
+        self,
+        table_name: str,
+        realm: str,
+        where: List[tuple],
+        space: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> int:
+        """Bulk-delete vertices matching *where*; returns rows deleted.
+
+        Edges cascade away and the audit triggers record each deletion. An
+        empty or absent *where* is refused: a full-table delete must be the
+        explicit :meth:`delete_realm`.
+        """
+        if not where:
+            raise ValueError(
+                "delete_vertices requires a non-empty where; to remove an "
+                "entire realm use delete_realm, which is explicit about it.")
+        self._validate_identifier(table_name)
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            params: Dict[str, Any] = {"realm": realm}
+            clauses = ""
+            if space and space != RESERVED_SPACE_ALL:
+                params["space"] = space
+                clauses += " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            where_sql, _ = self._compile_where(where, params)
+            clauses += where_sql
+            try:
+                res = await conn.execute(text(
+                    f"DELETE FROM {table_ref} t WHERE t.realm = :realm{clauses}"),
+                    params)
+                return int(res.rowcount)
+            except ProgrammingError as e:
+                if "does not exist" in str(e).lower():
+                    raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+                raise PostGraphError(f"Programming error: {e}")
+
+        return await self._run_in_tx(_op, user_id)
+
+    async def create_payload_index(
+        self,
+        table_name: str,
+        realm: str,
+        key: str,
+        numeric: bool = False,
+    ) -> str:
+        """Index the ``(payload->>'key')`` expression; returns the index name.
+
+        Idempotent, deterministically named from table and key; with
+        ``numeric=True`` the expression carries the cast the numeric
+        comparisons use, and the build fails if existing rows hold
+        non-numeric text under the key -- the correct time to find out.
+        """
+        self._validate_identifier(table_name)
+        self._validate_payload_key(key)
+        table_ref = self._get_table_ref(table_name, realm)
+        safe = re.sub(r"[^a-z0-9_]", "_", key.lower())
+        index_name = f"idx_{table_name}_payload_{safe}" + ("_num" if numeric else "")
+        expr = (f"(((payload->>'{key}'))::numeric)" if numeric
+                else f"((payload->>'{key}'))")
+
+        async def _op(conn):
+            try:
+                await conn.execute(text(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_ref} ({expr})"))
+                return index_name
+            except ProgrammingError as e:
+                if "does not exist" in str(e).lower():
+                    raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+                raise PostGraphError(f"Programming error: {e}")
+
+        if isinstance(self.engine_or_connection, AsyncConnection):
+            name = await _op(self.engine_or_connection)
+            await self.engine_or_connection.commit()
+            return name
+        async with self.engine_or_connection.begin() as conn:
+            return await _op(conn)
 
     async def delete_vertex(self, table_name: str, realm: str, vertex_id: str, user_id: Optional[str] = None) -> bool:
         """Delete a vertex. Cascading foreign keys will automatically delete referencing edges."""

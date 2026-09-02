@@ -1263,8 +1263,13 @@ class SQLAlchemyPostGraph:
         search_scope: str = "main",
         space: Optional[str] = None,
         column_name: str = "embedding",
+        where: Optional[List[tuple]] = None,
     ) -> List[Tuple[Vertex, float]]:
-        """Perform vector similarity search on vertex embeddings using pgvector."""
+        """Perform vector similarity search on vertex embeddings using pgvector.
+
+        *where* applies the same payload predicates as :meth:`find_vertices`
+        inside the search (main scope only; other scopes raise), so a filtered
+        top-k is a genuine top-k rather than a post-filtered remainder."""
         self._validate_identifier(table_name)
         self._validate_identifier(column_name)
         col = f'"{column_name}"'
@@ -1326,19 +1331,28 @@ class SQLAlchemyPostGraph:
             LIMIT :top_k
             """
         else:
+            fetch_params = {"realm": realm, "vec": vec_str, "top_k": top_k}
+            if effective_space:
+                fetch_params["space"] = effective_space
+            where_sql, _nk = self._compile_where(where, fetch_params)
             query = f"""
             SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
                    CAST(t.{col} AS TEXT) AS embedding_text,
                    (t.{col} {op} CAST(:vec AS vector)) AS distance
             FROM {table_ref} t
-            WHERE t.realm = :realm AND t.{col} IS NOT NULL{space_filter_t}
+            WHERE t.realm = :realm AND t.{col} IS NOT NULL{space_filter_t}{where_sql}
             ORDER BY t.{col} {op} CAST(:vec AS vector) ASC
             LIMIT :top_k
             """
 
-        fetch_params = {"realm": realm, "vec": vec_str, "top_k": top_k}
-        if effective_space:
-            fetch_params["space"] = effective_space
+        if search_scope.lower() != "main" or (search_data_table and search_scope.lower() == "main"):
+            if where:
+                raise ValueError(
+                    "vector_search(where=...) is supported for the 'main' scope "
+                    "only; filtering the data/both scopes is not implemented.")
+            fetch_params = {"realm": realm, "vec": vec_str, "top_k": top_k}
+            if effective_space:
+                fetch_params["space"] = effective_space
 
         async def _op(conn):
             try:

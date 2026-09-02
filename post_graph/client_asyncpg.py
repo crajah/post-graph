@@ -1480,8 +1480,17 @@ class AsyncPostGraph:
         search_scope: str = "main",
         space: Optional[str] = None,
         column_name: str = "embedding",
+        where: Optional[List[tuple]] = None,
     ) -> List[Tuple[Vertex, float]]:
         """Perform vector similarity search on vertex embeddings using pgvector.
+
+        *where* adds the same ``(key, op, value)`` payload predicates as
+        :meth:`find_vertices`, applied inside the search rather than to its
+        result. The difference is not cosmetic: post-filtering a top-k list
+        can return fewer than k rows -- or none -- whenever the excluded rows
+        dominate the neighbourhood. Supported for the default ``main`` scope;
+        combining it with ``data``/``both`` scopes raises rather than
+        silently ignoring the predicate.
         
         Parameters:
           - search_data_table: If True and search_scope is 'main', searches the associated data table.
@@ -1508,6 +1517,10 @@ class AsyncPostGraph:
         scope = search_scope.lower()
         if search_data_table and scope == "main":
             scope = "data"
+        if where and scope != "main":
+            raise ValueError(
+                "vector_search(where=...) is supported for the 'main' scope "
+                "only; filtering the data/both scopes is not implemented.")
 
         effective_space = space if space and space != RESERVED_SPACE_ALL else None
         space_filter = ""
@@ -1555,19 +1568,24 @@ class AsyncPostGraph:
             LIMIT $3
             """
         else:
+            fetch_args = [realm, vec_str, top_k]
+            if effective_space:
+                fetch_args.append(effective_space)
+            where_sql, _nk = self._compile_where(where, fetch_args)
             query = f"""
             SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
                    to_jsonb(t)->>'{column_name}' AS embedding_text,
                    (t.{col} {op} $2::vector) AS distance
             FROM {table_ref} t
-            WHERE t.realm = $1 AND t.{col} IS NOT NULL{space_filter}
+            WHERE t.realm = $1 AND t.{col} IS NOT NULL{space_filter}{where_sql}
             ORDER BY t.{col} {op} $2::vector ASC
             LIMIT $3
             """
 
-        fetch_args = [realm, vec_str, top_k]
-        if effective_space:
-            fetch_args.append(effective_space)
+        if scope != "main":
+            fetch_args = [realm, vec_str, top_k]
+            if effective_space:
+                fetch_args.append(effective_space)
 
         async def _op(conn):
             try:

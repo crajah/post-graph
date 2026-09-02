@@ -300,3 +300,52 @@ class TestEdgeRangeQueries:
         n1 = await c.create_payload_index(t, realm=realm, key="t_created")
         n2 = await c.create_payload_index(t, realm=realm, key="t_created")
         assert n1 == n2 == f"idx_{t}_payload_t_created"
+
+
+class TestFilteredVectorSearch:
+    """where= inside vector_search: a filtered top-k must be a genuine top-k.
+
+    The scenario is the one post-filtering fails: many near neighbours of the
+    query are excluded by the predicate, and the wanted rows sit further out.
+    """
+
+    async def _seed(self, c, realm):
+        await c.create_vertex_table("rq_vec", realm=realm, vector_dim=3)
+        # Ten level-0 rows hugging the query vector, two level-1 rows far away.
+        for i in range(10):
+            await c.add_vertex("rq_vec", realm=realm,
+                               payload={"name": f"n{i}", "level": 0},
+                               embedding=[1.0, 0.0, 0.001 * i])
+        await c.add_vertex("rq_vec", realm=realm,
+                           payload={"name": "far1", "level": 1},
+                           embedding=[0.0, 1.0, 0.0])
+        await c.add_vertex("rq_vec", realm=realm,
+                           payload={"name": "far2", "level": 1},
+                           embedding=[0.0, 0.9, 0.1])
+
+    async def test_filtered_topk_returns_k_not_remainder(self, any_client, clean_realm):
+        c, realm = any_client, clean_realm
+        await self._seed(c, realm)
+        hits = await c.vector_search("rq_vec", realm=realm,
+                                     query_vector=[1.0, 0.0, 0.0], top_k=2,
+                                     where=[("level", "=", 1)])
+        # Post-filtering top-2 would return zero rows here; in-search
+        # filtering returns exactly the two level-1 rows.
+        assert len(hits) == 2
+        assert {v.payload["name"] for v, _d in hits} == {"far1", "far2"}
+
+    async def test_unfiltered_unchanged(self, any_client, clean_realm):
+        c, realm = any_client, clean_realm
+        await self._seed(c, realm)
+        hits = await c.vector_search("rq_vec", realm=realm,
+                                     query_vector=[1.0, 0.0, 0.0], top_k=3)
+        assert all(v.payload["level"] == 0 for v, _d in hits)
+
+    async def test_where_rejected_on_other_scopes(self, any_client, clean_realm):
+        c, realm = any_client, clean_realm
+        await self._seed(c, realm)
+        with pytest.raises(ValueError, match="main"):
+            await c.vector_search("rq_vec", realm=realm,
+                                  query_vector=[1.0, 0.0, 0.0],
+                                  search_scope="both",
+                                  where=[("level", "=", 1)])

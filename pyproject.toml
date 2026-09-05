@@ -38,6 +38,11 @@ all = [
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    # The suite exercises both backends, so the SQLAlchemy client's tests are
+    # part of it and its dependency belongs here. Without this, `pip install
+    # -e ".[test]"` produces a collection error rather than a test run -- which
+    # is how CI found it.
+    "SQLAlchemy>=2.0.0",
 ]
 
 [tool.pytest.ini_options]

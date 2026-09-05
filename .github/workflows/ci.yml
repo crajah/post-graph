@@ -63,7 +63,13 @@ jobs:
         # The suite skips rather than fails when PostgreSQL is unreachable,
         # which would otherwise show a green badge over a run that tested
         # nothing. Fail the job if anything was skipped.
-        run: pytest -q -rs --no-header | tee out.txt; grep -q "skipped" out.txt && { echo "::error::tests were skipped -- database not reachable"; exit 1; }; exit ${PIPESTATUS[0]}
+        run: |
+          set -o pipefail
+          pytest -q -rs --no-header | tee out.txt
+          if grep -q "skipped" out.txt; then
+            echo "::error::tests were skipped — the database was not reachable"
+            exit 1
+          fi
 
   lint:
     name: Lint and format

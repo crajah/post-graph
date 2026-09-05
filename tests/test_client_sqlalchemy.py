@@ -4,23 +4,21 @@ Mirrors the asyncpg test suite to ensure both clients behave identically.
 Tests are skipped when the database is unreachable.
 """
 
-import json
 import uuid
 
 import pytest
-from post_graph.client_sqlalchemy import SQLAlchemyPostGraph
+
 from post_graph import (
     RESERVED_SPACE_ALL,
+    CyclicReferenceError,
+    EdgeNotFoundError,
+    PostGraphError,
     ReservedSpaceError,
-    TableExistsError,
     TableNotFoundError,
     VertexNotFoundError,
-    EdgeNotFoundError,
-    CyclicReferenceError,
-    PostGraphError,
 )
-from post_graph.models import Vertex, Edge, DataRecord
-
+from post_graph.client_sqlalchemy import SQLAlchemyPostGraph
+from post_graph.models import DataRecord, Edge, Vertex
 
 # ---------------------------------------------------------------------------
 # Identifier validation (no DB needed)
@@ -584,7 +582,7 @@ class TestFindVertices:
     async def test_find_with_limit(self, sa_client, sa_clean_realm):
         realm = sa_clean_realm
         await sa_client.create_vertex_table("sa_people", realm=realm)
-        for i in range(5):
+        for _i in range(5):
             await sa_client.add_vertex("sa_people", realm=realm, payload={"group": "a"})
         results = await sa_client.find_vertices("sa_people", realm=realm, filters={"group": "a"}, limit=2)
         assert len(results) == 2
@@ -1303,7 +1301,6 @@ class TestEdgeSchema:
         realm = sa_clean_realm
         await sa_client.create_vertex_table("sa_people", realm=realm)
         await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
-        from sqlalchemy import text
         async with sa_client.engine_or_connection.connect() as conn:
             schema = await sa_client.get_edge_schema(conn, "sa_knows")
             assert schema["from_id"] == "sa_people"
@@ -1313,7 +1310,6 @@ class TestEdgeSchema:
         realm = sa_clean_realm
         await sa_client.create_vertex_table("sa_people", realm=realm)
         await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
-        from sqlalchemy import text
         async with sa_client.engine_or_connection.connect() as conn:
             s1 = await sa_client.get_edge_schema(conn, "sa_knows")
             s2 = await sa_client.get_edge_schema(conn, "sa_knows")

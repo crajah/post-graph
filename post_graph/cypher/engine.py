@@ -9,10 +9,17 @@ import json
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .ast import (
-    Create, Delete, Literal, Match, Merge, NodePattern, Param, PathPattern,
-    Property, Query, Return, SetClause,
+    Create,
+    Delete,
+    Literal,
+    Match,
+    Merge,
+    Param,
+    PathPattern,
+    Query,
+    Return,
+    SetClause,
 )
-from .lexer import CypherSyntaxError
 from .parser import parse
 from .translator import CypherTranslationError, Translator
 

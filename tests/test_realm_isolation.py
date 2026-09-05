@@ -8,7 +8,6 @@ import uuid
 
 import pytest
 import pytest_asyncio
-
 from conftest import requires_pg
 
 pytestmark = [requires_pg, pytest.mark.asyncio(loop_scope="session")]

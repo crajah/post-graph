@@ -6,12 +6,12 @@ every literal reaches SQL as a bind parameter rather than as text, and every
 construct outside the subset raises rather than being approximated.
 """
 import pytest
+from conftest import requires_pg
 
+from post_graph.cypher import ast as A
 from post_graph.cypher import parse, tokenize
 from post_graph.cypher.lexer import CypherSyntaxError
 from post_graph.cypher.translator import CypherTranslationError, Translator
-from post_graph.cypher import ast as A
-from conftest import requires_pg
 
 
 def _ref(table, realm):
@@ -344,7 +344,6 @@ class TestCypherExecution:
     @pytest.mark.asyncio(loop_scope="session")
     async def test_realm_isolation(self, pg_client_spr, graph):
         """A Cypher query must not see another realm's rows."""
-        from post_graph import CypherSession
         s, _, realm = graph
         other = f"{realm}_other"
         await pg_client_spr.create_vertex_table("person", realm=other)

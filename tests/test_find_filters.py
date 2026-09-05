@@ -12,10 +12,9 @@ fixture, because both carried the same implementation.
 """
 import pytest
 import pytest_asyncio
-
-from post_graph import JSON_NULL, ABSENT
-
 from conftest import requires_pg
+
+from post_graph import ABSENT, JSON_NULL
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), requires_pg]
 

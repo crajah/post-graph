@@ -19,11 +19,24 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import promoted as _promoted
 from .ast import (
-    BoolOp, Comparison, FunctionCall, IsNull, Literal, Match, Not, NodePattern,
-    Param, PathPattern, Property, Query, RelPattern, Return, UnaryOp, Variable,
+    BoolOp,
+    Comparison,
+    FunctionCall,
+    IsNull,
+    Literal,
+    Match,
+    NodePattern,
+    Not,
+    Param,
+    PathPattern,
+    Property,
+    Query,
+    RelPattern,
+    Return,
+    UnaryOp,
+    Variable,
     With,
 )
-from .lexer import CypherSyntaxError
 
 # Columns that exist on the table itself rather than inside payload.
 REAL_COLUMNS = {'id', 'uuid', 'fqid', 'realm', 'space', 'created_at', 'updated_at'}

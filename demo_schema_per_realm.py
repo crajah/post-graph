@@ -1,11 +1,14 @@
-import os
 import asyncio
 import getpass
-import json
+import os
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
+
 from post_graph import AsyncPostGraph, SQLAlchemyPostGraph
-from post_graph.errors import TableExistsError, TableNotFoundError, VertexNotFoundError, CyclicReferenceError
+from post_graph.errors import (
+    CyclicReferenceError,
+)
 
 # Autodetect connection DSN
 username = getpass.getuser()
@@ -50,13 +53,13 @@ async def run_asyncpg_schema_demo():
         # 2. Add Vertices & Edges (Verification of isolation)
         print("\n[+] Populating vertices and edges...")
         # Add alice in tenant_a
-        alice_a = await client.add_vertex("users", realm=realm_a, vertex_id=1, payload={"name": "Alice in Wonderland"})
+        await client.add_vertex("users", realm=realm_a, vertex_id=1, payload={"name": "Alice in Wonderland"})
         # Add alice in tenant_b (different payload)
-        alice_b = await client.add_vertex("users", realm=realm_b, vertex_id=1, payload={"name": "Alice in Chains"})
+        await client.add_vertex("users", realm=realm_b, vertex_id=1, payload={"name": "Alice in Chains"})
         
         # Add bob in both
-        bob_a = await client.add_vertex("users", realm=realm_a, vertex_id=2, payload={"name": "Bob A"})
-        bob_b = await client.add_vertex("users", realm=realm_b, vertex_id=2, payload={"name": "Bob B"})
+        await client.add_vertex("users", realm=realm_a, vertex_id=2, payload={"name": "Bob A"})
+        await client.add_vertex("users", realm=realm_b, vertex_id=2, payload={"name": "Bob B"})
 
         # Link followers
         await client.add_edge("follows", realm=realm_a, edge_id=10, from_id=1, to_id=2, relation_type="friend")
@@ -119,7 +122,7 @@ async def run_asyncpg_schema_demo():
         try:
             await client.add_edge("follows", realm=realm_a, from_id=3, to_id=1, relation_type="friend", check_cycle=True)
             print("    [-] Error: Cyclic edge was incorrectly allowed!")
-            assert False
+            raise AssertionError()
         except CyclicReferenceError as e:
             print(f"    [OK] Cycle check prevented loop: {e}")
 
@@ -177,11 +180,11 @@ async def run_sqlalchemy_schema_demo():
 
         # 2. Add Vertices & Edges (Verification of isolation)
         print("\n[+] Populating vertices and edges...")
-        alice_a = await client.add_vertex("sa_users", realm=realm_a, vertex_id=1, payload={"name": "Alice in Wonderland"})
-        alice_b = await client.add_vertex("sa_users", realm=realm_b, vertex_id=1, payload={"name": "Alice in Chains"})
+        await client.add_vertex("sa_users", realm=realm_a, vertex_id=1, payload={"name": "Alice in Wonderland"})
+        await client.add_vertex("sa_users", realm=realm_b, vertex_id=1, payload={"name": "Alice in Chains"})
         
-        bob_a = await client.add_vertex("sa_users", realm=realm_a, vertex_id=2, payload={"name": "Bob A"})
-        bob_b = await client.add_vertex("sa_users", realm=realm_b, vertex_id=2, payload={"name": "Bob B"})
+        await client.add_vertex("sa_users", realm=realm_a, vertex_id=2, payload={"name": "Bob A"})
+        await client.add_vertex("sa_users", realm=realm_b, vertex_id=2, payload={"name": "Bob B"})
 
         # Link followers
         await client.add_edge("sa_follows", realm=realm_a, edge_id=10, from_id=1, to_id=2, relation_type="friend")
@@ -244,7 +247,7 @@ async def run_sqlalchemy_schema_demo():
         try:
             await client.add_edge("sa_follows", realm=realm_a, from_id=3, to_id=1, relation_type="friend", check_cycle=True)
             print("    [-] Error: Cyclic edge was incorrectly allowed!")
-            assert False
+            raise AssertionError()
         except CyclicReferenceError as e:
             print(f"    [OK] Cycle check prevented loop: {e}")
 

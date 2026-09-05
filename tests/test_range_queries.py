@@ -10,7 +10,6 @@ the same assertions through per-schema realms.
 """
 import pytest
 import pytest_asyncio
-
 from conftest import requires_pg
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), requires_pg]

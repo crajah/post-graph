@@ -1,21 +1,22 @@
-import json
 import asyncio
-import random
+import json
 import logging
+import random
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
 import asyncpg
 
 from post_graph import promoted as _promoted
 from post_graph.errors import (
-    VertexNotFoundError,
     EdgeNotFoundError,
-    TableExistsError,
-    TableNotFoundError,
     PostGraphError,
     ReservedSpaceError,
+    TableExistsError,
+    TableNotFoundError,
+    VertexNotFoundError,
 )
-from post_graph.models import JSON_NULL, ABSENT, Vertex, Edge, DataRecord
+from post_graph.models import ABSENT, JSON_NULL, DataRecord, Edge, Vertex
 
 logger = logging.getLogger("post_graph")
 
@@ -833,7 +834,7 @@ class AsyncPostGraph:
             else:
                 v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
 
-            v_id_str = str(v_id_int)
+            str(v_id_int)
 
             has_emb = False
             if vec_str:
@@ -1556,9 +1557,9 @@ class AsyncPostGraph:
         effective_space = space if space and space != RESERVED_SPACE_ALL else None
         space_filter = ""
         if effective_space:
-            space_filter = f" AND v.space = $4" if scope in ("data", "both") else f" AND t.space = $4"
-        space_filter_d = f" AND d.space = $4" if effective_space else ""
-        space_filter_combined = f" AND space = $4" if effective_space else ""
+            space_filter = " AND v.space = $4" if scope in ("data", "both") else " AND t.space = $4"
+        space_filter_d = " AND d.space = $4" if effective_space else ""
+        space_filter_combined = " AND space = $4" if effective_space else ""
 
         if scope == "data":
             query = f"""
@@ -3122,7 +3123,7 @@ class AsyncPostGraph:
                 rows = await conn.fetch(query, realm)
                 return [list(r["members"]) for r in rows]
             except asyncpg.UndefinedTableError:
-                raise TableNotFoundError(f"Table not found during connected_components.")
+                raise TableNotFoundError("Table not found during connected_components.")
 
         if isinstance(self.connection, asyncpg.Pool):
             async with self.connection.acquire() as conn:

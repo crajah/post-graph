@@ -1,17 +1,17 @@
 import asyncio
-import json
 import os
 import sys
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 # Ensure the local package is importable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
 
+import getpass
+
 from post_graph import AsyncPostGraph, SQLAlchemyPostGraph, TableNotFoundError
 
-
-import getpass
 default_user = getpass.getuser()
 DATABASE_URL = os.environ.get("DATABASE_URL", f"postgresql://{default_user}@localhost:5432/postgres")
 # For SQLAlchemy we need postgresql+asyncpg
@@ -79,8 +79,8 @@ async def run_asyncpg_demo():
         print("\n[+] Inserting vertices with user auditing...")
         # Realm A
         u1 = await client.add_vertex("users", realm="realm_a", vertex_id=1, payload={"name": "Alice Smith"}, user_id="admin_1")
-        u2 = await client.add_vertex("users", realm="realm_a", vertex_id=2, payload={"name": "Bob Jones"}, user_id="admin_1")
-        p1 = await client.add_vertex("posts", realm="realm_a", vertex_id=10, payload={"title": "Post Graph is Awesome"}, user_id="alice_user")
+        await client.add_vertex("users", realm="realm_a", vertex_id=2, payload={"name": "Bob Jones"}, user_id="admin_1")
+        await client.add_vertex("posts", realm="realm_a", vertex_id=10, payload={"title": "Post Graph is Awesome"}, user_id="alice_user")
 
         # Realm B (Tenant Isolation verification)
         u3 = await client.add_vertex("users", realm="realm_b", vertex_id=1, payload={"name": "Alice Cooper"}, user_id="admin_2")
@@ -284,8 +284,8 @@ async def run_asyncpg_demo():
         print("\n[+] Testing Append-Only Data Tables ({table_name}_data)...")
         v_alice = await client.get_vertex("users", "realm_a", 1)
         if v_alice:
-            rec1 = await v_alice.add_data({"status": "active", "login_count": 1})
-            rec2 = await v_alice.add_data({"status": "idle", "login_count": 2})
+            await v_alice.add_data({"status": "active", "login_count": 1})
+            await v_alice.add_data({"status": "idle", "login_count": 2})
             v_data = await v_alice.get_data()
             print(f"    Vertex Data Records for Alice: count={len(v_data)}")
             for r in v_data:
@@ -294,7 +294,7 @@ async def run_asyncpg_demo():
 
         e_like = await client.get_edge("likes", "realm_a", 2)
         if e_like:
-            rec_e = await e_like.add_data({"event": "heart_clicked", "device": "mobile"})
+            await e_like.add_data({"event": "heart_clicked", "device": "mobile"})
             e_data = await e_like.get_data()
             print(f"    Edge Data Records for Like Edge: count={len(e_data)}, Payload: {e_data[0].payload}")
             assert len(e_data) == 1

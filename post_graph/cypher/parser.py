@@ -7,9 +7,30 @@ whose meaning we only approximate.
 from typing import Any, Dict, List, Optional, Tuple
 
 from .ast import (
-    BoolOp, Comparison, Create, Delete, FunctionCall, IsNull, Literal, Match,
-    Merge, Not, NodePattern, OrderItem, Param, PathPattern, Property, Query,
-    RelPattern, Remove, Return, ReturnItem, SetClause, UnaryOp, Unwind, Variable,
+    BoolOp,
+    Comparison,
+    Create,
+    Delete,
+    FunctionCall,
+    IsNull,
+    Literal,
+    Match,
+    Merge,
+    NodePattern,
+    Not,
+    OrderItem,
+    Param,
+    PathPattern,
+    Property,
+    Query,
+    RelPattern,
+    Remove,
+    Return,
+    ReturnItem,
+    SetClause,
+    UnaryOp,
+    Unwind,
+    Variable,
     With,
 )
 from .lexer import CypherSyntaxError, Token, tokenize

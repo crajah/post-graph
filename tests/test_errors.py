@@ -1,13 +1,13 @@
 """Tests for the post_graph.errors module."""
 
 from post_graph.errors import (
-    PostGraphError,
-    VertexNotFoundError,
+    CyclicReferenceError,
     EdgeNotFoundError,
+    PostGraphError,
+    ReservedSpaceError,
     TableExistsError,
     TableNotFoundError,
-    CyclicReferenceError,
-    ReservedSpaceError,
+    VertexNotFoundError,
 )
 
 

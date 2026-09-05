@@ -6,8 +6,7 @@ that silently answers a slightly different question than the one asked is worse
 than one that refuses.
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
-
+from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------- expressions
 

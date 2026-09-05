@@ -1,6 +1,7 @@
 """Demo script testing automatic UUID creation and lookup in post-graph."""
 import asyncio
 import os
+
 from post_graph import AsyncPostGraph
 
 DB_URI = os.getenv("POSTGRES_URI", "postgresql://crajah@localhost:5432/postgres")

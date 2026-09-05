@@ -6,9 +6,9 @@ unpromoted one must return the same rows for the same query. A promotion that
 is merely fast is a bug.
 """
 import pytest
+from conftest import requires_pg
 
 from post_graph import promoted as pr
-from conftest import requires_pg
 
 
 class TestNames:

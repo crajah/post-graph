@@ -13,8 +13,7 @@ import sys
 # Add parent dir to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-from post_graph import AsyncPostGraph, CypherSession
-from post_graph import CypherSyntaxError, CypherTranslationError
+from post_graph import AsyncPostGraph, CypherSession, CypherSyntaxError, CypherTranslationError
 
 
 async def main():

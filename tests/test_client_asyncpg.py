@@ -8,17 +8,17 @@ import json
 import uuid
 
 import pytest
+
 from post_graph import (
-    AsyncPostGraph,
     RESERVED_SPACE_ALL,
+    AsyncPostGraph,
+    CyclicReferenceError,
+    EdgeNotFoundError,
     ReservedSpaceError,
-    TableExistsError,
     TableNotFoundError,
     VertexNotFoundError,
-    EdgeNotFoundError,
-    CyclicReferenceError,
 )
-from post_graph.models import Vertex, Edge, DataRecord
+from post_graph.models import DataRecord, Edge, Vertex
 
 # ---------------------------------------------------------------------------
 # Identifier validation (no DB needed)
@@ -610,7 +610,7 @@ class TestFindVertices:
     async def test_find_with_limit(self, pg_client, clean_realm):
         realm = clean_realm
         await pg_client.create_vertex_table("people", realm=realm)
-        for i in range(5):
+        for _i in range(5):
             await pg_client.add_vertex("people", realm=realm, payload={"group": "a"})
         results = await pg_client.find_vertices("people", realm=realm, filters={"group": "a"}, limit=2)
         assert len(results) == 2

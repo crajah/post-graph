@@ -50,3 +50,31 @@ pythonpath = [".", "tests"]
 [project.urls]
 Homepage = "https://github.com/crajah/post-graph"
 Repository = "https://github.com/crajah/post-graph"
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+exclude = ["evaluation/lightrag_work", "evaluation/corpus", ".venv"]
+
+[tool.ruff.lint]
+# Deliberately narrow. These four catch real defects -- unused names, shadowed
+# bindings, mutable defaults, loop-variable capture -- rather than enforcing a
+# house style over a codebase that already has one. Style rules were left off
+# because `ruff format` would rewrite ~6,000 lines and take git blame with it,
+# which is a poor trade for a codebase whose formatting is already consistent.
+select = ["F", "B", "E9", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Research harnesses: closures inside a loop are consumed by an await in the
+# same iteration, so the binding warning does not apply. Kept scoped to these
+# files rather than disabled globally.
+"evaluation/**" = ["B023"]
+# Tests deliberately assert against broad exception types in a few places.
+"tests/**" = ["B017", "F841"]
+# B904: the client modules translate driver exceptions into domain errors
+# (TableNotFoundError, CyclicReferenceError) deliberately, and often want to
+# hide the driver detail rather than chain it. Adding `from e` at 87 sites
+# would improve tracebacks and is worth doing -- as its own change, reviewed
+# on its merits, not as launch-eve churn. Tracked rather than silently
+# disabled.
+"post_graph/**" = ["B904"]

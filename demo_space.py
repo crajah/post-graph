@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from post_graph import AsyncPostGraph
 
+
 async def main():
     dsn = os.getenv("POSTGRES_URI", "postgresql://crajah:postgrespassword@localhost:5432/postgres")
     client = AsyncPostGraph(dsn=dsn)

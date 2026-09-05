@@ -5,7 +5,10 @@ Markdown emphasis is stripped and tick/cross symbols become words, because
 GitHub interprets neither inside a CSV — an unconverted "❌ discouraged" renders
 as the meaningless "No discouraged".
 """
-import csv, pathlib, re, sys
+import csv
+import pathlib
+import re
+import sys
 
 NAMES = [
     "capability-comparison",

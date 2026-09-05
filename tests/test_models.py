@@ -1,14 +1,13 @@
 """Tests for the post_graph.models module — pure unit tests, no database needed."""
 
-import json
 import copy
-
-import pytest
+import json
 from datetime import datetime, timezone
 
-from post_graph.models import Vertex, Edge, DataRecord, TraversalStep
-from post_graph.errors import PostGraphError
+import pytest
 
+from post_graph.errors import PostGraphError
+from post_graph.models import DataRecord, Edge, TraversalStep, Vertex
 
 # ---------------------------------------------------------------------------
 # Vertex

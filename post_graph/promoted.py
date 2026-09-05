@@ -28,8 +28,8 @@ to a 27-buffer bitmap index scan, and from ~31ms to ~2.5ms warm. The margin
 grows with the table.
 """
 
-from typing import List, Optional, Sequence, Tuple
 import re
+from typing import List, Optional, Sequence, Tuple
 
 #: Payload keys promoted as temporal columns unless a caller overrides them.
 #: These are post-graph's own vocabulary — ``traverse(as_of=...)`` already

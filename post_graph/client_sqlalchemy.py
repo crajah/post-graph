@@ -2,20 +2,21 @@ import json
 import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncConnection
-from sqlalchemy.exc import DBAPIError, DataError, IntegrityError, ProgrammingError
+from sqlalchemy.exc import DataError, DBAPIError, IntegrityError, ProgrammingError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from post_graph import promoted as _promoted
 from post_graph.errors import (
-    VertexNotFoundError,
     EdgeNotFoundError,
-    TableExistsError,
-    TableNotFoundError,
     PostGraphError,
     ReservedSpaceError,
+    TableExistsError,
+    TableNotFoundError,
+    VertexNotFoundError,
 )
-from post_graph.models import JSON_NULL, ABSENT, Vertex, Edge, DataRecord
+from post_graph.models import ABSENT, JSON_NULL, DataRecord, Edge, Vertex
 
 logger = logging.getLogger("post_graph")
 
@@ -759,7 +760,7 @@ class SQLAlchemyPostGraph:
             else:
                 v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
 
-            v_id_str = str(v_id_int)
+            str(v_id_int)
 
             if vec_str:
                 query = f"""
@@ -1981,7 +1982,7 @@ class SQLAlchemyPostGraph:
             from_id_int = int(str(from_id).split('/')[-1]) if '/' in str(from_id) else int(from_id)
             to_id_int = int(str(to_id).split('/')[-1]) if '/' in str(to_id) else int(to_id)
 
-            e_id_str = str(e_id_int)
+            str(e_id_int)
 
             if check_cycle:
                 cycle_tables = check_cycle if isinstance(check_cycle, list) else [table_name]

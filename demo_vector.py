@@ -1,7 +1,8 @@
 """Demo script verifying pgvector support and vector similarity search in post-graph across main and data tables."""
 import asyncio
 import os
-from post_graph import AsyncPostGraph, TableNotFoundError
+
+from post_graph import AsyncPostGraph
 
 DB_URI = os.getenv("POSTGRES_URI", "postgresql://crajah@localhost:5432/postgres")
 
@@ -17,7 +18,7 @@ async def main():
     realm = "rag_demo"
 
     table_ref = client._get_table_ref(table_name, realm)
-    audit_table_ref = client._get_table_ref(f"{table_name}_data_audit", realm)
+    client._get_table_ref(f"{table_name}_data_audit", realm)
     audit_table_main = client._get_table_ref(f"{table_name}_audit", realm)
     data_table_ref = client._get_table_ref(f"{table_name}_data", realm)
 

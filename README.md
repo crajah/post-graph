@@ -1,5 +1,6 @@
 # post-graph: PostgreSQL-Backed Graph Database Library
 
+[![CI](https://github.com/crajah/post-graph/actions/workflows/ci.yml/badge.svg)](https://github.com/crajah/post-graph/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/post-graph.svg)](https://pypi.org/project/post-graph/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/post-graph.svg)](https://pypi.org/project/post-graph/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)

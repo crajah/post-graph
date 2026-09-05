@@ -7,6 +7,7 @@ anything that speaks SQL can read your graph.
 import asyncio
 
 from _shared import DSN, banner, fresh_realm
+
 from post_graph import AsyncPostGraph
 
 

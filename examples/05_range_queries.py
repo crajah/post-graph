@@ -12,6 +12,7 @@ number.
 import asyncio
 
 from _shared import DSN, banner, fresh_realm
+
 from post_graph import AsyncPostGraph
 
 
@@ -21,12 +22,12 @@ async def main():
     realm = fresh_realm("ex_range")
     try:
         await client.create_vertex_table("readings", realm=realm)
-        for i, (sensor, temp, ts) in enumerate([
+        for sensor, temp, ts in [
                 ("s1", 18.5, "2026-01-02T09:00:00Z"),
                 ("s1", 22.1, "2026-01-02T12:00:00Z"),
                 ("s2", 31.7, "2026-01-02T12:05:00Z"),
                 ("s2", 12.0, "2026-01-03T08:30:00Z"),
-                ("s3", 27.4, "2026-01-03T15:45:00Z")]):
+                ("s3", 27.4, "2026-01-03T15:45:00Z")]:
             await client.add_vertex("readings", realm=realm,
                                     payload={"sensor": sensor, "temp": temp, "ts": ts})
 

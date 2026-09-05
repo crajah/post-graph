@@ -10,6 +10,7 @@ what happened, including the things you would rather had not.
 import asyncio
 
 from _shared import DSN, banner, fresh_realm
+
 from post_graph import AsyncPostGraph
 
 

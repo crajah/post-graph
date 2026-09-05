@@ -591,6 +591,23 @@ deleted_count = await client.delete_realm(realm="tenant_to_remove")
 
 ---
 
+## 🤝 Contributing
+
+Bug reports, failing test cases and pull requests are all welcome.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the parts that are specific to this
+project rather than generic advice: what the test suite needs, what it
+deliberately does not need, and the invariants worth understanding before
+changing them.
+
+Issues tagged [`good first issue`](https://github.com/crajah/post-graph/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are real gaps rather than
+make-work — each one names the file to look at, what "done" means, and what
+you will learn from it.
+
+Tests need PostgreSQL with `pgvector` and nothing else — no LLM, no API keys.
+The same is true of every example.
+
+---
+
 ## 📄 License
 
 This project is licensed under the [Apache License 2.0](LICENSE).

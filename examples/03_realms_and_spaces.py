@@ -13,7 +13,7 @@ from post_graph import AsyncPostGraph
 
 
 async def main():
-    dsn = os.getenv("POSTGRES_URI", "postgresql://crajah:postgrespassword@localhost:5432/postgres")
+    dsn = os.getenv("POSTGRES_URI", "postgresql://localhost:5432/postgres")
     client = AsyncPostGraph(dsn=dsn)
     try:
         await client.connect()

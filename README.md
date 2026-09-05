@@ -9,6 +9,33 @@ A high-performance Python library for using PostgreSQL as a native graph databas
 
 ---
 
+## 🧪 Runnable Examples
+
+Ten scripts in [`examples/`](examples/), each one capability. They need
+**PostgreSQL and nothing else** — no LLM, no API keys:
+
+```bash
+export POSTGRES_URI=postgresql://localhost:5432/postgres
+cd examples && python 01_quickstart.py
+```
+
+| | shows |
+| :--- | :--- |
+| [`01_quickstart.py`](examples/01_quickstart.py) | Vertices, edges, traversal, shortest path |
+| [`02_vector_search.py`](examples/02_vector_search.py) | pgvector search across main and history tables |
+| [`03_realms_and_spaces.py`](examples/03_realms_and_spaces.py) | Tenant isolation and sub-grouping |
+| [`04_schema_per_realm.py`](examples/04_schema_per_realm.py) | A PostgreSQL schema per tenant |
+| [`05_range_queries.py`](examples/05_range_queries.py) | Range filters, ordering, counting, bulk delete on JSONB |
+| [`06_history_and_audit.py`](examples/06_history_and_audit.py) | Append-only history and the trigger-written audit log |
+| [`07_opencypher.py`](examples/07_opencypher.py) | openCypher queries |
+| [`08_transactions.py`](examples/08_transactions.py) | Graph and application tables in one transaction |
+| [`09_uuid_keys.py`](examples/09_uuid_keys.py) | UUID keys alongside generated ids |
+| [`10_full_tour.py`](examples/10_full_tour.py) | All of it, end to end |
+
+Every one was executed against a live database before being committed.
+
+---
+
 ## 🌟 Key Features
 
 - **Table-Per-Vertex & Table-Per-Edge Architecture**: Maps graph elements directly to relational tables, taking advantage of PostgreSQL's foreign keys, indexes, and constraints.
@@ -551,7 +578,7 @@ The subset is bounded and every boundary raises rather than being approximated;
 `WITH`, `UNION`, `OPTIONAL MATCH`, path variables and `RETURN *` are refused.
 Conformance is measured against the openCypher TCK rather than asserted. See
 [docs/cypher.md](docs/cypher.md) for what is supported and the current numbers,
-and `demo_cypher.py` for a runnable tour.
+and [`examples/07_opencypher.py`](examples/07_opencypher.py) for a runnable tour.
 
 ---
 

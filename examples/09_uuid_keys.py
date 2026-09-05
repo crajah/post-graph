@@ -4,7 +4,7 @@ import os
 
 from post_graph import AsyncPostGraph
 
-DB_URI = os.getenv("POSTGRES_URI", "postgresql://crajah@localhost:5432/postgres")
+DB_URI = os.getenv("POSTGRES_URI", "postgresql://localhost:5432/postgres")
 
 async def main():
     print("=" * 60)

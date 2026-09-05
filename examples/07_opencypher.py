@@ -17,7 +17,7 @@ from post_graph import AsyncPostGraph, CypherSession, CypherSyntaxError, CypherT
 
 
 async def main():
-    dsn = os.getenv("POSTGRES_URI", "postgresql://crajah:postgrespassword@localhost:5432/postgres")
+    dsn = os.getenv("POSTGRES_URI", "postgresql://localhost:5432/postgres")
     client = AsyncPostGraph(dsn=dsn, schema_per_realm=True)
     try:
         await client.connect()

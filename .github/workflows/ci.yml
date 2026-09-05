@@ -62,12 +62,13 @@ jobs:
           POST_GRAPH_TEST_DSN: postgresql://postgres:postgres@localhost:5432/postgres
         # The suite skips rather than fails when PostgreSQL is unreachable,
         # which would otherwise show a green badge over a run that tested
-        # nothing. Fail the job if anything was skipped.
+        # nothing. Fail on that specific skip only: the openCypher TCK tests
+        # skip legitimately here, since the fixtures are fetched separately.
         run: |
           set -o pipefail
           pytest -q -rs --no-header | tee out.txt
-          if grep -q "skipped" out.txt; then
-            echo "::error::tests were skipped — the database was not reachable"
+          if grep -q "PostgreSQL not reachable" out.txt; then
+            echo "::error::the database was not reachable; the run tested nothing"
             exit 1
           fi
 

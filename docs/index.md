@@ -25,23 +25,15 @@ That is the whole installation. No server to run, no extension to compile, no se
 
 ---
 
-## Where this came from
-
-`post-graph` was written for a genome simulation.
-
-Thousands of agents make decisions against a shared world model and write events that only ever accumulate. The scheduler needs the handful of events whose `due_at` has passed, not the table. The work queue needs the rows nobody has done yet. Every simulated world has to be isolated from every other, and every mutation has to stay reconstructible afterwards — a result you cannot replay is not a result.
-
-That shape is a graph. Agents, decisions and world state are vertices joined by edges you walk rather than join, and the walks are the interesting part. The obvious move was to stand up Neo4j beside the PostgreSQL already holding the simulation's own tables.
-
-What stopped it was one requirement that no pair of datastores can satisfy: writing a decision, its embedding, and the application row recording it had to commit together or not at all. Two systems give you two transactions and a window in between where the graph says one thing and your tables say another. On a simulation you intend to replay, that window is the bug.
-
-So the graph stayed in PostgreSQL, and this library is what had to be written to make that comfortable — the schema, the traversal SQL, the tenancy, the audit trail. Everything below came out of a real workload rather than a design exercise: the [payload predicates](#polling-without-fetching-the-table) exist because polling a growing table OOMed a worker, the [promoted columns](#properties-you-filter-on-as-indexed-columns) because a sequential scan on 65k rows was too slow, the [realms](#two-levels-of-tenancy) because worlds must not see each other.
-
-The general case is the same one many teams hit. You reach for a graph database at the moment you realise a join is really a walk, and the usual next step is Neo4j, or Apache AGE, or accepting that the graph lives somewhere other than the data it describes.
+Most teams reach for a graph database at the moment they realise a join is really a walk. The usual next step is to stand up Neo4j, or install Apache AGE, or accept that the graph lives somewhere other than the data it describes.
 
 There is a less obvious option: PostgreSQL is already a competent graph database, provided something takes care of the schema, the traversal SQL, the tenancy and the audit trail for you.
 
 That is what `post-graph` is. Not a storage engine, not an extension — a Python library that builds the tables, writes the recursive CTEs, and leaves you with a graph made of ordinary PostgreSQL objects that you can index, constrain, back up and inspect with `psql`.
+
+```bash
+pip install post-graph
+```
 
 ## The claim, stated plainly
 
@@ -194,9 +186,9 @@ Two things this deliberately does not do. It does not change the model: `Vertex`
 
 *New in 1.2.0.*
 
-This is the simulation's scheduler problem from the top of the page. Its event
-tables only grow; each tick needs the few rows whose `due_at` has passed, and
-the work queue needs the undone ones. With only equality filters, every poll
+The workload that motivated this appends events and never deletes them, so its
+tables only grow. Its scheduler needs the few rows whose `due_at` has passed;
+its work queue needs the undone rows. With only equality filters, every poll
 fetched the entire table and filtered client-side — which worked until it
 OOMed a worker.
 

@@ -235,7 +235,7 @@ due = await pg.find_vertices("events", realm=world,
     order_by="due_at", limit=200)
 
 # A work queue's pending slice.
-pending = await pg.find_vertices("decision_queue", realm="genome_agents",
+pending = await pg.find_vertices("decision_queue", realm="agents",
     where=[("done_at", "is_null", None)], limit=500)
 
 # Periodic purge of completed history, returning rows deleted.
@@ -243,7 +243,7 @@ purged = await pg.delete_vertices("events", realm=world,
     where=[("done_at", "not_null", None), ("done_at", "<", cutoff_str)])
 
 # Queue depth without row transfer; index the hot predicate once at startup.
-depth = await pg.count_vertices("decision_queue", realm="genome_agents",
+depth = await pg.count_vertices("decision_queue", realm="agents",
     where=[("done_at", "is_null", None)])
 await pg.create_payload_index("events", realm=world, key="due_at")
 ```

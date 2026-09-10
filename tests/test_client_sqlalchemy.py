@@ -288,6 +288,49 @@ class TestVertexCRUD:
         assert v2.payload["a"] == 1
         assert v2.payload["b"] == 2
 
+    async def test_upsert_vertex_replace_removes_a_key(self, sa_client, sa_clean_realm):
+        """Merging cannot express removal: a payload written without a key left
+        the old key in the row, so payload.pop(k) followed by a write silently
+        did nothing. replace=True overwrites the column instead."""
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        await sa_client.upsert_vertex("sa_people", realm=realm, vertex_id=61,
+                                      payload={"a": 1, "paused": True})
+
+        merged = await sa_client.upsert_vertex("sa_people", realm=realm, vertex_id=61,
+                                               payload={"a": 1})
+        assert merged.payload["paused"] is True, "default must still merge"
+
+        replaced = await sa_client.upsert_vertex("sa_people", realm=realm, vertex_id=61,
+                                                 payload={"a": 1}, replace=True)
+        assert "paused" not in replaced.payload
+        assert replaced.payload == {"a": 1}
+
+        fetched = await sa_client.get_vertex("sa_people", realm=realm, vertex_id="61")
+        assert "paused" not in fetched.payload, "removal must survive the round trip"
+
+    async def test_upsert_edge_replace_removes_a_key(self, sa_client, sa_clean_realm):
+        realm = sa_clean_realm
+        await sa_client.create_vertex_table("sa_people", realm=realm)
+        await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people",
+                                          to_vertex_table="sa_people", realm=realm)
+        a = await sa_client.add_vertex("sa_people", realm=realm, payload={"n": "a"})
+        b = await sa_client.add_vertex("sa_people", realm=realm, payload={"n": "b"})
+        e = await sa_client.add_edge("sa_knows", realm=realm, from_id=a.id, to_id=b.id,
+                                     relation_type="sa_knows", payload={"w": 1, "stale": True})
+
+        merged = await sa_client.upsert_edge("sa_knows", realm=realm, edge_id=e.id,
+                                             from_id=a.id, to_id=b.id,
+                                             relation_type="sa_knows", payload={"w": 2})
+        assert merged.payload["stale"] is True
+
+        replaced = await sa_client.upsert_edge("sa_knows", realm=realm, edge_id=e.id,
+                                               from_id=a.id, to_id=b.id,
+                                               relation_type="sa_knows", payload={"w": 2},
+                                               replace=True)
+        assert "stale" not in replaced.payload
+        assert replaced.payload == {"w": 2}
+
     async def test_delete_vertex(self, sa_client, sa_clean_realm):
         realm = sa_clean_realm
         await sa_client.create_vertex_table("sa_people", realm=realm)

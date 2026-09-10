@@ -740,9 +740,18 @@ class SQLAlchemyPostGraph:
         embedding: Optional[List[float]] = None,
         embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
-        space: Optional[str] = "default"
+        space: Optional[str] = "default",
+        replace: bool = False
     ) -> Vertex:
-        """Upsert a vertex (merges payload JSONB on conflict)."""
+        """Upsert a vertex, merging the payload JSONB on conflict.
+
+        ``replace=False`` (the default) merges the supplied payload into the
+        stored one, so keys not mentioned here survive -- the long-standing
+        contract, which callers depend on to avoid erasing flags written by
+        other code paths. Merging cannot express removal, so pass
+        ``replace=True`` to overwrite the payload column outright and thereby
+        delete a key. With replace, the supplied payload is the whole payload.
+        """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
             raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
@@ -750,6 +759,11 @@ class SQLAlchemyPostGraph:
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
         eff_space = space or "default"
+
+        # Merge by default; replace only when the caller asks. Merging cannot
+        # express key removal, which is the whole reason `replace` exists.
+        payload_sql = ("EXCLUDED.payload" if replace
+                       else f"{table_ref}.payload || EXCLUDED.payload")
 
         async def _op(conn):
             nonlocal vertex_id
@@ -768,7 +782,7 @@ class SQLAlchemyPostGraph:
                 VALUES (:realm, :id, :space, CAST(:payload AS JSONB), CAST(:vec AS vector))
                 ON CONFLICT (realm, id) DO UPDATE
                 SET space = EXCLUDED.space,
-                    payload = {table_ref}.payload || EXCLUDED.payload,
+                    payload = {payload_sql},
                     embedding = EXCLUDED.embedding,
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
@@ -780,7 +794,7 @@ class SQLAlchemyPostGraph:
                 VALUES (:realm, :id, :space, CAST(:payload AS JSONB))
                 ON CONFLICT (realm, id) DO UPDATE
                 SET space = EXCLUDED.space,
-                    payload = {table_ref}.payload || EXCLUDED.payload,
+                    payload = {payload_sql},
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
                 """
@@ -850,6 +864,7 @@ class SQLAlchemyPostGraph:
                 payload=item.get("payload"),
                 embedding=item.get("embedding"),
                 space=item.get("space", "default"),
+                replace=item.get("replace", False),
                 user_id=user_id,
             )
             results.append(v)
@@ -878,6 +893,7 @@ class SQLAlchemyPostGraph:
                 edge_id=item.get("edge_id"),
                 payload=item.get("payload"),
                 space=item.get("space", "default"),
+                replace=item.get("replace", False),
                 user_id=user_id,
             )
             results.append(e)
@@ -1951,9 +1967,17 @@ class SQLAlchemyPostGraph:
         user_id: Optional[str] = None,
         check_cycle: Union[bool, List[str]] = False,
         space: Optional[str] = "default",
-        embedding: Optional[List[float]] = None
+        embedding: Optional[List[float]] = None,
+        replace: bool = False
     ) -> Edge:
-        """Upsert an edge (merges payload JSONB on conflict).
+        """Upsert an edge, merging the payload JSONB on conflict.
+
+        ``replace=False`` (the default) merges the supplied payload into the
+        stored one, so keys not mentioned here survive -- the long-standing
+        contract, which callers depend on to avoid erasing flags written by
+        other code paths. Merging cannot express removal, so pass
+        ``replace=True`` to overwrite the payload column outright and thereby
+        delete a key. With replace, the supplied payload is the whole payload.
 
         ``embedding`` is stored when the edge table has a vector column, and
         replaces any previous embedding for the edge.
@@ -1965,6 +1989,11 @@ class SQLAlchemyPostGraph:
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
         eff_space = space or "default"
+
+        # Merge by default; replace only when the caller asks. Merging cannot
+        # express key removal, which is the whole reason `replace` exists.
+        payload_sql = ("EXCLUDED.payload" if replace
+                       else f"{table_ref}.payload || EXCLUDED.payload")
 
         async def _op(conn):
             nonlocal edge_id
@@ -2010,7 +2039,7 @@ class SQLAlchemyPostGraph:
                     from_id = EXCLUDED.from_id,
                     to_id = EXCLUDED.to_id,
                     relation_type = EXCLUDED.relation_type,
-                    payload = {table_ref}.payload || EXCLUDED.payload,
+                    payload = {payload_sql},
                     embedding = EXCLUDED.embedding,
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
@@ -2026,7 +2055,7 @@ class SQLAlchemyPostGraph:
                     from_id = EXCLUDED.from_id,
                     to_id = EXCLUDED.to_id,
                     relation_type = EXCLUDED.relation_type,
-                    payload = {table_ref}.payload || EXCLUDED.payload,
+                    payload = {payload_sql},
                     updated_at = CURRENT_TIMESTAMP
                 RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
                 """

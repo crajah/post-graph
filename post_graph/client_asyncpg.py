@@ -369,8 +369,17 @@ class AsyncPostGraph:
         vector_columns: Optional[Dict[str, int]] = None,
         temporal_keys: Optional[Sequence[str]] = None,
         promoted_keys: Optional[Sequence[str]] = None,
+        audited: bool = True,
     ):
-        """Create a new vertex table and its associated shadow audit table, indexes, and triggers."""
+        """Create a new vertex table and its associated shadow audit table, indexes, and triggers.
+
+        ``audited=False`` skips the shadow audit table and its trigger, for
+        tables whose every write does not need recording -- caches, scratch
+        realms, high-churn queues where the audit table would outgrow the data
+        it shadows. Re-running with ``audited=False`` on a table that was
+        audited drops the trigger, so auditing genuinely stops; rows already
+        recorded are left alone and removed only by :meth:`drop_audit_table`.
+        """
         self._validate_identifier(table_name)
         if self.schema_per_realm:
             if not realm:
@@ -464,20 +473,21 @@ class AsyncPostGraph:
             await self._execute(stmt)
         self._promoted_cache.pop((realm, table_name), None)
 
-        # 2. Create shadow audit table
-        audit_query = f"""
-        CREATE TABLE IF NOT EXISTS {audit_table_ref} (
-            audit_id BIGSERIAL PRIMARY KEY,
-            realm TEXT NOT NULL,
-            space VARCHAR(255) DEFAULT 'default',
-            action TEXT NOT NULL,
-            changed_by TEXT,
-            changed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-            old_row JSONB,
-            new_row JSONB
-        );
-        """
-        await self._execute(audit_query)
+        # 2. Create shadow audit table, unless the table is declared unaudited
+        if audited:
+            audit_query = f"""
+            CREATE TABLE IF NOT EXISTS {audit_table_ref} (
+                audit_id BIGSERIAL PRIMARY KEY,
+                realm TEXT NOT NULL,
+                space VARCHAR(255) DEFAULT 'default',
+                action TEXT NOT NULL,
+                changed_by TEXT,
+                changed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                old_row JSONB,
+                new_row JSONB
+            );
+            """
+            await self._execute(audit_query)
 
         # 3. Create append-only data table
         data_query = f"""
@@ -518,14 +528,18 @@ class AsyncPostGraph:
             EXECUTE FUNCTION {schema_prefix}update_modified_column();
         """)
 
-        # 6. Create trigger for auditing
+        # 6. Create trigger for auditing. The drop runs unconditionally so
+        # that re-declaring an existing table as unaudited actually stops the
+        # auditing; what the table already recorded is left alone, and is
+        # removed only by an explicit drop_audit_table call.
         await self._execute(f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
-        await self._execute(f"""
-            CREATE TRIGGER "audit_{table_name}_trigger"
-            AFTER INSERT OR UPDATE OR DELETE ON {table_ref}
-            FOR EACH ROW
-            EXECUTE FUNCTION {schema_prefix}audit_trigger_func();
-        """)
+        if audited:
+            await self._execute(f"""
+                CREATE TRIGGER "audit_{table_name}_trigger"
+                AFTER INSERT OR UPDATE OR DELETE ON {table_ref}
+                FOR EACH ROW
+                EXECUTE FUNCTION {schema_prefix}audit_trigger_func();
+            """)
 
     async def create_edge_table(
         self,
@@ -540,8 +554,16 @@ class AsyncPostGraph:
         vector_columns: Optional[Dict[str, int]] = None,
         temporal_keys: Optional[Sequence[str]] = None,
         promoted_keys: Optional[Sequence[str]] = None,
+        audited: bool = True,
     ):
         """Create a new edge table linking two vertex tables, plus shadow audit table and constraints.
+
+        ``audited=False`` skips the shadow audit table and its trigger, for
+        tables whose every write does not need recording -- caches, scratch
+        realms, high-churn queues where the audit table would outgrow the data
+        it shadows. Re-running with ``audited=False`` on a table that was
+        audited drops the trigger, so auditing genuinely stops; rows already
+        recorded are left alone and removed only by :meth:`drop_audit_table`.
 
         When ``vector_dim`` is given, the edge table gains a pgvector ``embedding``
         column with an HNSW index, so relationships can be retrieved by semantic
@@ -612,20 +634,21 @@ class AsyncPostGraph:
             await self._execute(stmt)
         self._promoted_cache.pop((realm, table_name), None)
 
-        # 2. Create shadow audit table
-        audit_query = f"""
-        CREATE TABLE IF NOT EXISTS {audit_table_ref} (
-            audit_id BIGSERIAL PRIMARY KEY,
-            realm TEXT NOT NULL,
-            space VARCHAR(255) DEFAULT 'default',
-            action TEXT NOT NULL,
-            changed_by TEXT,
-            changed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-            old_row JSONB,
-            new_row JSONB
-        );
-        """
-        await self._execute(audit_query)
+        # 2. Create shadow audit table, unless the table is declared unaudited
+        if audited:
+            audit_query = f"""
+            CREATE TABLE IF NOT EXISTS {audit_table_ref} (
+                audit_id BIGSERIAL PRIMARY KEY,
+                realm TEXT NOT NULL,
+                space VARCHAR(255) DEFAULT 'default',
+                action TEXT NOT NULL,
+                changed_by TEXT,
+                changed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                old_row JSONB,
+                new_row JSONB
+            );
+            """
+            await self._execute(audit_query)
 
         # 3. Create append-only data table
         data_query = f"""
@@ -668,14 +691,18 @@ class AsyncPostGraph:
             EXECUTE FUNCTION {schema_prefix}update_modified_column();
         """)
 
-        # 5. Create trigger for auditing
+        # 5. Create trigger for auditing. The drop runs unconditionally so
+        # that re-declaring an existing table as unaudited actually stops the
+        # auditing; what the table already recorded is left alone, and is
+        # removed only by an explicit drop_audit_table call.
         await self._execute(f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
-        await self._execute(f"""
-            CREATE TRIGGER "audit_{table_name}_trigger"
-            AFTER INSERT OR UPDATE OR DELETE ON {table_ref}
-            FOR EACH ROW
-            EXECUTE FUNCTION {schema_prefix}audit_trigger_func();
-        """)
+        if audited:
+            await self._execute(f"""
+                CREATE TRIGGER "audit_{table_name}_trigger"
+                AFTER INSERT OR UPDATE OR DELETE ON {table_ref}
+                FOR EACH ROW
+                EXECUTE FUNCTION {schema_prefix}audit_trigger_func();
+            """)
 
         # 6. Create custom cascade delete trigger if either boolean is True
         await self._execute(f'DROP TRIGGER IF EXISTS "cascade_delete_trigger_{table_name}" ON {table_ref};')
@@ -2564,6 +2591,49 @@ class AsyncPostGraph:
                 return res == "DELETE 1"
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
+
+        return await self._run_in_tx(_op, user_id)
+
+    async def drop_audit_table(self, table_name: str, realm: Optional[str] = None,
+                               user_id: Optional[str] = None) -> bool:
+        """Drop a table's shadow audit table and stop it being written to.
+
+        Deliberately a separate, explicit call rather than a side effect of
+        anything else. An audit table is the record of what was done to the
+        data, so nothing removes it implicitly -- not creating a table as
+        unaudited, not deleting a realm's rows. Removing that record is a
+        decision, and it is made here.
+
+        Two effects, in order: the audit trigger is dropped, so writes to the
+        base table stop being recorded; then the audit table itself is dropped,
+        discarding what was recorded already. The base table and its data are
+        untouched.
+
+        Returns True if an audit table existed and was dropped, False if there
+        was nothing to drop -- so calling it twice is safe, and calling it on a
+        table created with ``audited=False`` is a no-op rather than an error.
+
+        Auditing can be restored by calling the create method again with
+        ``audited=True``: the trigger comes back and recording resumes. What was
+        discarded does not.
+        """
+        self._validate_identifier(table_name)
+        if self.schema_per_realm and not realm:
+            raise PostGraphError(
+                "realm must be specified in schema_per_realm mode when dropping an audit table.")
+        table_ref = self._get_table_ref(table_name, realm)
+        audit_table_ref = self._get_table_ref(f"{table_name}_audit", realm)
+
+        async def _op(conn):
+            existed = await conn.fetchval(
+                "SELECT to_regclass($1) IS NOT NULL", audit_table_ref)
+            # Drop the trigger first. Dropping the table out from under a live
+            # trigger would leave every subsequent write to the base table
+            # failing on a missing audit target.
+            await conn.execute(
+                f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
+            await conn.execute(f"DROP TABLE IF EXISTS {audit_table_ref};")
+            return bool(existed)
 
         return await self._run_in_tx(_op, user_id)
 

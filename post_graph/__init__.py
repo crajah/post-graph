@@ -1,3 +1,4 @@
+from post_graph._ddl import is_concurrent_creation, is_retryable_ddl
 from post_graph.client_asyncpg import RESERVED_SPACE_ALL, AsyncPostGraph
 from post_graph.cypher import (
     CypherSession,
@@ -20,7 +21,7 @@ try:
 except ImportError:
     SQLAlchemyPostGraph = None
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 __all__ = [
     "JSON_NULL",
@@ -29,6 +30,8 @@ __all__ = [
     'CypherSyntaxError',
     'CypherTranslationError',
     "__version__",
+    "is_concurrent_creation",
+    "is_retryable_ddl",
     "PostGraphError",
     "VertexNotFoundError",
     "EdgeNotFoundError",

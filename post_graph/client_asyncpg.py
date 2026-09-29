@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import asyncpg
 
 from post_graph import promoted as _promoted
+from post_graph._ddl import is_concurrent_creation, is_retryable_ddl
 from post_graph.errors import (
     EdgeNotFoundError,
     PostGraphError,
@@ -334,11 +335,11 @@ class AsyncPostGraph:
         Callers must invoke this only after both tables exist.
         """
         try:
-            await self._execute("CREATE EXTENSION IF NOT EXISTS vector;")
-            await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});")
-            await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);')
-            await self._execute(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});")
-            await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);')
+            await self._execute_ddl("CREATE EXTENSION IF NOT EXISTS vector;")
+            await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});")
+            await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);')
+            await self._execute_ddl(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});")
+            await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);')
         except Exception as e:
             raise PostGraphError(f"Failed to initialize pgvector extension or embedding column for table '{table_name}': {e}")
 
@@ -351,15 +352,55 @@ class AsyncPostGraph:
     ):
         """Add multiple named pgvector columns with HNSW indexes."""
         try:
-            await self._execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            await self._execute_ddl("CREATE EXTENSION IF NOT EXISTS vector;")
             for col_name, dim in columns.items():
                 self._validate_identifier(col_name)
-                await self._execute(f'ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});')
-                await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" ON {table_ref} USING hnsw ("{col_name}" vector_cosine_ops);')
-                await self._execute(f'ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});')
-                await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_{col_name}" ON {data_table_ref} USING hnsw ("{col_name}" vector_cosine_ops);')
+                await self._execute_ddl(f'ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});')
+                await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" ON {table_ref} USING hnsw ("{col_name}" vector_cosine_ops);')
+                await self._execute_ddl(f'ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});')
+                await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_{col_name}" ON {data_table_ref} USING hnsw ("{col_name}" vector_cosine_ops);')
         except Exception as e:
             raise PostGraphError(f"Failed to add vector columns to table '{table_name}': {e}")
+
+    async def _execute_ddl(self, sql: str, attempts: int = 8) -> None:
+        """Run a provisioning statement, tolerating a concurrent creator.
+
+        Two different things go wrong when replicas provision the same realm at
+        once, and they need opposite treatment.
+
+        A statement that *lost a race* has still achieved what the caller
+        wanted -- the object exists -- so it is ignored. Each statement is
+        autocommit here, so that costs only the statement and provisioning
+        continues.
+
+        A statement killed to break a *deadlock* has achieved nothing, and
+        deadlocks are unavoidable when several sessions take locks on a schema,
+        a trigger function and the catalog in whatever order they arrive. That
+        is retried with jittered backoff: PostgreSQL guarantees one participant
+        survives, so the losers converge instead of spinning. The jitter
+        matters -- replicas that back off in lockstep simply deadlock again.
+
+        Anything else propagates. A table or index silently swallowed becomes a
+        wrong answer much later, which is far worse than failing now.
+        """
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                await self._execute(sql)
+                return
+            except Exception as e:
+                if is_concurrent_creation(e):
+                    logger.debug("DDL raced with a concurrent creator, ignoring: %s", str(e)[:160])
+                    return
+                if is_retryable_ddl(e) and attempt < attempts:
+                    # Exponential, not linear. Contention scales with replica
+                    # count, and a linear ramp over five tries tops out under a
+                    # second -- enough for six replicas, not for twenty.
+                    delay = min(2.0, 0.05 * (2 ** (attempt - 1))) * (1.0 + random.random())
+                    logger.debug("DDL contended (attempt %d/%d), retrying in %.3fs: %s",
+                                 attempt, attempts, delay, str(e)[:120])
+                    await asyncio.sleep(delay)
+                    continue
+                raise
 
     async def create_vertex_table(
         self,
@@ -393,12 +434,12 @@ class AsyncPostGraph:
         # Resolve schema prefix for triggers/functions
         if self.schema_per_realm:
             schema_prefix = f'"{realm}".'
-            await self._execute(f'CREATE SCHEMA IF NOT EXISTS "{realm}"')
+            await self._execute_ddl(f'CREATE SCHEMA IF NOT EXISTS "{realm}"')
         else:
             schema_prefix = ""
 
         # Create trigger function for updated_at
-        await self._execute(f"""
+        await self._execute_ddl(f"""
             CREATE OR REPLACE FUNCTION {schema_prefix}update_modified_column()
             RETURNS TRIGGER AS $$
             BEGIN
@@ -409,7 +450,7 @@ class AsyncPostGraph:
         """)
 
         # Create shared trigger function for auditing
-        await self._execute(f"""
+        await self._execute_ddl(f"""
             CREATE OR REPLACE FUNCTION {schema_prefix}audit_trigger_func()
             RETURNS TRIGGER AS $$
             DECLARE
@@ -460,17 +501,17 @@ class AsyncPostGraph:
             PRIMARY KEY (realm, id)
         );
         """
-        await self._execute(query)
-        await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
-        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);')
-        await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED;")
-        await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();")
-        await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);')
+        await self._execute_ddl(query)
+        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
+        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);')
+        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED;")
+        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();")
+        await self._execute_ddl(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);')
 
         # Hot payload keys as generated, indexed columns. Maintained by
         # PostgreSQL from payload, so writers are unaffected; see promoted.py.
         for stmt in _promoted.all_column_ddl(table_ref, table_name, temporal_keys, promoted_keys):
-            await self._execute(stmt)
+            await self._execute_ddl(stmt)
         self._promoted_cache.pop((realm, table_name), None)
 
         # 2. Create shadow audit table, unless the table is declared unaudited
@@ -487,7 +528,7 @@ class AsyncPostGraph:
                 new_row JSONB
             );
             """
-            await self._execute(audit_query)
+            await self._execute_ddl(audit_query)
 
         # 3. Create append-only data table
         data_query = f"""
@@ -501,11 +542,11 @@ class AsyncPostGraph:
             FOREIGN KEY (realm, id) REFERENCES {table_ref}(realm, id) ON DELETE CASCADE
         );
         """
-        await self._execute(data_query)
-        await self._execute(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
-        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);')
-        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);')
-        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);')
+        await self._execute_ddl(data_query)
+        await self._execute_ddl(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
+        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);')
+        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);')
+        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);')
 
         # 4. Add vector columns. This must run after the data table exists, since
         # the embedding column is added to both the main and the data table.
@@ -515,13 +556,13 @@ class AsyncPostGraph:
             await self._add_vector_columns(table_name, table_ref, data_table_ref, vector_columns)
 
         # 5. Create GIN index on payload
-        await self._execute(
+        await self._execute_ddl(
             f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_payload" ON {table_ref} USING gin (payload);'
         )
 
         # 5. Create trigger for updated_at
-        await self._execute(f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};')
-        await self._execute(f"""
+        await self._execute_ddl(f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};')
+        await self._execute_ddl(f"""
             CREATE TRIGGER "update_{table_name}_modtime"
             BEFORE UPDATE ON {table_ref}
             FOR EACH ROW
@@ -532,9 +573,9 @@ class AsyncPostGraph:
         # that re-declaring an existing table as unaudited actually stops the
         # auditing; what the table already recorded is left alone, and is
         # removed only by an explicit drop_audit_table call.
-        await self._execute(f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
+        await self._execute_ddl(f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
         if audited:
-            await self._execute(f"""
+            await self._execute_ddl(f"""
                 CREATE TRIGGER "audit_{table_name}_trigger"
                 AFTER INSERT OR UPDATE OR DELETE ON {table_ref}
                 FOR EACH ROW
@@ -621,17 +662,17 @@ class AsyncPostGraph:
             FOREIGN KEY (realm, to_id) REFERENCES {to_vertex_ref}(realm, id) ON DELETE CASCADE
         );
         """
-        await self._execute(query)
-        await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
-        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);')
-        await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{from_vertex_table}-{to_vertex_table}' || '/' || id::text) STORED;")
-        await self._execute(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();")
-        await self._execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);')
+        await self._execute_ddl(query)
+        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
+        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);')
+        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{from_vertex_table}-{to_vertex_table}' || '/' || id::text) STORED;")
+        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();")
+        await self._execute_ddl(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);')
 
         # Hot payload keys as generated, indexed columns. Maintained by
         # PostgreSQL from payload, so writers are unaffected; see promoted.py.
         for stmt in _promoted.all_column_ddl(table_ref, table_name, temporal_keys, promoted_keys):
-            await self._execute(stmt)
+            await self._execute_ddl(stmt)
         self._promoted_cache.pop((realm, table_name), None)
 
         # 2. Create shadow audit table, unless the table is declared unaudited
@@ -648,7 +689,7 @@ class AsyncPostGraph:
                 new_row JSONB
             );
             """
-            await self._execute(audit_query)
+            await self._execute_ddl(audit_query)
 
         # 3. Create append-only data table
         data_query = f"""
@@ -662,11 +703,11 @@ class AsyncPostGraph:
             FOREIGN KEY (realm, id) REFERENCES {table_ref}(realm, id) ON DELETE CASCADE
         );
         """
-        await self._execute(data_query)
-        await self._execute(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
-        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);')
-        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);')
-        await self._execute(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);')
+        await self._execute_ddl(data_query)
+        await self._execute_ddl(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
+        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);')
+        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);')
+        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);')
 
         # 3a. Add vector columns, after both the main and data tables exist.
         if vector_dim and vector_dim > 0:
@@ -675,16 +716,16 @@ class AsyncPostGraph:
             await self._add_vector_columns(table_name, table_ref, data_table_ref, vector_columns)
 
         # 3. Create indexes
-        await self._execute(
+        await self._execute_ddl(
             f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_to" ON {table_ref} (realm, to_id);'
         )
-        await self._execute(
+        await self._execute_ddl(
             f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_payload" ON {table_ref} USING gin (payload);'
         )
 
         # 4. Create trigger for updated_at
-        await self._execute(f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};')
-        await self._execute(f"""
+        await self._execute_ddl(f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};')
+        await self._execute_ddl(f"""
             CREATE TRIGGER "update_{table_name}_modtime"
             BEFORE UPDATE ON {table_ref}
             FOR EACH ROW
@@ -695,9 +736,9 @@ class AsyncPostGraph:
         # that re-declaring an existing table as unaudited actually stops the
         # auditing; what the table already recorded is left alone, and is
         # removed only by an explicit drop_audit_table call.
-        await self._execute(f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
+        await self._execute_ddl(f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
         if audited:
-            await self._execute(f"""
+            await self._execute_ddl(f"""
                 CREATE TRIGGER "audit_{table_name}_trigger"
                 AFTER INSERT OR UPDATE OR DELETE ON {table_ref}
                 FOR EACH ROW
@@ -705,13 +746,13 @@ class AsyncPostGraph:
             """)
 
         # 6. Create custom cascade delete trigger if either boolean is True
-        await self._execute(f'DROP TRIGGER IF EXISTS "cascade_delete_trigger_{table_name}" ON {table_ref};')
-        await self._execute(f'DROP FUNCTION IF EXISTS {schema_prefix}"cascade_delete_func_{table_name}"();')
+        await self._execute_ddl(f'DROP TRIGGER IF EXISTS "cascade_delete_trigger_{table_name}" ON {table_ref};')
+        await self._execute_ddl(f'DROP FUNCTION IF EXISTS {schema_prefix}"cascade_delete_func_{table_name}"();')
         if cascade_delete_from or cascade_delete_to:
             from_clause = f'DELETE FROM {from_vertex_ref} WHERE realm = OLD.realm AND id = OLD.from_id;' if cascade_delete_from else ''
             to_clause = f'DELETE FROM {to_vertex_ref} WHERE realm = OLD.realm AND id = OLD.to_id;' if cascade_delete_to else ''
             
-            await self._execute(f"""
+            await self._execute_ddl(f"""
                 CREATE OR REPLACE FUNCTION {schema_prefix}"cascade_delete_func_{table_name}"()
                 RETURNS TRIGGER AS $$
                 BEGIN
@@ -721,7 +762,7 @@ class AsyncPostGraph:
                 END;
                 $$ LANGUAGE plpgsql;
             """)
-            await self._execute(f"""
+            await self._execute_ddl(f"""
                 CREATE TRIGGER "cascade_delete_trigger_{table_name}"
                 AFTER DELETE ON {table_ref}
                 FOR EACH ROW
@@ -1491,6 +1532,14 @@ class AsyncPostGraph:
                 return index_name
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+            except Exception as e:
+                # IF NOT EXISTS is check-then-create, so replicas indexing the
+                # same hot key at once collide on pg_class. The index exists
+                # either way, which is the whole contract.
+                if not is_concurrent_creation(e):
+                    raise
+                logger.debug("Payload index %r created concurrently.", index_name)
+                return index_name
 
         if isinstance(self.connection, asyncpg.Pool):
             async with self.connection.acquire() as conn:

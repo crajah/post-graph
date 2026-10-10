@@ -9,6 +9,13 @@ import asyncpg
 
 from post_graph import promoted as _promoted
 from post_graph._ddl import is_concurrent_creation, is_retryable_ddl
+from post_graph._query import (
+    ADVISORY_CLASSID,
+    EDGE_ORDER_COLUMNS,
+    VERTEX_ORDER_COLUMNS,
+    advisory_key,
+    validate_order_column,
+)
 from post_graph.errors import (
     EdgeNotFoundError,
     PostGraphError,
@@ -1255,6 +1262,84 @@ class AsyncPostGraph:
         else:
             return await _op(self.connection)
 
+    async def advisory_xact_lock(self, table_name: str, realm: str) -> None:
+        """Serialise writers to one (realm, table) for the rest of this transaction.
+
+        Takes ``pg_advisory_xact_lock``, which releases at COMMIT or ROLLBACK.
+        There is no unlock call to forget, so a writer that died cannot block
+        every later writer until its connection is reaped -- and it is the only
+        kind of advisory lock that is correct behind a transaction-mode
+        connection pooler, where a session-scoped lock would outlive the
+        transaction and travel to whichever client got that server connection
+        next.
+
+        The key is derived from *realm* and *table_name*, so no caller invents
+        an integer and two tables cannot collide by accident. It uses the
+        two-argument lock space under a classid of post-graph's own, which
+        PostgreSQL keeps separate from the single-bigint space, so these locks
+        cannot collide with another library's however it picks its integers.
+
+        What this buys, and why it is needed alongside ordering: a sequence
+        does not order commits. Two writers can take nextval 5 and 6 and commit
+        in the other order, so both can read the same newest row and record it
+        as their predecessor. ``ORDER BY id DESC LIMIT 1`` is only trustworthy
+        while one writer is in flight, and this is what makes that true.
+
+        Raises rather than appearing to work in the two cases where it could
+        not serialise anything:
+
+        * on a **pool**-bound client, where the lock would be taken on some
+          connection and released at the end of its own implicit transaction,
+          before the caller's write;
+        * on a connection-bound client that is **not inside a transaction**,
+          where a transaction-scoped lock is taken and released by the same
+          implicit transaction and is gone before it returns.
+
+        Both are silent failures -- the lock call succeeds, nothing is
+        serialised -- and the thing they fail to protect is usually the reason
+        someone wanted a lock.
+        """
+        self._validate_identifier(table_name)
+        if isinstance(self.connection, asyncpg.Pool):
+            raise PostGraphError(
+                "advisory_xact_lock needs a connection-bound client: on a pool the lock "
+                "would be taken on an arbitrary connection and released at the end of its "
+                "own implicit transaction, before the caller's write. Acquire a connection, "
+                "open a transaction on it, and construct the client over that connection."
+            )
+        if not self.connection.is_in_transaction():
+            raise PostGraphError(
+                "advisory_xact_lock must be called inside a transaction: a "
+                "transaction-scoped lock taken outside one is released by the implicit "
+                "transaction that took it, so it is already gone when this returns. "
+                "Open a transaction on this connection first."
+            )
+        await self.connection.execute(
+            "SELECT pg_advisory_xact_lock($1::int, $2::int)",
+            ADVISORY_CLASSID, advisory_key(realm, table_name),
+        )
+
+    async def newest_vertex(
+        self, table_name: str, realm: str, space: Optional[str] = None
+    ) -> Optional[Vertex]:
+        """The most recently inserted row of a vertex table, or None if empty.
+
+        A backwards walk of ``PRIMARY KEY (realm, id)``, so its cost does not
+        grow with the table. Ordering is by ``id`` and not by any timestamp in
+        the payload: two rows can share an instant, and clock skew between two
+        writers must not be able to reorder them.
+
+        Insert order is only the order of *commits* while writers are
+        serialised. If more than one writer can append to this table, take
+        :meth:`advisory_xact_lock` in the same transaction first -- otherwise
+        two of them can read this same row.
+        """
+        rows = await self.find_vertices(
+            table_name, realm=realm, space=space,
+            order_by_column="id", descending=True, limit=1,
+        )
+        return rows[0] if rows else None
+
     async def find_vertices(
         self,
         table_name: str,
@@ -1264,6 +1349,7 @@ class AsyncPostGraph:
         limit: Optional[int] = None,
         where: Optional[List[tuple]] = None,
         order_by: Optional[str] = None,
+        order_by_column: Optional[str] = None,
         descending: bool = False,
     ) -> List[Vertex]:
         """Find vertices whose payload matches the given key-value filters.
@@ -1298,6 +1384,13 @@ class AsyncPostGraph:
         table_ref = self._get_table_ref(table_name, realm)
         if order_by is not None:
             self._validate_payload_key(order_by)
+        if order_by_column is not None:
+            if order_by is not None:
+                raise PostGraphError(
+                    "Pass order_by (a payload key) or order_by_column (a real column), "
+                    "not both."
+                )
+            validate_order_column(order_by_column, VERTEX_ORDER_COLUMNS)
 
         async def _op(conn):
             params: list = [realm]
@@ -1319,7 +1412,15 @@ class AsyncPostGraph:
                 clauses += f" AND NOT jsonb_exists(t.payload, ${len(params)})"
             where_sql, numeric_keys = self._compile_where(where, params)
             clauses += where_sql
-            if order_by is not None:
+            if order_by_column is not None:
+                # No payload accessor and no tie-break: a real column. For `id`
+                # this is a backwards walk of PRIMARY KEY (realm, id) --
+                # index-only -- so order_by_column="id", descending=True,
+                # limit=1 reads the newest row without touching the rest of the
+                # table, however large it has grown.
+                direction = "DESC" if descending else "ASC"
+                order_clause = f"ORDER BY t.{order_by_column} {direction}"
+            elif order_by is not None:
                 acc = f"t.payload->>'{order_by}'"
                 if order_by in numeric_keys:
                     acc = f"({acc})::numeric"
@@ -2540,6 +2641,7 @@ class AsyncPostGraph:
         limit: Optional[int] = None,
         where: Optional[List[tuple]] = None,
         order_by: Optional[str] = None,
+        order_by_column: Optional[str] = None,
         descending: bool = False,
     ) -> List[Edge]:
         """Find edges whose payload matches the given key-value filters.
@@ -2551,6 +2653,13 @@ class AsyncPostGraph:
         self._validate_identifier(table_name)
         if order_by is not None:
             self._validate_payload_key(order_by)
+        if order_by_column is not None:
+            if order_by is not None:
+                raise PostGraphError(
+                    "Pass order_by (a payload key) or order_by_column (a real column), "
+                    "not both."
+                )
+            validate_order_column(order_by_column, EDGE_ORDER_COLUMNS)
         table_ref = self._get_table_ref(table_name, realm)
 
         async def _op(conn):
@@ -2571,7 +2680,15 @@ class AsyncPostGraph:
                 clauses += f" AND NOT jsonb_exists(t.payload, ${len(params)})"
             where_sql, numeric_keys = self._compile_where(where, params)
             clauses += where_sql
-            if order_by is not None:
+            if order_by_column is not None:
+                # No payload accessor and no tie-break: a real column. For `id`
+                # this is a backwards walk of PRIMARY KEY (realm, id) --
+                # index-only -- so order_by_column="id", descending=True,
+                # limit=1 reads the newest row without touching the rest of the
+                # table, however large it has grown.
+                direction = "DESC" if descending else "ASC"
+                order_clause = f"ORDER BY t.{order_by_column} {direction}"
+            elif order_by is not None:
                 acc = f"t.payload->>'{order_by}'"
                 if order_by in numeric_keys:
                     acc = f"({acc})::numeric"

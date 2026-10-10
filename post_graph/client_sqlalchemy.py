@@ -11,6 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from post_graph import promoted as _promoted
 from post_graph._ddl import is_concurrent_creation, is_retryable_ddl
+from post_graph._query import (
+    ADVISORY_CLASSID,
+    EDGE_ORDER_COLUMNS,
+    VERTEX_ORDER_COLUMNS,
+    advisory_key,
+    validate_order_column,
+)
 from post_graph.errors import (
     EdgeNotFoundError,
     PostGraphError,
@@ -1180,6 +1187,55 @@ class SQLAlchemyPostGraph:
             async with self.engine_or_connection.connect() as conn:
                 return await _op(conn)
 
+    async def advisory_xact_lock(self, table_name: str, realm: str) -> None:
+        """Serialise writers to one (realm, table) for the rest of this transaction.
+
+        The SQLAlchemy counterpart of the asyncpg method; see that docstring
+        for why the transaction-scoped form is the only correct one behind a
+        transaction-mode pooler, and why the key is derived rather than passed.
+
+        Raises on an **engine**-bound client, where the lock would be taken on
+        a checked-out connection and released with its own implicit
+        transaction, and on a connection that is **not in a transaction**,
+        where it is released before this returns. Both fail silently otherwise.
+        """
+        self._validate_identifier(table_name)
+        conn = self.engine_or_connection
+        if not isinstance(conn, AsyncConnection):
+            raise PostGraphError(
+                "advisory_xact_lock needs a connection-bound client: over an engine the "
+                "lock would be taken on a checked-out connection and released at the end "
+                "of its own implicit transaction, before the caller's write. Construct "
+                "the client over an AsyncConnection with a transaction already open."
+            )
+        if not conn.in_transaction():
+            raise PostGraphError(
+                "advisory_xact_lock must be called inside a transaction: a "
+                "transaction-scoped lock taken outside one is released by the implicit "
+                "transaction that took it, so it is already gone when this returns."
+            )
+        await conn.execute(
+            text("SELECT pg_advisory_xact_lock(CAST(:classid AS int), CAST(:objid AS int))"),
+            {"classid": ADVISORY_CLASSID, "objid": advisory_key(realm, table_name)},
+        )
+
+    async def newest_vertex(
+        self, table_name: str, realm: str, space: Optional[str] = None
+    ) -> Optional[Vertex]:
+        """The most recently inserted row of a vertex table, or None if empty.
+
+        Ordered by ``id``, not by any payload timestamp: two rows can share an
+        instant and clock skew must not be able to reorder them. Insert order
+        is the order of commits only while writers are serialised -- take
+        :meth:`advisory_xact_lock` in the same transaction if more than one
+        writer can append here.
+        """
+        rows = await self.find_vertices(
+            table_name, realm=realm, space=space,
+            order_by_column="id", descending=True, limit=1,
+        )
+        return rows[0] if rows else None
+
     async def find_vertices(
         self,
         table_name: str,
@@ -1189,6 +1245,7 @@ class SQLAlchemyPostGraph:
         limit: Optional[int] = None,
         where: Optional[List[tuple]] = None,
         order_by: Optional[str] = None,
+        order_by_column: Optional[str] = None,
         descending: bool = False,
     ) -> List[Vertex]:
         """Find vertices whose payload matches the given key-value filters.
@@ -1219,6 +1276,13 @@ class SQLAlchemyPostGraph:
         table_ref = self._get_table_ref(table_name, realm)
         if order_by is not None:
             self._validate_payload_key(order_by)
+        if order_by_column is not None:
+            if order_by is not None:
+                raise PostGraphError(
+                    "Pass order_by (a payload key) or order_by_column (a real column), "
+                    "not both."
+                )
+            validate_order_column(order_by_column, VERTEX_ORDER_COLUMNS)
 
         async def _op(conn):
             params: Dict[str, Any] = {"realm": realm}
@@ -1239,7 +1303,12 @@ class SQLAlchemyPostGraph:
                 clauses += f" AND NOT jsonb_exists(t.payload, :{pname})"
             where_sql, numeric_keys = self._compile_where(where, params)
             clauses += where_sql
-            if order_by is not None:
+            if order_by_column is not None:
+                # A real column, no payload accessor and no tie-break. For `id`
+                # this is a backwards walk of PRIMARY KEY (realm, id).
+                direction = "DESC" if descending else "ASC"
+                order_clause = f"ORDER BY t.{order_by_column} {direction}"
+            elif order_by is not None:
                 acc = f"t.payload->>'{order_by}'"
                 if order_by in numeric_keys:
                     acc = f"({acc})::numeric"
@@ -2451,6 +2520,7 @@ class SQLAlchemyPostGraph:
         limit: Optional[int] = None,
         where: Optional[List[tuple]] = None,
         order_by: Optional[str] = None,
+        order_by_column: Optional[str] = None,
         descending: bool = False,
     ) -> List[Edge]:
         """Find edges whose payload matches the given key-value filters.
@@ -2462,6 +2532,13 @@ class SQLAlchemyPostGraph:
         self._validate_identifier(table_name)
         if order_by is not None:
             self._validate_payload_key(order_by)
+        if order_by_column is not None:
+            if order_by is not None:
+                raise PostGraphError(
+                    "Pass order_by (a payload key) or order_by_column (a real column), "
+                    "not both."
+                )
+            validate_order_column(order_by_column, EDGE_ORDER_COLUMNS)
         table_ref = self._get_table_ref(table_name, realm)
 
         async def _op(conn):
@@ -2483,7 +2560,12 @@ class SQLAlchemyPostGraph:
                 clauses += f" AND NOT jsonb_exists(t.payload, :{pname})"
             where_sql, numeric_keys = self._compile_where(where, params)
             clauses += where_sql
-            if order_by is not None:
+            if order_by_column is not None:
+                # A real column, no payload accessor and no tie-break. For `id`
+                # this is a backwards walk of PRIMARY KEY (realm, id).
+                direction = "DESC" if descending else "ASC"
+                order_clause = f"ORDER BY t.{order_by_column} {direction}"
+            elif order_by is not None:
                 acc = f"t.payload->>'{order_by}'"
                 if order_by in numeric_keys:
                     acc = f"({acc})::numeric"

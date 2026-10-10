@@ -923,6 +923,100 @@ class SQLAlchemyPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
+    async def update_vertex(
+        self,
+        table_name: str,
+        realm: str,
+        vertex_id: Union[str, int],
+        payload: Optional[Dict[str, Any]] = None,
+        embedding: Optional[List[float]] = None,
+        embeddings: Optional[Dict[str, List[float]]] = None,
+        user_id: Optional[str] = None,
+        space: Optional[str] = None,
+        replace: bool = False
+    ) -> Optional[Vertex]:
+        """Update an existing vertex. Emits a bare UPDATE and never an INSERT.
+
+        The SQLAlchemy counterpart of the asyncpg method; see that docstring
+        for why ``upsert_vertex`` cannot be used by a role that holds only
+        ``UPDATE``, why ``space=None`` leaves the space alone here, and for
+        the two grants an *audited* table additionally needs.
+
+        Returns the updated :class:`Vertex`, or ``None`` when no row matches
+        ``(realm, vertex_id)``. It never creates the row.
+        """
+        self._validate_identifier(table_name)
+        if space == RESERVED_SPACE_ALL:
+            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for a write. It is only valid as a query-time filter.")
+        payload_json = json.dumps(payload or {})
+        table_ref = self._get_table_ref(table_name, realm)
+        vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
+
+        # Identical to upsert_vertex's payload_sql, so a caller moving
+        # between the two gets the same row -- including `||`'s NULL.
+        payload_sql = "CAST(:payload AS JSONB)" if replace else "payload || CAST(:payload AS JSONB)"
+
+        async def _op(conn):
+            v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+
+            set_parts = [f"payload = {payload_sql}", "updated_at = CURRENT_TIMESTAMP"]
+            kwargs: Dict[str, Any] = {"realm": realm, "id": v_id_int, "payload": payload_json}
+
+            # None means leave the space alone, unlike upsert_vertex.
+            if space is not None:
+                kwargs["space"] = space
+                set_parts.append("space = :space")
+
+            returning = "realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text"
+            if vec_str:
+                kwargs["vec"] = vec_str
+                set_parts.append("embedding = CAST(:vec AS vector)")
+                returning += ", CAST(embedding AS TEXT) AS embedding_text"
+
+            emb_dict = None
+            if embeddings:
+                for i, (col_name, vec) in enumerate(embeddings.items()):
+                    self._validate_identifier(col_name)
+                    pname = f"_emb_v{i}"
+                    kwargs[pname] = f"[{','.join(str(x) for x in vec)}]"
+                    set_parts.append(f'"{col_name}" = CAST(:{pname} AS vector)')
+                emb_dict = dict(embeddings)
+
+            query = f"""
+            UPDATE {table_ref}
+            SET {', '.join(set_parts)}
+            WHERE realm = :realm AND id = :id
+            RETURNING {returning}
+            """
+            try:
+                row = await self._fetchrow(conn, query, **kwargs)
+            except ProgrammingError as e:
+                if "does not exist" in str(e).lower():
+                    raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+                raise PostGraphError(f"Programming error: {e}")
+            if row is None:
+                return None
+
+            emb = None
+            if 'embedding_text' in row and row['embedding_text']:
+                emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+            return Vertex(
+                realm=row['realm'],
+                id=str(row['id']),
+                space=row.get('space') or 'default',
+                fqid=row['fqid'],
+                payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                created_at=row['created_at'],
+                updated_at=row['updated_at'],
+                table_name=table_name,
+                embedding=emb,
+                embeddings=emb_dict,
+                uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
+                _client=self
+            )
+
+        return await self._run_in_tx(_op, user_id)
+
     async def batch_upsert_vertices(
         self,
         table_name: str,

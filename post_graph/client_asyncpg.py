@@ -1000,6 +1000,143 @@ class AsyncPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
+    async def update_vertex(
+        self,
+        table_name: str,
+        realm: str,
+        vertex_id: Union[str, int],
+        payload: Optional[Dict[str, Any]] = None,
+        embedding: Optional[List[float]] = None,
+        embeddings: Optional[Dict[str, List[float]]] = None,
+        user_id: Optional[str] = None,
+        space: Optional[str] = None,
+        replace: bool = False
+    ) -> Optional[Vertex]:
+        """Update an existing vertex. Emits a bare UPDATE and never an INSERT.
+
+        :meth:`upsert_vertex` is the other way to change a vertex, and it
+        cannot be used by a role that holds only ``UPDATE``: its statement is
+        ``INSERT ... ON CONFLICT DO UPDATE``, and PostgreSQL checks the INSERT
+        privilege on that statement unconditionally -- not only when the
+        insert path is taken, because the check is on the statement and not on
+        the branch the data happens to take. A role granted ``SELECT, UPDATE``
+        therefore gets ``InsufficientPrivilegeError`` from ``upsert_vertex``
+        on a row it is perfectly entitled to change.
+
+        That matters wherever the grant *is* the containment: a caller that
+        may spend a single-use token but must not be able to mint one is
+        granted ``UPDATE`` and withheld ``INSERT`` deliberately, and an upsert
+        asks it to give that distinction up. This method emits
+
+        ``UPDATE <table> SET payload = ..., updated_at = CURRENT_TIMESTAMP
+        WHERE realm = $1 AND id = $2 RETURNING ...``
+
+        so ``UPDATE`` is the only table privilege it needs.
+
+        Returns the updated :class:`Vertex`, or ``None`` when no row matches
+        ``(realm, vertex_id)``. It does not create the row: an unknown id
+        leaves the table exactly as it was, which is the whole point of
+        having this beside ``upsert_vertex`` rather than instead of it.
+
+        Payload semantics are ``upsert_vertex``'s. ``replace=False`` (the
+        default) merges the supplied payload into the stored one with ``||``,
+        so keys not mentioned survive; ``replace=True`` overwrites the column
+        outright, which is how a key is removed.
+
+        ``space`` differs from ``upsert_vertex`` in one way worth knowing:
+        there it defaults to ``"default"`` and is always written, because an
+        upsert may be creating the row and the row needs a space. Here the
+        default is ``None``, meaning *leave the space alone*. An update that
+        silently relocated a row to ``"default"`` because the caller did not
+        mention a space would be a surprising way to lose a tenant's data.
+        Pass ``space="..."`` to move the row deliberately.
+
+        One trap that is not this method's doing: on an **audited** table the
+        shadow trigger runs ``INSERT INTO <table>_audit`` as the invoking
+        role, so a ``SELECT, UPDATE`` role still fails -- with ``permission
+        denied for table <table>_audit``, a different table from the one in
+        the grant. The fix is two write-only grants, which do not widen the
+        role's reach into the table itself::
+
+            GRANT INSERT ON <realm>.<table>_audit TO <role>;
+            GRANT USAGE ON SEQUENCE <realm>.<table>_audit_audit_id_seq TO <role>;
+
+        The role can then append an audit record but still cannot read the
+        audit table, nor insert into the audited table. The alternative is
+        ``create_vertex_table(..., audited=False)``, which trades the audit
+        trail away; for a security-relevant write that is usually the wrong
+        trade.
+        """
+        self._validate_identifier(table_name)
+        if space == RESERVED_SPACE_ALL:
+            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for a write. It is only valid as a query-time filter.")
+        payload_json = json.dumps(payload or {})
+        table_ref = self._get_table_ref(table_name, realm)
+        vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
+
+        # Merge by default; replace only when the caller asks. Identical to
+        # upsert_vertex's payload_sql, so a caller moving between the two
+        # gets the same row -- including the NULL propagation of `||`.
+        payload_sql = "$3::jsonb" if replace else "payload || $3::jsonb"
+
+        async def _op(conn):
+            v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+
+            set_clauses = [f"payload = {payload_sql}", "updated_at = CURRENT_TIMESTAMP"]
+            params: list = [realm, v_id_int, payload_json]
+
+            # None means leave the space alone, unlike upsert_vertex.
+            if space is not None:
+                params.append(space)
+                set_clauses.append(f"space = ${len(params)}")
+
+            returning = "realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text"
+            if vec_str and await self._table_has_embedding(conn, table_name, realm):
+                params.append(vec_str)
+                set_clauses.append(f"embedding = ${len(params)}::vector")
+                returning += ", embedding::text AS embedding_text"
+
+            emb_dict = None
+            if embeddings:
+                for col_name, vec in embeddings.items():
+                    self._validate_identifier(col_name)
+                    params.append(f"[{','.join(str(x) for x in vec)}]")
+                    set_clauses.append(f'"{col_name}" = ${len(params)}::vector')
+                emb_dict = dict(embeddings)
+
+            query = f"""
+            UPDATE {table_ref}
+            SET {', '.join(set_clauses)}
+            WHERE realm = $1 AND id = $2
+            RETURNING {returning}
+            """
+            try:
+                row = await conn.fetchrow(query, *params)
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+            if row is None:
+                return None
+
+            emb = None
+            if 'embedding_text' in row and row['embedding_text']:
+                emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+            return Vertex(
+                realm=row['realm'],
+                id=str(row['id']),
+                space=row.get('space') or 'default',
+                fqid=row['fqid'],
+                payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                created_at=row['created_at'],
+                updated_at=row['updated_at'],
+                table_name=table_name,
+                embedding=emb,
+                embeddings=emb_dict,
+                uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
+                _client=self
+            )
+
+        return await self._run_in_tx(_op, user_id)
+
     async def batch_upsert_vertices(
         self,
         table_name: str,

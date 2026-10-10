@@ -345,6 +345,52 @@ vertex = await client.upsert_vertex(
 )
 ```
 
+#### `update_vertex(table_name, realm, vertex_id, payload, space=None, replace=False)`
+Changes an existing vertex with a bare `UPDATE`, and never an `INSERT`. Returns the
+updated vertex, or `None` when no row matches `(realm, vertex_id)` — it does not
+create the row.
+
+```python
+spent = await client.update_vertex(
+    table_name="invitations",
+    realm="trial_platform",
+    vertex_id=4211517,
+    payload={"redeemed_at": "2026-10-10T09:00:00Z"},  # merged, as upsert_vertex merges
+)
+if spent is None:
+    ...  # no such invitation
+```
+
+Use it where the **grant is the containment**. `upsert_vertex` emits `INSERT … ON
+CONFLICT DO UPDATE`, and PostgreSQL checks the `INSERT` privilege on that statement
+unconditionally — not only when the insert path is taken, because the check is on the
+statement, not on the branch the data happens to take. So a role granted
+`SELECT, UPDATE` gets `InsufficientPrivilegeError` from `upsert_vertex` on a row it is
+entitled to change. A caller that may spend a single-use token but must not be able to
+mint one is granted `UPDATE` and withheld `INSERT` deliberately; `update_vertex` is the
+write that fits that grant.
+
+Two differences from `upsert_vertex` worth knowing:
+
+- `space` defaults to `None`, meaning *leave the space alone*. `upsert_vertex` defaults
+  it to `"default"` and always writes it, because it may be creating the row. An update
+  that relocated a row to `"default"` because the caller did not mention a space would be
+  a surprising way to lose a tenant's data. Pass `space="…"` to move the row deliberately.
+- On an **audited** table the shadow trigger runs `INSERT INTO <table>_audit` as the
+  *invoking* role, so a `SELECT, UPDATE` role still fails — with `permission denied for
+  table <table>_audit`, naming a table absent from the grant. Two write-only grants fix
+  it without widening the role's reach into the audited table:
+
+  ```sql
+  GRANT INSERT ON <table>_audit TO <role>;
+  GRANT USAGE ON SEQUENCE <table>_audit_audit_id_seq TO <role>;
+  ```
+
+  The role can then append an audit record but still cannot read the audit table, nor
+  insert into the audited one. The alternative,
+  `create_vertex_table(..., audited=False)`, trades the audit trail away — for a
+  security-relevant write, usually the wrong trade.
+
 #### `get_vertex(table_name, realm, vertex_id)`
 Fetches a single vertex by its numeric ID, UUID, or FQID.
 

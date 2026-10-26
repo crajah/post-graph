@@ -93,6 +93,14 @@ async def sa_engine():
     try:
         async with engine.connect() as conn:
             await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
+    except ImportError:
+        # A broken install, not an absent database. Skipping here is how a
+        # missing greenlet turned the whole SQLAlchemy half of the suite --
+        # some 240 tests -- into skips for four consecutive CI runs, with one
+        # stray test the only thing that went red. The skip below exists so
+        # the suite runs where there is no PostgreSQL; it must not also
+        # swallow the case where the dependency itself is gone.
+        raise
     except Exception as exc:
         pytest.skip(f"SQLAlchemy engine cannot connect at {sa_dsn}: {exc}")
     yield engine

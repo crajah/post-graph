@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "post-graph"
-version = "1.10.0"
+version = "1.10.1"
 description = "High-performance PostgreSQL-backed graph database library supporting multi-tenant realms, space sub-grouping, schema-per-realm, shadow auditing, and append-only data history."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -22,6 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Database",
 ]
 dependencies = [
@@ -29,11 +30,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The [asyncio] extra, not bare SQLAlchemy: it is what pulls in greenlet,
+# which SQLAlchemy's async layer needs at import time. Until 2.1 greenlet was
+# a base dependency on common platforms, so bare SQLAlchemy happened to work
+# and this was latent; 2.1 moved it into the extra and the SQLAlchemy client
+# began raising ImportError on first use.
 sqlalchemy = [
-    "SQLAlchemy>=2.0.0",
+    "SQLAlchemy[asyncio]>=2.0.0",
 ]
 all = [
-    "SQLAlchemy>=2.0.0",
+    "SQLAlchemy[asyncio]>=2.0.0",
 ]
 test = [
     "pytest>=8.0",
@@ -42,7 +48,7 @@ test = [
     # part of it and its dependency belongs here. Without this, `pip install
     # -e ".[test]"` produces a collection error rather than a test run -- which
     # is how CI found it.
-    "SQLAlchemy>=2.0.0",
+    "SQLAlchemy[asyncio]>=2.0.0",
 ]
 
 [tool.pytest.ini_options]

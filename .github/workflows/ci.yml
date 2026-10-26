@@ -71,6 +71,14 @@ jobs:
             echo "::error::the database was not reachable; the run tested nothing"
             exit 1
           fi
+          # The same guard for the other backend. A missing greenlet made the
+          # SQLAlchemy fixture skip ~240 tests for four consecutive runs; the
+          # fixture now raises instead, and this is the backstop in case some
+          # future environment failure reaches the skip path again.
+          if grep -q "SQLAlchemy engine cannot connect" out.txt; then
+            echo "::error::the SQLAlchemy backend was unusable; its tests did not run"
+            exit 1
+          fi
 
   lint:
     name: Lint and format

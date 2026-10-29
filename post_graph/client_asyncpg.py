@@ -35,7 +35,9 @@ RESERVED_SPACE_ALL = "__all__"
 class AsyncPostGraph:
     def __init__(
         self,
-        connection_or_pool: Union[asyncpg.Connection, asyncpg.Pool, None] = None,
+        # Any object with an async-context-manager ``acquire()`` is driven as a
+        # pool; anything else as a single connection. See ``_is_pool``.
+        connection_or_pool: Optional[Any] = None,
         dsn: Optional[str] = None,
         schema_per_realm: bool = False,
         pool_min_size: int = 1,
@@ -101,6 +103,36 @@ class AsyncPostGraph:
         """Close connection pool if it was managed by this client."""
         if self._pool:
             await self._pool.close()
+
+    @property
+    def _is_pool(self) -> bool:
+        """Whether ``self.connection`` is something to acquire from.
+
+        Dispatch is on capability, not on type. ``isinstance(..., asyncpg.Pool)``
+        was the test here, and it meant that a *wrapper* around a pool -- one
+        whose ``acquire()`` sets a role, a ``search_path`` or a statement
+        timeout on the connection it hands out -- was driven as though it were
+        a single connection, so ``acquire()`` was never called and the first
+        query died on ``AttributeError: no attribute 'fetch'``.
+
+        Such a wrapper is the only safe shape behind PgBouncer in transaction
+        mode, where a session-level ``SET ROLE`` would leave a server
+        connection wearing one tenant's role for the next client. Requiring
+        callers to subclass ``asyncpg.Pool`` to get it is requiring them to
+        import asyncpg, which is exactly what a caller using this library to
+        own its SQL is trying not to do.
+
+        An asyncpg ``Pool`` answers True as before. A ``Connection`` has no
+        ``acquire``, and neither does a ``PoolConnectionProxy`` -- attribute
+        lookup on it delegates to the connection it wraps, and it is also an
+        ``asyncpg.Connection`` for ``isinstance``, so both halves of the test
+        exclude it. A borrowed connection must take the connection branch or
+        the caller's own transaction is silently abandoned.
+        """
+        conn = self.connection
+        if conn is None:
+            return False
+        return hasattr(conn, "acquire") and not isinstance(conn, asyncpg.Connection)
 
     def get_pool_config(self) -> Dict[str, Any]:
         """Return the current pool configuration."""
@@ -246,7 +278,7 @@ class AsyncPostGraph:
 
     async def execute(self, query: str, *args) -> str:
         """Execute a SQL statement and return the status string."""
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await conn.execute(query, *args)
         else:
@@ -254,7 +286,7 @@ class AsyncPostGraph:
 
     async def fetch(self, query: str, *args) -> List[asyncpg.Record]:
         """Execute a SQL query and return all rows."""
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await conn.fetch(query, *args)
         else:
@@ -262,7 +294,7 @@ class AsyncPostGraph:
 
     async def fetchrow(self, query: str, *args) -> Optional[asyncpg.Record]:
         """Execute a SQL query and return the first row."""
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await conn.fetchrow(query, *args)
         else:
@@ -283,7 +315,7 @@ class AsyncPostGraph:
                 await conn.execute("SELECT set_config('app.current_user_id', '', true)")
             return await func(conn)
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 async with conn.transaction():
                     return await _execute_block(conn)
@@ -1350,7 +1382,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 result = await _op(conn)
         else:
@@ -1414,7 +1446,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -1491,7 +1523,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -1535,7 +1567,7 @@ class AsyncPostGraph:
         someone wanted a lock.
         """
         self._validate_identifier(table_name)
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             raise PostGraphError(
                 "advisory_xact_lock needs a connection-bound client: on a pool the lock "
                 "would be taken on an arbitrary connection and released at the end of its "
@@ -1698,7 +1730,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -1742,7 +1774,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -1786,7 +1818,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -1877,7 +1909,7 @@ class AsyncPostGraph:
                 logger.debug("Payload index %r created concurrently.", index_name)
                 return index_name
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -1927,7 +1959,7 @@ class AsyncPostGraph:
             except (asyncpg.DataError, asyncpg.InvalidTextRepresentationError):
                 return None
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 result = await _op(conn)
         else:
@@ -2084,7 +2116,7 @@ class AsyncPostGraph:
                 results.append((v, dist))
             return results
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -2177,7 +2209,7 @@ class AsyncPostGraph:
                 results.append((e, float(r['distance'])))
             return results
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -2270,7 +2302,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -2348,7 +2380,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -2772,7 +2804,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -2860,7 +2892,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -2970,7 +3002,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -3632,7 +3664,7 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError("Table not found during connected_components.")
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:
@@ -3759,7 +3791,7 @@ class AsyncPostGraph:
                 "total_weight": float(row["total_weight"]),
             }
 
-        if isinstance(self.connection, asyncpg.Pool):
+        if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await _op(conn)
         else:

@@ -271,6 +271,41 @@ Sizing rule: `workers × pool_max_size` must stay below the server's
 database. Past that point no client-side setting helps — put PgBouncer in
 between.
 
+### Supplying your own pool
+
+`AsyncPostGraph(connection_or_pool=…)` takes either a connection or a pool, and
+tells them apart by capability rather than by type: **anything with an
+`acquire()` that is not an asyncpg `Connection` is driven as a pool.** So a thin
+wrapper of your own works, and that is the point —
+
+```python
+class RoleAssumingPool:
+    """Each acquisition is a transaction wearing one tenant's role."""
+    def __init__(self, pool, role):
+        self._pool, self._role = pool, role
+
+    @asynccontextmanager
+    async def acquire(self):
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(f'SET LOCAL ROLE "{self._role}"')
+                yield conn
+
+client = AsyncPostGraph(connection_or_pool=RoleAssumingPool(pool, "tenant_7"))
+```
+
+A wrapper is the only safe shape behind PgBouncer in **transaction** mode,
+where a session-level `SET ROLE` would leave a server connection wearing one
+tenant's role for the next client that borrows it. Being recognised does not
+require subclassing `asyncpg.Pool` — and so does not require importing asyncpg
+in code whose whole reason for using this library is to keep the driver in one
+place.
+
+`advisory_xact_lock` still refuses a pool of any kind, wrapper included: a
+transaction-scoped lock taken on a borrowed connection is released by the
+acquisition that took it, so it is already gone when the caller writes. Build
+the client over a connection for that.
+
 ## 📚 Comprehensive API Reference
 
 ### Client Initialization & Management

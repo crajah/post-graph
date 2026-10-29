@@ -803,37 +803,45 @@ class AsyncPostGraph:
         async def _op(conn):
             nonlocal vertex_id
             table_ref_pg = f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
-            if vertex_id is None:
-                seq_query = f"SELECT nextval(pg_get_serial_sequence('{table_ref_pg}', 'id'))"
-                v_id_int = await conn.fetchval(seq_query)
-            else:
-                v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
-
-            v_id_str = str(v_id_int)
-
-            has_emb = False
-            if vec_str:
-                if self.schema_per_realm:
-                    has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'", realm, table_name) is not None
-                else:
-                    has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'", table_name) is not None
-
-            if vec_str and has_emb:
-                query = f"""
-                INSERT INTO {table_ref} (realm, id, space, payload, embedding)
-                VALUES ($1, $2, $3, $4::jsonb, $5::vector)
-                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
-                """
-                row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json, vec_str)
-            else:
-                query = f"""
-                INSERT INTO {table_ref} (realm, id, space, payload)
-                VALUES ($1, $2, $3, $4::jsonb)
-                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
-                """
-                row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json)
-
+            # Every statement is inside the try, including the INSERT. The
+            # handlers below translate a duplicate id and a missing table into
+            # this library's own error types, and for four releases the one
+            # statement that raises those -- the INSERT -- sat above the try, so
+            # a duplicate vertex id escaped as a raw asyncpg UniqueViolationError
+            # and the TableExistsError handler was unreachable for the case it
+            # names. The SQLAlchemy client never had the bug, which is how the two
+            # came to disagree about add_vertex's own documented contract.
+            v_id_str = str(vertex_id) if vertex_id is not None else '(sequence)'
             try:
+                if vertex_id is None:
+                    seq_query = f"SELECT nextval(pg_get_serial_sequence('{table_ref_pg}', 'id'))"
+                    v_id_int = await conn.fetchval(seq_query)
+                else:
+                    v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+
+                v_id_str = str(v_id_int)
+
+                has_emb = False
+                if vec_str:
+                    if self.schema_per_realm:
+                        has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'", realm, table_name) is not None
+                    else:
+                        has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'", table_name) is not None
+
+                if vec_str and has_emb:
+                    query = f"""
+                    INSERT INTO {table_ref} (realm, id, space, payload, embedding)
+                    VALUES ($1, $2, $3, $4::jsonb, $5::vector)
+                    RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
+                    """
+                    row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json, vec_str)
+                else:
+                    query = f"""
+                    INSERT INTO {table_ref} (realm, id, space, payload)
+                    VALUES ($1, $2, $3, $4::jsonb)
+                    RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
+                    """
+                    row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json)
                 if vertex_id is not None:
                     await conn.execute(
                         f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"

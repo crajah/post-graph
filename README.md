@@ -333,6 +333,12 @@ await client.create_edge_table(
 #### `add_vertex` / `upsert_vertex`
 Upserts a vertex object into a specific `{realm}` and optional `{space}`.
 
+`add_vertex` inserts and refuses a duplicate: a `vertex_id` already in use
+raises `TableExistsError`, naming the id, the table and the realm. (Before
+1.11.0 the duplicate escaped as a raw `asyncpg.UniqueViolationError` — the
+handler was there, the `INSERT` was outside it.) `upsert_vertex` merges
+instead.
+
 ```python
 vertex = await client.upsert_vertex(
     table_name="agents",

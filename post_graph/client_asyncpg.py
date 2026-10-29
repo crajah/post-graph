@@ -888,6 +888,96 @@ class AsyncPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
+    async def insert_vertex(
+        self,
+        table_name: str,
+        realm: str,
+        vertex_id: Union[str, int],
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        space: str,
+        user_id: Optional[str] = None,
+    ) -> bool:
+        """Insert one row under a supplied id. True if written, False if the id was taken.
+
+        The append an ``INSERT``-only role can run. Returns whether the row was
+        written rather than returning the row, because every way of reporting
+        the row needs a privilege this method exists to do without:
+
+        * no ``RETURNING`` -- PostgreSQL requires ``SELECT`` on every column a
+          ``RETURNING`` clause names, so ``add_vertex`` and ``upsert_vertex``
+          both need ``SELECT`` even when the caller discards the result;
+        * no conflict target -- ``ON CONFLICT (realm, id) DO NOTHING`` is
+          refused to a role without ``SELECT`` because naming the arbiter reads
+          the index; the untargeted ``ON CONFLICT DO NOTHING`` is not;
+        * no ``setval`` -- ``add_vertex`` resynchronises the sequence from
+          ``SELECT COALESCE(MAX(id), 1) FROM <table>``, which reads the table.
+
+        So this emits exactly one statement, ``INSERT ... ON CONFLICT DO
+        NOTHING``, and reads the answer out of the command tag. The caller
+        needs ``INSERT`` on the table and ``USAGE`` on the schema, and nothing
+        else. (An *audited* table additionally needs ``INSERT`` on
+        ``<table>_audit``: the audit trigger is ``SECURITY INVOKER``, so its
+        write runs as the caller.)
+
+        That makes it the write for an append-only ledger whose idempotency is
+        its primary key: derive the id from the event, and a redelivered
+        message collides with the row already there and changes nothing.
+        False is "already recorded", not an error -- and because the untargeted
+        conflict clause absorbs *any* unique violation on the row, not only one
+        on the primary key, a table with a second unique constraint will report
+        False for a collision on that one too.
+
+        ``space`` is keyword-only and has no default. The other writes default
+        it to ``"default"``, which is a reasonable default for a graph the
+        caller browses and a poor one for a ledger partitioned by tenant, where
+        a silently defaulted space is rows written where nobody will look for
+        them. Pass it.
+
+        No embedding parameter: a vector would have to be written by a second
+        statement or read back to be returned, and this method's whole contract
+        is one statement and no read. Use ``add_vertex`` where that is wanted.
+        """
+        self._validate_identifier(table_name)
+        if space == RESERVED_SPACE_ALL:
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for "
+                f"creation. It is only valid as a query-time filter."
+            )
+        if vertex_id is None:
+            raise PostGraphError(
+                "insert_vertex requires a vertex_id: its contract is an id-keyed insert "
+                "whose conflict is the caller's idempotency key. Use add_vertex for a "
+                "sequence-assigned id."
+            )
+        v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+        payload_json = json.dumps(payload or {})
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            try:
+                status = await conn.execute(
+                    f"INSERT INTO {table_ref} (realm, id, space, payload) "
+                    f"VALUES ($1, $2, $3, $4::jsonb) "
+                    f"ON CONFLICT DO NOTHING",
+                    realm, v_id_int, space, payload_json,
+                )
+            except asyncpg.UndefinedTableError:
+                raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+            # asyncpg hands back the command tag verbatim: 'INSERT 0 1' wrote a
+            # row, 'INSERT 0 0' found the id taken. Anything else means the tag
+            # format changed under us, and guessing which it was would turn a
+            # driver change into a silently miscounted ledger.
+            tag = (status or "").strip().split()
+            if len(tag) != 3 or tag[0] != "INSERT" or tag[2] not in ("0", "1"):
+                raise PostGraphError(
+                    f"insert_vertex could not read the row count from command tag "
+                    f"{status!r} for table '{table_name}' in realm '{realm}'."
+                )
+            return tag[2] == "1"
+
+        return await self._run_in_tx(_op, user_id)
+
     async def upsert_vertex(
         self,
         table_name: str,

@@ -811,6 +811,65 @@ class SQLAlchemyPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
+    async def insert_vertex(
+        self,
+        table_name: str,
+        realm: str,
+        vertex_id: Union[str, int],
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        space: str,
+        user_id: Optional[str] = None,
+    ) -> bool:
+        """Insert one row under a supplied id. True if written, False if the id was taken.
+
+        The SQLAlchemy counterpart of the asyncpg method; see that docstring
+        for why this emits no ``RETURNING``, no conflict target and no
+        ``setval``, and why ``space`` is keyword-only with no default.
+
+        Reads the answer from ``rowcount`` rather than from a command tag,
+        which is the same number: 1 written, 0 already there.
+        """
+        self._validate_identifier(table_name)
+        if space == RESERVED_SPACE_ALL:
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for "
+                f"creation. It is only valid as a query-time filter."
+            )
+        if vertex_id is None:
+            raise PostGraphError(
+                "insert_vertex requires a vertex_id: its contract is an id-keyed insert "
+                "whose conflict is the caller's idempotency key. Use add_vertex for a "
+                "sequence-assigned id."
+            )
+        v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+        payload_json = json.dumps(payload or {})
+        table_ref = self._get_table_ref(table_name, realm)
+
+        async def _op(conn):
+            query = (
+                f"INSERT INTO {table_ref} (realm, id, space, payload) "
+                f"VALUES (:realm, :id, :space, CAST(:payload AS JSONB)) "
+                f"ON CONFLICT DO NOTHING"
+            )
+            try:
+                result = await conn.execute(text(query), {
+                    "realm": realm, "id": v_id_int,
+                    "space": space, "payload": payload_json,
+                })
+            except ProgrammingError as e:
+                if "does not exist" in str(e).lower():
+                    raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+                raise PostGraphError(f"Programming error: {e}")
+            if result.rowcount not in (0, 1):
+                raise PostGraphError(
+                    f"insert_vertex wrote {result.rowcount} rows for a single-row insert "
+                    f"into '{table_name}' in realm '{realm}'."
+                )
+            return result.rowcount == 1
+
+        return await self._run_in_tx(_op, user_id)
+
     async def upsert_vertex(
         self,
         table_name: str,

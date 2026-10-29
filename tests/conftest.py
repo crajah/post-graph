@@ -147,3 +147,65 @@ async def sa_clean_realm_spr(sa_client_spr, realm):
             await conn.execute(text(f'DROP SCHEMA IF EXISTS "{realm}" CASCADE'))
     except Exception:
         pass
+
+
+# --------------------------------------------------------------- role helpers
+#
+# Privilege tests need a role that holds exactly the grants under test and
+# nothing else, and a way to see the SQL a method emits rather than only its
+# effect. Both started life inside test_update_vertex.py; they are here because
+# three test modules now measure the same kind of thing.
+
+
+async def grant_role(conn, role, grants):
+    """Create a NOLOGIN role and apply *grants*, a list of SQL fragments."""
+    await conn.execute(f'CREATE ROLE "{role}" NOLOGIN')
+    await conn.execute(f'GRANT USAGE ON SCHEMA public TO "{role}"')
+    for g in grants:
+        await conn.execute(g)
+
+
+async def drop_role(conn, role):
+    try:
+        await conn.execute(f'REASSIGN OWNED BY "{role}" TO CURRENT_USER')
+        await conn.execute(f'DROP OWNED BY "{role}"')
+        await conn.execute(f'DROP ROLE "{role}"')
+    except Exception:
+        pass
+
+
+class RecordingConnection:
+    """Delegates to a real asyncpg connection and keeps the SQL it is asked
+    to run. Used to assert the shape of a statement, not its effect."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.queries = []
+
+    def transaction(self, *a, **kw):
+        return self._conn.transaction(*a, **kw)
+
+    def is_in_transaction(self):
+        return self._conn.is_in_transaction()
+
+    async def execute(self, query, *args, **kw):
+        self.queries.append(" ".join(query.split()))
+        return await self._conn.execute(query, *args, **kw)
+
+    async def fetchrow(self, query, *args, **kw):
+        self.queries.append(" ".join(query.split()))
+        return await self._conn.fetchrow(query, *args, **kw)
+
+    async def fetch(self, query, *args, **kw):
+        self.queries.append(" ".join(query.split()))
+        return await self._conn.fetch(query, *args, **kw)
+
+    async def fetchval(self, query, *args, **kw):
+        self.queries.append(" ".join(query.split()))
+        return await self._conn.fetchval(query, *args, **kw)
+
+
+@pytest.fixture()
+def grantee():
+    """A unique, unused role name for one privilege test."""
+    return f"pgt_role_{uuid.uuid4().hex[:10]}"

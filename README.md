@@ -397,6 +397,53 @@ Two differences from `upsert_vertex` worth knowing:
   `create_vertex_table(..., audited=False)`, trades the audit trail away — for a
   security-relevant write, usually the wrong trade.
 
+#### `insert_vertex(table_name, realm, vertex_id, payload, *, space)`
+Inserts one row under a supplied id and returns **`True` if it was written,
+`False` if that id already held one**. The append an `INSERT`-only role can run.
+
+```python
+written = await client.insert_vertex(
+    table_name="usage_events",
+    realm="trial_platform",
+    vertex_id=event_id,            # derived from the event: the idempotency key
+    payload={"case_id": "c-1", "class": "transcription", "seconds": 42},
+    space="metering",              # keyword-only, no default
+)
+if not written:
+    ...  # a redelivered message; already recorded
+```
+
+It emits exactly one statement — `INSERT … ON CONFLICT DO NOTHING` — and reads
+the answer out of the command tag. The caller needs `INSERT` on the table and
+`USAGE` on the schema, and **nothing else**; not even the sequence, since a
+supplied id never evaluates the column default. Each of the three things it
+does without is a privilege the other writes need:
+
+| | needs | because |
+| :--- | :--- | :--- |
+| `RETURNING` | `SELECT` on every column named | PostgreSQL privilege-checks them column by column, even when the caller discards the result |
+| `ON CONFLICT (realm, id)` | `SELECT` | naming the arbiter reads the index; the untargeted form does not |
+| `setval(…, MAX(id))` | `SELECT` | `add_vertex` resynchronises the sequence after a supplied id |
+
+So this is the write for an append-only ledger whose containment is its grant:
+the writer holds `INSERT` and nothing else, so no path it reaches can amend or
+remove what it recorded, and its idempotency is the primary key. `False` means
+"already recorded", not an error.
+
+Two things to know:
+
+- `space` is **keyword-only with no default**, unlike every other write. A
+  silently defaulted space on a ledger partitioned by tenant is rows written
+  where nobody will look for them.
+- The untargeted conflict clause absorbs **any** unique violation on the row,
+  not only one on the primary key. A table with a second unique constraint
+  reports `False` for a collision on that one too — right when that constraint
+  *is* your idempotency key, surprising otherwise.
+
+On an **audited** table the shadow trigger's own `INSERT` runs as the invoking
+role, so it needs the same two grants `update_vertex` documents above
+(`INSERT ON <table>_audit`, `USAGE ON SEQUENCE <table>_audit_audit_id_seq`).
+
 #### `get_vertex(table_name, realm, vertex_id)`
 Fetches a single vertex by its numeric ID, UUID, or FQID.
 

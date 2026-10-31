@@ -305,6 +305,124 @@ class AsyncPostGraph:
     _fetch = fetch
     _fetchrow = fetchrow
 
+    #: Statements that have a transactional path and must not take this one.
+    #: A first-word check: it catches the mistake, not the determined.
+    _TRANSACTIONAL_STATEMENTS = frozenset({
+        "insert", "update", "delete", "merge", "copy", "truncate", "with",
+    })
+
+    async def execute_outside_transaction(self, statement: str) -> str:
+        """Run one statement with no transaction around it, and return its tag.
+
+        For the class of statements PostgreSQL refuses inside a transaction
+        block: ``VACUUM``, ``CREATE INDEX CONCURRENTLY``, ``DROP INDEX
+        CONCURRENTLY``, ``REINDEX CONCURRENTLY``, ``CREATE DATABASE``, ``DROP
+        DATABASE``, ``ALTER SYSTEM``, ``CREATE``/``DROP TABLESPACE``. Every
+        other write here runs inside a transaction on purpose, so these had no
+        path a caller could *rely* on -- ``execute`` happens not to open one,
+        but that is an implementation detail of ``execute``, and a caller whose
+        own architecture forbids opening a connection needs the guarantee and
+        not the coincidence.
+
+        A separate method rather than a flag on an existing one: a flag is
+        something a request-path caller can pass. Named for the property rather
+        than for maintenance, because ``CREATE DATABASE`` is in the class and is
+        not maintenance.
+
+        One statement per call, and that is PostgreSQL's rule rather than this
+        library's: a multi-statement simple query runs as one *implicit*
+        transaction, so ``VACUUM; VACUUM;`` is refused with the very error this
+        method exists to escape, and in a mixed pair a failure in the second
+        statement rolls the first one back. Both measured. A block holding a
+        connection for several statements would therefore buy nothing and read
+        like a transaction, so there isn't one.
+
+        It refuses rather than work around three situations, because in each the
+        name would stop being true:
+
+        * the connection it acquired is **already inside a transaction**. A pool
+          wrapper whose ``acquire()`` opens one -- to hold a ``SET LOCAL ROLE``
+          for a tenant, which is the only safe shape behind a transaction-mode
+          pooler -- cannot serve this method. Measured: the statement fails with
+          ``ActiveSQLTransactionError`` exactly as it does inside any other
+          transaction, so the refusal names the wrapper instead of leaving the
+          driver to report a transaction the caller never opened.
+        * the client is bound to a single connection and **the caller holds a
+          transaction** on it. This will not open a second connection to get
+          around that. A client that quietly held one would make "every DDL call
+          is inside a transaction" unenforceable for every caller, which is
+          usually the guard that made someone want this method in the first
+          place.
+        * the client has **no connection yet**.
+        """
+        if not (statement or "").strip():
+            raise PostGraphError("execute_outside_transaction needs a statement.")
+
+        bare = statement.strip().rstrip(";").rstrip()
+        if ";" in bare:
+            raise PostGraphError(
+                "execute_outside_transaction takes one statement. PostgreSQL "
+                "runs a multi-statement string as a single implicit "
+                "transaction, so a statement in this class fails inside one -- "
+                "reporting a transaction you never opened. Issue them in "
+                "separate calls."
+            )
+
+        first = statement.strip().split(None, 1)[0].lstrip("(").lower()
+        if first in self._TRANSACTIONAL_STATEMENTS:
+            raise PostGraphError(
+                f"execute_outside_transaction refuses a statement beginning "
+                f"'{first}': it has a transactional path and belongs on it. "
+                f"Outside a transaction nothing has set app.current_user_id, so "
+                f"an audit trigger would record the write with an empty user -- "
+                f"a provenance hole that stays invisible until someone reads the "
+                f"audit table and finds rows attributed to nobody. Use the "
+                f"method for the write, or execute() inside a transaction."
+            )
+
+        if self.connection is None:
+            raise PostGraphError(
+                "execute_outside_transaction has no connection: call connect() "
+                "first, or construct the client over a pool or connection."
+            )
+
+        if self._is_pool:
+            async with self.connection.acquire() as conn:
+                self._assert_no_transaction(conn, acquired=True)
+                return await conn.execute(statement)
+
+        self._assert_no_transaction(self.connection, acquired=False)
+        return await self.connection.execute(statement)
+
+    @staticmethod
+    def _assert_no_transaction(conn, acquired: bool) -> None:
+        """Refuse a connection that is already in a transaction.
+
+        Skipped when the object cannot answer -- a wrapper may yield something
+        without ``is_in_transaction``. PostgreSQL still refuses the statement in
+        that case; this only buys a message that names the cause.
+        """
+        probe = getattr(conn, "is_in_transaction", None)
+        if probe is None or not probe():
+            return
+        if acquired:
+            raise PostGraphError(
+                "execute_outside_transaction acquired a connection that is "
+                "already inside a transaction, so a statement PostgreSQL "
+                "refuses inside one cannot run on it. A pool wrapper whose "
+                "acquire() opens a transaction -- to hold a SET LOCAL ROLE, for "
+                "instance -- cannot serve this method. Give it a pool or "
+                "connection that hands over an idle session."
+            )
+        raise PostGraphError(
+            "execute_outside_transaction was called on a connection-bound "
+            "client while the caller holds an open transaction on it. Commit or "
+            "roll back first, or build a separate client over a pool for this. "
+            "This method will not open a second connection to work around it: a "
+            "client that quietly held one would make 'every DDL call is inside a "
+            "transaction' unenforceable for every caller, not just this one."
+        )
+
     async def _run_in_tx(self, func, user_id: Optional[str] = None):
         """Helper to run a block of operations inside a transaction, setting the user_id session context."""
         async def _execute_block(conn):

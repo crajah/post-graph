@@ -432,6 +432,43 @@ Two differences from `upsert_vertex` worth knowing:
   `create_vertex_table(..., audited=False)`, trades the audit trail away — for a
   security-relevant write, usually the wrong trade.
 
+#### `execute_outside_transaction(statement)`
+Runs **one** statement with no transaction around it, and returns its command tag.
+
+```python
+await client.execute_outside_transaction("VACUUM")
+await client.execute_outside_transaction(
+    'CREATE INDEX CONCURRENTLY "idx_things_realm" ON "things" (realm, id)')
+```
+
+For the statements PostgreSQL refuses inside a transaction block: `VACUUM`,
+`CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY`, `REINDEX CONCURRENTLY`,
+`CREATE DATABASE`, `DROP DATABASE`, `ALTER SYSTEM`, `CREATE`/`DROP TABLESPACE`.
+Every other write here runs inside a transaction on purpose, so these had no
+path a caller could *rely* on — `execute` happens not to open one, but that is
+an implementation detail of `execute`, and a caller whose own architecture
+forbids opening a connection needs the guarantee rather than the coincidence.
+
+A separate method rather than a flag, because a flag is something a request-path
+caller can pass. Named for the property rather than for maintenance, because
+`CREATE DATABASE` is in the class and is not maintenance.
+
+**One statement per call is PostgreSQL's rule, not this library's.** A
+multi-statement simple query runs as a single *implicit* transaction, so
+`VACUUM; VACUUM;` fails with the very error this method exists to escape, and in
+a mixed pair a failure in the second statement rolls the first one back. The
+client refuses a batched string itself, so the diagnosis does not arrive as a
+driver complaint about a transaction you never opened.
+
+It refuses rather than work around four situations:
+
+| situation | why |
+| :--- | :--- |
+| the acquired connection is **already in a transaction** | a pool wrapper whose `acquire()` opens one — to hold a tenant's `SET LOCAL ROLE` — cannot serve this; the refusal names the wrapper instead of leaving the driver to report a transaction you never opened |
+| connection-bound client, **caller holds a transaction** | it will not open a second connection to get around that: a client that quietly held one would make "every DDL call is inside a transaction" unenforceable for *every* caller, which is usually the guard that made someone want this method |
+| **no connection yet** | same reason — it does not open one from the DSN |
+| the statement is `INSERT`/`UPDATE`/`DELETE`/`MERGE`/`COPY`/`TRUNCATE`/`WITH` | these have a transactional path. Outside a transaction nothing has set `app.current_user_id`, so an audited table would record the write against nobody — a provenance hole invisible until someone reads the audit table. A first-word check: it catches the mistake, not the determined |
+
 #### `insert_vertex(table_name, realm, vertex_id, payload, *, space)`
 Inserts one row under a supplied id and returns **`True` if it was written,
 `False` if that id already held one**. The append an `INSERT`-only role can run.

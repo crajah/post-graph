@@ -221,6 +221,74 @@ class SQLAlchemyPostGraph:
     _fetch = fetch
     _fetchrow = fetchrow
 
+    #: Statements that have a transactional path and must not take this one.
+    _TRANSACTIONAL_STATEMENTS = frozenset({
+        "insert", "update", "delete", "merge", "copy", "truncate", "with",
+    })
+
+    async def execute_outside_transaction(self, statement: str) -> None:
+        """Run one statement with no transaction around it.
+
+        The SQLAlchemy counterpart; see the asyncpg method for the class of
+        statements this is for, why it is a separate method rather than a flag,
+        and why it refuses instead of working around a transaction it finds
+        already open.
+
+        SQLAlchemy opens a transaction on ``connect()`` whether or not the
+        caller asks, so this runs on a connection whose isolation level is
+        ``AUTOCOMMIT`` -- the dialect's way of not issuing ``BEGIN`` at all.
+        Measured: a plain ``engine.connect()`` fails on ``VACUUM`` with the same
+        ``ActiveSQLTransactionError`` the asyncpg client gets inside one.
+
+        Returns ``None`` rather than a command tag. SQLAlchemy's asyncpg adapter
+        does not surface ``statusmessage``, so there is no tag to return, and a
+        manufactured one would be worse than none.
+        """
+        if not (statement or "").strip():
+            raise PostGraphError("execute_outside_transaction needs a statement.")
+
+        bare = statement.strip().rstrip(";").rstrip()
+        if ";" in bare:
+            raise PostGraphError(
+                "execute_outside_transaction takes one statement. PostgreSQL "
+                "runs a multi-statement string as a single implicit "
+                "transaction, so a statement in this class fails inside one -- "
+                "reporting a transaction you never opened. Issue them in "
+                "separate calls."
+            )
+
+        first = statement.strip().split(None, 1)[0].lstrip("(").lower()
+        if first in self._TRANSACTIONAL_STATEMENTS:
+            raise PostGraphError(
+                f"execute_outside_transaction refuses a statement beginning "
+                f"'{first}': it has a transactional path and belongs on it. "
+                f"Outside a transaction nothing has set app.current_user_id, so "
+                f"an audit trigger would record the write with an empty user -- "
+                f"a provenance hole that stays invisible until someone reads the "
+                f"audit table and finds rows attributed to nobody."
+            )
+
+        target = self.engine_or_connection
+        if isinstance(target, AsyncConnection):
+            if target.in_transaction():
+                raise PostGraphError(
+                    "execute_outside_transaction was called on a "
+                    "connection-bound client while the caller holds an open "
+                    "transaction on it. Commit or roll back first, or build a "
+                    "separate client over an engine for this. This method will "
+                    "not open a second connection to work around it: a client "
+                    "that quietly held one would make 'every DDL call is inside "
+                    "a transaction' unenforceable for every caller, not just "
+                    "this one."
+                )
+            conn = await target.execution_options(isolation_level="AUTOCOMMIT")
+            await conn.execute(text(statement))
+            return
+
+        autocommit = target.execution_options(isolation_level="AUTOCOMMIT")
+        async with autocommit.connect() as conn:
+            await conn.execute(text(statement))
+
     async def _run_in_tx(self, func, user_id: Optional[str] = None):
         """Helper to run a function block within a transaction and optional audit user context."""
         async def _execute_block(conn):

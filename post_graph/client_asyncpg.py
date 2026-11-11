@@ -519,7 +519,8 @@ class AsyncPostGraph:
         except Exception as e:
             raise PostGraphError(f"Failed to add vector columns to table '{table_name}': {e}")
 
-    async def _execute_ddl(self, sql: str, attempts: int = 8) -> None:
+    async def _execute_ddl(self, sql: str, attempts: int = 8,
+                           tolerate_existing: bool = True) -> None:
         """Run a provisioning statement, tolerating a concurrent creator.
 
         Two different things go wrong when replicas provision the same realm at
@@ -539,13 +540,23 @@ class AsyncPostGraph:
 
         Anything else propagates. A table or index silently swallowed becomes a
         wrong answer much later, which is far worse than failing now.
+
+        ``tolerate_existing=False`` keeps the retry and drops the swallow, for a
+        statement that is not a creation and so has no "someone else already did
+        it" reading. ``REASSIGN OWNED`` is the case: it rewrites catalogue rows
+        rather than inserting them, and a concurrent writer makes it fail with
+        ``tuple concurrently updated`` -- which ``is_concurrent_creation``
+        matches, because for ``CREATE OR REPLACE FUNCTION`` that message really
+        does mean the work is done. For a reassignment it means the opposite,
+        and swallowing it would report success over objects whose ownership
+        never moved. It stays retryable either way.
         """
         for attempt in range(1, max(1, attempts) + 1):
             try:
                 await self._execute(sql)
                 return
             except Exception as e:
-                if is_concurrent_creation(e):
+                if tolerate_existing and is_concurrent_creation(e):
                     logger.debug("DDL raced with a concurrent creator, ignoring: %s", str(e)[:160])
                     return
                 if is_retryable_ddl(e) and attempt < attempts:
@@ -558,6 +569,61 @@ class AsyncPostGraph:
                     await asyncio.sleep(delay)
                     continue
                 raise
+
+
+    async def reassign_owned_to(self, role: str) -> None:
+        """Give every object this role owns in the current database to *role*.
+
+        Emits ``REASSIGN OWNED BY CURRENT_USER TO "<role>"``.
+
+        For the deployment where a subordinate role created objects that should
+        belong to somebody else: a batch indexer connecting as a writer role
+        with a longer ``statement_timeout``, which happens to be the first
+        session to reach a realm and so creates its tables. Everything it makes
+        -- tables, their ``_data`` and ``_audit`` companions, every
+        ``BIGSERIAL`` sequence and every index -- is then owned by the writer,
+        and the owning role can no longer ``ALTER`` them, nor can ``pg_dump``
+        take ``ACCESS SHARE`` on them. One statement repairs all of it as a
+        catalogue update, in milliseconds, with no data copied and no re-index.
+
+        **The reach is the whole database, not one realm.** PostgreSQL moves
+        every object ``CURRENT_USER`` owns in the current database across all
+        schemas, plus any cluster-global objects it owns. That is what makes it
+        a one-statement repair; it is also why a role that owns objects beyond
+        the realm in hand will hand those over too. Where that is not wanted,
+        ``ALTER TABLE ... OWNER TO`` per object is the narrower tool and this
+        library does not wrap it.
+
+        The source role is fixed to ``CURRENT_USER`` and is not a parameter.
+        PostgreSQL would accept ``REASSIGN OWNED BY <other> TO <role>`` from a
+        session holding privileges of both, so taking the left-hand side as an
+        argument would make this a method for pulling objects *away* from
+        another role. Fixed as it is, it can only give away what the connected
+        role already owns, which is a capability every connected role has over
+        itself anyway.
+
+        Idempotent and cheap: with no matching ``pg_shdepend`` rows PostgreSQL
+        takes no relation lock and returns cleanly, so it is safe to call
+        unconditionally at start-up. Handing objects to the role that already
+        owns them is likewise a no-op.
+
+        Transactional, unlike ``VACUUM``: it runs inside or outside an explicit
+        transaction block, so it needs no special connection and is safe behind
+        a transaction-mode pooler.
+
+        Raises ``ValueError`` for an identifier that is not a bare name.
+        ``REASSIGN OWNED`` takes no bound parameter, so validating the
+        identifier before quoting it is the only defence there is.
+        """
+        self._validate_identifier(role)
+        # tolerate_existing=False: see _execute_ddl. A reassignment that lost a
+        # catalogue race has achieved nothing, and reporting success over
+        # objects whose ownership never moved would leave the caller's backups
+        # failing with no indication of why.
+        await self._execute_ddl(
+            f'REASSIGN OWNED BY CURRENT_USER TO "{role}"',
+            tolerate_existing=False,
+        )
 
     async def create_vertex_table(
         self,

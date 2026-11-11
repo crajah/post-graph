@@ -331,7 +331,8 @@ class SQLAlchemyPostGraph:
             row = await self._fetchrow(conn, query, table_name=table_name)
         return row is not None
 
-    async def _execute_ddl(self, conn: AsyncConnection, sql: str) -> None:
+    async def _execute_ddl(self, conn: AsyncConnection, sql: str,
+                           tolerate_existing: bool = True) -> None:
         """Run one provisioning statement, tolerating a concurrent creator.
 
         The savepoint is the whole point. Unlike the asyncpg client, this one
@@ -344,12 +345,16 @@ class SQLAlchemyPostGraph:
         A statement that lost a race has still achieved what the caller wanted.
         Anything else propagates: a table or index silently swallowed becomes a
         wrong answer much later.
+
+        ``tolerate_existing=False`` drops that tolerance, for a statement that
+        is not a creation and so has no "someone else already did it" reading.
+        See the asyncpg client for why ``REASSIGN OWNED`` is that case.
         """
         try:
             async with conn.begin_nested():
                 await conn.execute(text(sql))
         except Exception as e:
-            if not is_concurrent_creation(e):
+            if not (tolerate_existing and is_concurrent_creation(e)):
                 raise
             logger.debug("DDL raced with a concurrent creator, ignoring: %s", str(e)[:160])
 
@@ -380,6 +385,24 @@ class SQLAlchemyPostGraph:
                     await asyncio.sleep(delay)
                     continue
                 raise
+
+
+    async def reassign_owned_to(self, role: str) -> None:
+        """Give every object this role owns in the current database to *role*.
+
+        The SQLAlchemy counterpart; see the asyncpg method for the deployment
+        this repairs, why the reach is the whole database rather than one
+        realm, and why the source role is fixed to ``CURRENT_USER``.
+
+        Raises ``ValueError`` for an identifier that is not a bare name.
+        """
+        self._validate_identifier(role)
+        sql = f'REASSIGN OWNED BY CURRENT_USER TO "{role}"'
+
+        async def _op(conn):
+            await self._execute_ddl(conn, sql, tolerate_existing=False)
+
+        await self._provision(_op)
 
     async def create_vertex_table(
         self,

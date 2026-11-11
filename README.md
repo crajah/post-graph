@@ -432,6 +432,44 @@ Two differences from `upsert_vertex` worth knowing:
   `create_vertex_table(..., audited=False)`, trades the audit trail away — for a
   security-relevant write, usually the wrong trade.
 
+#### `reassign_owned_to(role)`
+Gives every object the connected role owns **in the current database** to `role`,
+by emitting `REASSIGN OWNED BY CURRENT_USER TO "<role>"`.
+
+```python
+await writer_client.reassign_owned_to("app_owner")
+```
+
+For the deployment where a subordinate role created objects that should belong
+to somebody else: a batch indexer connecting as a writer role with a longer
+`statement_timeout`, which happens to be the first session to reach a realm and
+so creates its tables. Everything it makes — the tables, their `_data` and
+`_audit` companions, every `BIGSERIAL` sequence and every index — is then owned
+by the writer, and the owning role can no longer `ALTER` them, nor can `pg_dump`
+take `ACCESS SHARE` on them. One statement repairs the lot as a catalogue
+update, in milliseconds, with nothing copied and nothing re-indexed.
+
+The writer keeps working afterwards, provided it is `IN ROLE` the owner: it
+inherits the rights on the tables and sequences it has just given away.
+
+**The reach is the whole database, not one realm.** That is what makes it a
+one-statement repair, and it is also why a role owning objects beyond the realm
+in hand hands those over too. Where that is not wanted, `ALTER TABLE … OWNER TO`
+per object is the narrower tool and this library does not wrap it.
+
+**The source role is fixed to `CURRENT_USER` and is not a parameter.** PostgreSQL
+would accept `REASSIGN OWNED BY <other> TO <role>` from a session holding
+privileges of both, so a source argument would make this a method for pulling
+objects *away* from another role. Fixed as it is, it can only give away what the
+connected role already owns.
+
+Idempotent and cheap — with no matching `pg_shdepend` rows PostgreSQL takes no
+relation lock — so it is safe to call unconditionally at start-up. Transactional,
+unlike `VACUUM`, so it needs no special connection and is safe behind a
+transaction-mode pooler. Raises `ValueError` for an identifier that is not a
+bare name: `REASSIGN OWNED` takes no bound parameter, so validating before
+quoting is the only defence there is.
+
 #### `execute_outside_transaction(statement)`
 Runs **one** statement with no transaction around it, and returns its command tag.
 

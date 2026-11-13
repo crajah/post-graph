@@ -165,8 +165,14 @@ class TestItActuallyRuns:
             assert len(await client.get_vertices(table, realm=realm)) == 1
             assert await client.count_vertices(table, realm=realm) == 1
         finally:
-            await client._execute(f'DROP TABLE IF EXISTS "{table}" CASCADE')
-            await client._execute(f'DROP TABLE IF EXISTS "{table}_audit" CASCADE')
+            # All three: create_vertex_table makes the table plus its _data
+            # and _audit companions, and this client shares one schema across
+            # realms. A companion left behind still carries a `realm` column,
+            # so a later delete_realm enumerates it -- which is how 35 orphaned
+            # pp_*_data tables came to make an unrelated multi-realm test fail.
+            for suffix in ("", "_data", "_audit"):
+                await client._execute(
+                    f'DROP TABLE IF EXISTS "{table}{suffix}" CASCADE')
 
     @pytest.mark.asyncio
     async def test_every_acquisition_carries_the_role(self, raw_pool, realm, grantee):
@@ -202,7 +208,9 @@ class TestItActuallyRuns:
                 await client.delete_vertex(table, realm=realm, vertex_id=v.id)
         finally:
             await drop_role(owner, grantee)
-            await owner.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE')
+            for suffix in ("", "_data", "_audit"):
+                await owner.execute(
+                    f'DROP TABLE IF EXISTS "{table}{suffix}" CASCADE')
             await owner.close()
 
     @pytest.mark.asyncio
@@ -222,7 +230,9 @@ class TestItActuallyRuns:
                 await client.add_vertex(table, realm=realm, payload={"n": 1})
         finally:
             await drop_role(owner, grantee)
-            await owner.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE')
+            for suffix in ("", "_data", "_audit"):
+                await owner.execute(
+                    f'DROP TABLE IF EXISTS "{table}{suffix}" CASCADE')
             await owner.close()
 
 

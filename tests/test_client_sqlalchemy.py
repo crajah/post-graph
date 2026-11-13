@@ -1330,13 +1330,20 @@ class TestVertexFqidFormat:
 
 class TestEdgeFqidFormat:
     async def test_edge_fqid_format(self, sa_client, sa_clean_realm):
+        """The edge table's own name, matching the vertex form above.
+
+        Uniquely named per run; see the asyncpg twin for why a fixed name
+        cannot be used here.
+        """
         realm = sa_clean_realm
-        await sa_client.create_vertex_table("sa_people", realm=realm)
-        await sa_client.create_edge_table("sa_knows", from_vertex_table="sa_people", to_vertex_table="sa_people", realm=realm)
-        a = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "A"})
-        b = await sa_client.add_vertex("sa_people", realm=realm, payload={"name": "B"})
-        e = await sa_client.add_edge("sa_knows", realm=realm, from_id=a.id, to_id=b.id, relation_type="knows")
-        assert e.fqid == f"{realm}/sa_people-sa_people/{e.id}"
+        tag = uuid.uuid4().hex[:8]
+        people, edge = f"sa_people_{tag}", f"sa_knows_{tag}"
+        await sa_client.create_vertex_table(people, realm=realm)
+        await sa_client.create_edge_table(edge, from_vertex_table=people, to_vertex_table=people, realm=realm)
+        a = await sa_client.add_vertex(people, realm=realm, payload={"name": "A"})
+        b = await sa_client.add_vertex(people, realm=realm, payload={"name": "B"})
+        e = await sa_client.add_edge(edge, realm=realm, from_id=a.id, to_id=b.id, relation_type="knows")
+        assert e.fqid == f"{realm}/{edge}/{e.id}"
 
 
 class TestEdgeSchema:

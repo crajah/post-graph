@@ -1819,18 +1819,30 @@ class TestVertexFqidFormat:
 
 class TestEdgeFqidFormat:
     async def test_edge_fqid_format(self, pg_client, clean_realm):
+        """An edge's fqid carries its own table's name, as a vertex's does.
+
+        Table names are unique per run on purpose. This client shares one
+        schema across realms, so a fixed name is whatever an earlier run left
+        there -- and `fqid` is a stored generated column that
+        `ADD COLUMN IF NOT EXISTS` will not redefine, so a table created
+        before this format changed keeps the old expression for ever. A test
+        that asserts on the format has to own the table it reads.
+        """
         realm = clean_realm
-        await pg_client.create_vertex_table("people", realm=realm)
-        await pg_client.create_vertex_table("companies", realm=realm)
+        tag = uuid.uuid4().hex[:8]
+        people, companies = f"people_{tag}", f"companies_{tag}"
+        edge = f"works_at_{tag}"
+        await pg_client.create_vertex_table(people, realm=realm)
+        await pg_client.create_vertex_table(companies, realm=realm)
         await pg_client.create_edge_table(
-            "works_at", from_vertex_table="people", to_vertex_table="companies", realm=realm
+            edge, from_vertex_table=people, to_vertex_table=companies, realm=realm
         )
-        v1 = await pg_client.add_vertex("people", realm=realm, payload={"n": "A"})
-        v2 = await pg_client.add_vertex("companies", realm=realm, payload={"n": "X"})
+        v1 = await pg_client.add_vertex(people, realm=realm, payload={"n": "A"})
+        v2 = await pg_client.add_vertex(companies, realm=realm, payload={"n": "X"})
         e = await pg_client.add_edge(
-            "works_at", realm=realm, from_id=v1.id, to_id=v2.id, relation_type="r"
+            edge, realm=realm, from_id=v1.id, to_id=v2.id, relation_type="r"
         )
-        assert e.fqid == f"{realm}/people-companies/{e.id}"
+        assert e.fqid == f"{realm}/{edge}/{e.id}"
 
 
 class TestVertexAddEdgeFrom:

@@ -3,7 +3,10 @@ import json
 import logging
 import random
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 
@@ -16,12 +19,16 @@ from post_graph._query import (
     advisory_key,
     validate_order_column,
 )
+from post_graph._shared import SharedLogic
 from post_graph.errors import (
+    CommitFailedError,
+    ConcurrentModificationError,
     EdgeNotFoundError,
+    NestedTransactionError,
     PostGraphError,
     ReservedSpaceError,
-    TableExistsError,
     TableNotFoundError,
+    UniqueConstraintError,
     VertexNotFoundError,
 )
 from post_graph.models import ABSENT, JSON_NULL, DataRecord, Edge, Vertex
@@ -32,7 +39,7 @@ logger = logging.getLogger("post_graph")
 RESERVED_SPACE_ALL = "__all__"
 
 
-class AsyncPostGraph:
+class AsyncPostGraph(SharedLogic):
     def __init__(
         self,
         # Any object with an async-context-manager ``acquire()`` is driven as a
@@ -44,7 +51,7 @@ class AsyncPostGraph:
         pool_max_size: int = 10,
         pool_max_queries: int = 50000,
         pool_max_inactive_connection_lifetime: float = 300.0,
-        **conn_kwargs
+        **conn_kwargs,
     ):
         self.connection = connection_or_pool
         self.dsn = dsn
@@ -59,9 +66,20 @@ class AsyncPostGraph:
         self._pool = None
         self._schema_cache = {}
         self._promoted_cache = {}
+        # Set on the client yielded by transaction(): the actor every call in
+        # the block is attributed to unless it names its own, and the marker
+        # that makes a nested transaction() refuse.
+        self._tx_user_id: Optional[str] = None
+        # Set when that block exits, so a reference kept past it fails loudly
+        # instead of writing outside a transaction on somebody else's
+        # connection.
+        self._poisoned = False
 
     async def connect(self, retries: int = 5, retry_base_delay: float = 0.5):
         """Establish connection or connection pool to PostgreSQL.
+
+        Refuses on a client yielded by ``transaction()``: that client borrowed
+        its connection and does not own one to open.
 
         The pool opens ``pool_min_size`` connections eagerly (default 1) and
         grows to ``pool_max_size`` under load. The lazy default matters for
@@ -77,6 +95,11 @@ class AsyncPostGraph:
         client-side setting helps and a pooler such as PgBouncer belongs in
         between.
         """
+        if self._tx_user_id is not None:
+            raise PostGraphError(
+                "connect() is not available on the client transaction() "
+                "yielded: it borrowed its connection and owns nothing to open."
+            )
         if self.connection is None:
             kwargs = {**self._pool_config, **self.conn_kwargs}
             attempt = 0
@@ -87,20 +110,33 @@ class AsyncPostGraph:
                     else:
                         self._pool = await asyncpg.create_pool(**kwargs)
                     break
-                except (asyncpg.TooManyConnectionsError,
-                        asyncpg.CannotConnectNowError) as e:
+                except (asyncpg.TooManyConnectionsError, asyncpg.CannotConnectNowError) as e:
                     if attempt >= retries:
                         raise
-                    delay = retry_base_delay * (2 ** attempt) * (0.5 + random.random())
+                    delay = retry_base_delay * (2**attempt) * (0.5 + random.random())
                     logger.warning(
                         "connect(): %s; retry %d/%d in %.1fs",
-                        e.__class__.__name__, attempt + 1, retries, delay)
+                        e.__class__.__name__,
+                        attempt + 1,
+                        retries,
+                        delay,
+                    )
                     await asyncio.sleep(delay)
                     attempt += 1
             self.connection = self._pool
 
     async def close(self):
-        """Close connection pool if it was managed by this client."""
+        """Close connection pool if it was managed by this client.
+
+        Refuses on a client yielded by ``transaction()``: closing a borrowed
+        connection mid-transaction would strand the block that owns it.
+        """
+        if self._tx_user_id is not None:
+            raise PostGraphError(
+                "close() is not available on the client transaction() "
+                "yielded: the connection belongs to the block, which releases "
+                "it on exit."
+            )
         if self._pool:
             await self._pool.close()
 
@@ -128,7 +164,16 @@ class AsyncPostGraph:
         ``asyncpg.Connection`` for ``isinstance``, so both halves of the test
         exclude it. A borrowed connection must take the connection branch or
         the caller's own transaction is silently abandoned.
+
+        A poisoned client raises here rather than answering. This property is
+        consulted at every site that decides which connection to use -- the
+        writes, and the twenty-odd reads that dispatch without going through
+        ``_run_in_tx`` -- so it is the one place the check cannot be
+        forgotten. A client stashed past its ``transaction()`` block otherwise
+        reached a connection already back in the pool, and the driver reported
+        that as a released connection rather than as the mistake it is.
         """
+        self._assert_usable()
         conn = self.connection
         if conn is None:
             return False
@@ -153,7 +198,7 @@ class AsyncPostGraph:
         """Ensure identifiers are safe and valid to prevent SQL injection."""
         if not identifier or not isinstance(identifier, str):
             raise ValueError("Identifier must be a non-empty string.")
-        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", identifier):
             raise ValueError(
                 f"Invalid identifier: '{identifier}'. Must be alphanumeric and underscores only, "
                 f"starting with a letter or underscore."
@@ -197,8 +242,7 @@ class AsyncPostGraph:
         """
         if not isinstance(key, str) or not cls._PAYLOAD_KEY_RE.match(key):
             raise ValueError(
-                f"Invalid payload key: {key!r}. Allowed: letters, digits, "
-                f"underscore, dot and dash."
+                f"Invalid payload key: {key!r}. Allowed: letters, digits, underscore, dot and dash."
             )
         return key
 
@@ -248,21 +292,27 @@ class AsyncPostGraph:
                     sql += f" AND ({accessor})::numeric = ANY(${len(params)}::numeric[])"
                     numeric_keys.add(key)
                 else:
-                    params.append([("true" if v is True else "false" if v is False
-                                    else str(v)) for v in value])
+                    params.append(
+                        [
+                            ("true" if v is True else "false" if v is False else str(v))
+                            for v in value
+                        ]
+                    )
                     sql += f" AND {accessor} = ANY(${len(params)}::text[])"
             else:
                 if value is None:
                     raise ValueError(
                         f"({key!r}, {op!r}, None): comparisons with None are "
-                        f"ambiguous; use the 'is_null' / 'not_null' ops.")
+                        f"ambiguous; use the 'is_null' / 'not_null' ops."
+                    )
                 if cls._where_value_is_numeric(value):
                     params.append(value)
                     sql += f" AND ({accessor})::numeric {op} ${len(params)}::numeric"
                     numeric_keys.add(key)
                 else:
-                    params.append("true" if value is True else
-                                  "false" if value is False else str(value))
+                    params.append(
+                        "true" if value is True else "false" if value is False else str(value)
+                    )
                     sql += f" AND {accessor} {op} ${len(params)}"
         return sql, numeric_keys
 
@@ -271,13 +321,16 @@ class AsyncPostGraph:
         self._validate_identifier(table_name)
         if self.schema_per_realm:
             if not realm:
-                raise PostGraphError(f"Realm must be specified for table reference '{table_name}' under schema_per_realm mode.")
+                raise PostGraphError(
+                    f"Realm must be specified for table reference '{table_name}' under schema_per_realm mode."
+                )
             self._validate_identifier(realm)
             return f'"{realm}"."{table_name}"'
         return f'"{table_name}"'
 
     async def execute(self, query: str, *args) -> str:
         """Execute a SQL statement and return the status string."""
+        self._assert_usable()
         if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await conn.execute(query, *args)
@@ -286,6 +339,7 @@ class AsyncPostGraph:
 
     async def fetch(self, query: str, *args) -> List[asyncpg.Record]:
         """Execute a SQL query and return all rows."""
+        self._assert_usable()
         if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await conn.fetch(query, *args)
@@ -294,6 +348,7 @@ class AsyncPostGraph:
 
     async def fetchrow(self, query: str, *args) -> Optional[asyncpg.Record]:
         """Execute a SQL query and return the first row."""
+        self._assert_usable()
         if self._is_pool:
             async with self.connection.acquire() as conn:
                 return await conn.fetchrow(query, *args)
@@ -307,9 +362,17 @@ class AsyncPostGraph:
 
     #: Statements that have a transactional path and must not take this one.
     #: A first-word check: it catches the mistake, not the determined.
-    _TRANSACTIONAL_STATEMENTS = frozenset({
-        "insert", "update", "delete", "merge", "copy", "truncate", "with",
-    })
+    _TRANSACTIONAL_STATEMENTS = frozenset(
+        {
+            "insert",
+            "update",
+            "delete",
+            "merge",
+            "copy",
+            "truncate",
+            "with",
+        }
+    )
 
     async def execute_outside_transaction(self, statement: str) -> str:
         """Run one statement with no transaction around it, and return its tag.
@@ -423,12 +486,31 @@ class AsyncPostGraph:
             "transaction' unenforceable for every caller, not just this one."
         )
 
+    def _assert_usable(self) -> None:
+        """Refuse a client whose transaction() block has already exited."""
+        if self._poisoned:
+            raise PostGraphError(
+                "This client was yielded by transaction() and that block has "
+                "exited. Its connection has gone back to the pool and may be "
+                "serving another request, so a write here would land outside "
+                "any transaction on somebody else's session. Use the client "
+                "the block was opened on."
+            )
+
     async def _run_in_tx(self, func, user_id: Optional[str] = None):
         """Helper to run a block of operations inside a transaction, setting the user_id session context."""
+        self._assert_usable()
+        # Inside transaction(), a call that named no actor is attributed to the
+        # transaction's. Otherwise it would set app.current_user_id to '' and
+        # its audit row would record no actor at all.
+        user_id = user_id if user_id else self._tx_user_id
+
         async def _execute_block(conn):
             if user_id:
                 # Set transaction-local session variable for auditing
-                await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
+                await conn.execute(
+                    "SELECT set_config('app.current_user_id', $1, true)", str(user_id)
+                )
             else:
                 await conn.execute("SELECT set_config('app.current_user_id', '', true)")
             return await func(conn)
@@ -446,7 +528,9 @@ class AsyncPostGraph:
         self._validate_identifier(table_name)
         if self.schema_per_realm:
             if not realm:
-                raise PostGraphError(f"Realm must be specified for _table_exists('{table_name}') in schema_per_realm mode.")
+                raise PostGraphError(
+                    f"Realm must be specified for _table_exists('{table_name}') in schema_per_realm mode."
+                )
             self._validate_identifier(realm)
             query = """
             SELECT 1 
@@ -464,28 +548,27 @@ class AsyncPostGraph:
             row = await self._fetchrow(query, table_name)
         return row is not None
 
-    async def _table_has_embedding(self, conn, table_name: str, realm: Optional[str] = None) -> bool:
+    async def _table_has_embedding(
+        self, conn, table_name: str, realm: Optional[str] = None
+    ) -> bool:
         """Return True if the given table has an 'embedding' column."""
         if self.schema_per_realm:
             found = await conn.fetchval(
                 "SELECT 1 FROM information_schema.columns "
                 "WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'",
-                realm, table_name
+                realm,
+                table_name,
             )
         else:
             found = await conn.fetchval(
                 "SELECT 1 FROM information_schema.columns "
                 "WHERE table_name = $1 AND column_name = 'embedding'",
-                table_name
+                table_name,
             )
         return found is not None
 
     async def _add_vector_column(
-        self,
-        table_name: str,
-        table_ref: str,
-        data_table_ref: str,
-        vector_dim: int
+        self, table_name: str, table_ref: str, data_table_ref: str, vector_dim: int
     ):
         """Add pgvector embedding columns and HNSW indexes to a table and its data table.
 
@@ -493,12 +576,22 @@ class AsyncPostGraph:
         """
         try:
             await self._execute_ddl("CREATE EXTENSION IF NOT EXISTS vector;")
-            await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});")
-            await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);')
-            await self._execute_ddl(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});")
-            await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);')
+            await self._execute_ddl(
+                f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"
+            )
+            await self._execute_ddl(
+                f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);'
+            )
+            await self._execute_ddl(
+                f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"
+            )
+            await self._execute_ddl(
+                f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);'
+            )
         except Exception as e:
-            raise PostGraphError(f"Failed to initialize pgvector extension or embedding column for table '{table_name}': {e}")
+            raise PostGraphError(
+                f"Failed to initialize pgvector extension or embedding column for table '{table_name}': {e}"
+            )
 
     async def _add_vector_columns(
         self,
@@ -512,15 +605,24 @@ class AsyncPostGraph:
             await self._execute_ddl("CREATE EXTENSION IF NOT EXISTS vector;")
             for col_name, dim in columns.items():
                 self._validate_identifier(col_name)
-                await self._execute_ddl(f'ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});')
-                await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" ON {table_ref} USING hnsw ("{col_name}" vector_cosine_ops);')
-                await self._execute_ddl(f'ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});')
-                await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_{col_name}" ON {data_table_ref} USING hnsw ("{col_name}" vector_cosine_ops);')
+                await self._execute_ddl(
+                    f'ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'
+                )
+                await self._execute_ddl(
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" ON {table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'
+                )
+                await self._execute_ddl(
+                    f'ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'
+                )
+                await self._execute_ddl(
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_{col_name}" ON {data_table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'
+                )
         except Exception as e:
             raise PostGraphError(f"Failed to add vector columns to table '{table_name}': {e}")
 
-    async def _execute_ddl(self, sql: str, attempts: int = 8,
-                           tolerate_existing: bool = True) -> None:
+    async def _execute_ddl(
+        self, sql: str, attempts: int = 8, tolerate_existing: bool = True
+    ) -> None:
         """Run a provisioning statement, tolerating a concurrent creator.
 
         Two different things go wrong when replicas provision the same realm at
@@ -564,12 +666,420 @@ class AsyncPostGraph:
                     # count, and a linear ramp over five tries tops out under a
                     # second -- enough for six replicas, not for twenty.
                     delay = min(2.0, 0.05 * (2 ** (attempt - 1))) * (1.0 + random.random())
-                    logger.debug("DDL contended (attempt %d/%d), retrying in %.3fs: %s",
-                                 attempt, attempts, delay, str(e)[:120])
+                    logger.debug(
+                        "DDL contended (attempt %d/%d), retrying in %.3fs: %s",
+                        attempt,
+                        attempts,
+                        delay,
+                        str(e)[:120],
+                    )
                     await asyncio.sleep(delay)
                     continue
                 raise
 
+    @staticmethod
+    async def ensure_database(
+        dsn: str, *, database: str, maintenance_database: str = "postgres"
+    ) -> str:
+        """Create *database* if it is absent; return a DSN pointing at it.
+
+        The bootstrap a first deploy needs and cannot do through an ordinary
+        client, because connecting requires the database to exist. So this is
+        a static method that opens one connection to *maintenance_database*,
+        looks, creates if needed, and closes.
+
+        ``CREATE DATABASE`` cannot run inside a transaction, so the connection
+        is used directly rather than through this library's transactional
+        paths. It takes no bound parameter either, which is why the name is
+        validated as a bare identifier first -- before any connection is
+        opened, so a bad name costs nothing and reaches nothing.
+
+        Idempotent under a deploy herd: several replicas starting together all
+        see the database absent and race to create it. The loser gets
+        ``DuplicateDatabaseError``, which is success -- the database exists,
+        which is the whole contract.
+
+        The returned DSN has its path rewritten to *database*, so a caller
+        whose configured DSN still names the maintenance database gets a
+        usable one back rather than silently working against ``postgres``.
+
+        Driver exceptions are translated: a caller reaching for this is
+        bootstrapping, and a raw asyncpg error at that point names neither the
+        database nor what to do about it.
+        """
+        AsyncPostGraph._validate_database_name(database, what="database")
+        AsyncPostGraph._validate_database_name(maintenance_database, what="maintenance_database")
+
+        def _with_path(target: str) -> str:
+            parsed = urlsplit(dsn)
+            return urlunsplit(parsed._replace(path=f"/{target}"))
+
+        try:
+            conn = await asyncpg.connect(_with_path(maintenance_database))
+        except asyncpg.InvalidCatalogNameError as e:
+            raise PostGraphError(
+                f"ensure_database cannot reach the maintenance database "
+                f"{maintenance_database!r}: {e}. Name one that exists with "
+                f"maintenance_database=."
+            ) from e
+        except asyncpg.InsufficientPrivilegeError as e:
+            raise PostGraphError(
+                f"ensure_database was refused a connection to {maintenance_database!r}: {e}."
+            ) from e
+        except OSError as e:
+            raise PostGraphError(
+                f"ensure_database could not connect in order to create {database!r}: {e}."
+            ) from e
+
+        try:
+            exists = await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", database)
+            if not exists:
+                try:
+                    await conn.execute(f'CREATE DATABASE "{database}"')
+                except asyncpg.DuplicateDatabaseError:
+                    # Another replica won the race. The database exists, which
+                    # is what was asked for.
+                    logger.debug("Database %r created concurrently.", database)
+                except asyncpg.UniqueViolationError as e:
+                    # The other shape the same race takes. PostgreSQL does not
+                    # always reach the duplicate-database check: with several
+                    # CREATE DATABASE statements in flight the loser can fail
+                    # on pg_database's own unique index instead, which is 23505
+                    # and not 42P04. Measured -- four concurrent callers
+                    # produce it reliably, so treating only the tidy error as
+                    # success crashes one replica of a deploy herd.
+                    if not is_concurrent_creation(e):
+                        raise
+                    logger.debug(
+                        "Database %r created concurrently (%s).",
+                        database,
+                        getattr(e, "constraint_name", None),
+                    )
+                except asyncpg.InsufficientPrivilegeError as e:
+                    raise PostGraphError(
+                        f"ensure_database may not create {database!r}: {e}. "
+                        f"The connected role needs CREATEDB, or the database "
+                        f"has to be created for it."
+                    ) from e
+        finally:
+            await conn.close()
+
+        return _with_path(database)
+
+    @asynccontextmanager
+    async def transaction(
+        self, *, user_id: str, idle_in_transaction_timeout_ms: Optional[int] = None
+    ):
+        """One transaction spanning several calls; yields a client bound to it.
+
+        Every write here is already atomic on its own. This is for the cases
+        where two of them have to be atomic *together* -- a grant and the row
+        that records it -- which no amount of care at the call site can
+        arrange from outside.
+
+        ``user_id`` is required and is the transaction's actor. It is also
+        remembered: a call inside the block that passes no ``user_id`` is
+        attributed to this one rather than to nobody. Without that, the second
+        write in a block would blank ``app.current_user_id`` and its audit row
+        would record an empty actor -- the audit trail quietly losing exactly
+        the writes that were important enough to group.
+
+        An inner call may still pass its own ``user_id`` to attribute that one
+        write differently, and doing so does not affect the calls after it.
+
+        ``idle_in_transaction_timeout_ms`` is applied with ``SET LOCAL``, so it
+        reverts on commit or rollback and cannot leak onto a pooled backend
+        that another request borrows next. A session-level ``SET`` would, and
+        a startup parameter is either dropped or refused by a pooler in
+        transaction mode.
+
+        On a clean exit the transaction commits. If the commit itself fails,
+        that is :class:`~post_graph.errors.CommitFailedError` rather than an
+        ordinary error: everything in the block ran, so any external effect it
+        had -- a charge, an email -- has happened, and the caller needs to
+        reconcile rather than retry. On any exception inside the block the
+        transaction rolls back and the original exception propagates; a
+        rollback that itself fails is logged and suppressed, because losing
+        the original exception to a secondary failure on a dead socket is
+        worse than not knowing the rollback failed.
+
+        The yielded client is poisoned when the block exits. A reference
+        stashed outside and used later would otherwise be writing, outside any
+        transaction, on a connection now serving somebody else.
+        """
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError(
+                "transaction() requires a non-empty user_id: it is the actor "
+                "every write in the block is attributed to."
+            )
+        if self._tx_user_id is not None:
+            raise NestedTransactionError(
+                "transaction() is already open on this client. A nested block "
+                "would be a SAVEPOINT whose exit commits nothing, so a caller "
+                "believing it had committed would be wrong with nothing to "
+                "say so. Use the client you were given."
+            )
+        ms = idle_in_transaction_timeout_ms
+        if ms is not None:
+            # isinstance(True, int) is True in Python, and True would become
+            # '1ms', a timeout that fires immediately.
+            if isinstance(ms, bool) or not isinstance(ms, int) or ms <= 0:
+                raise ValueError(
+                    f"idle_in_transaction_timeout_ms must be a positive int, got {ms!r}."
+                )
+        if self.connection is None:
+            raise PostGraphError("transaction() needs a connection: call connect() first.")
+
+        async def _run(conn):
+            scoped = AsyncPostGraph(connection_or_pool=conn, schema_per_realm=self.schema_per_realm)
+            scoped._tx_user_id = user_id
+            scoped._schema_cache = self._schema_cache
+            scoped._promoted_cache = self._promoted_cache
+            tx = conn.transaction()
+            await tx.start()
+            try:
+                if ms is not None:
+                    await conn.execute(f"SET LOCAL idle_in_transaction_session_timeout = '{ms}ms'")
+                yield scoped
+            except BaseException:
+                try:
+                    await tx.rollback()
+                except Exception as rollback_error:  # noqa: BLE001
+                    logger.warning(
+                        "Rollback failed after an error in transaction(); the "
+                        "original exception is being re-raised: %s",
+                        rollback_error,
+                    )
+                raise
+            else:
+                try:
+                    await tx.commit()
+                except Exception as e:  # noqa: BLE001
+                    raise CommitFailedError(
+                        f"The transaction body completed and COMMIT failed: "
+                        f"{e}. Any effect outside the database has happened; "
+                        f"whether the writes are durable is unknown."
+                    ) from e
+            finally:
+                scoped._poisoned = True
+
+        if self._is_pool:
+            async with self.connection.acquire() as conn:
+                async for scoped in _run(conn):
+                    yield scoped
+        else:
+            async for scoped in _run(self.connection):
+                yield scoped
+
+    async def purge_record_audit(self, table_name: str, realm: str, record_ids) -> int:
+        """Delete the shadow audit rows for specific records. Returns the count.
+
+        The audit table is a full copy of every version of a row, so deleting
+        a row from the live table leaves its contents behind -- and for a row
+        holding something a person asked to have deleted, that is the whole of
+        the problem rather than a detail of it. Dropping the realm removes it,
+        but that is everything the person has; this is one record.
+
+        Matches ``old_row`` **and** ``new_row``, because the two hold different
+        halves of the history: an INSERT audit row has ``old_row`` NULL and the
+        contents under ``new_row``, a DELETE has it the other way about, and an
+        UPDATE has both. Matching only ``old_row`` would leave the original
+        INSERT copy in place, which is the copy that has been there longest.
+
+        Returns 0 without touching the database for an empty id list, and 0
+        when there is no audit table -- a table declared ``audited=False``, or
+        one whose audit table was dropped. Neither is an error: the caller
+        asked for the audit rows to be gone and they are.
+
+        Accepts one id or many; ``realm/table/42`` is read as 42, as the write
+        methods do.
+        """
+        self._validate_identifier(table_name)
+        if self.schema_per_realm:
+            self._validate_identifier(realm)
+        ids = self._normalise_ids(record_ids)
+        if not ids:
+            return 0
+
+        audit_ref = self._get_table_ref(f"{table_name}_audit", realm)
+
+        async def _op(conn):
+            present = await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", audit_ref)
+            if not present:
+                return 0
+            status = await conn.execute(
+                f"DELETE FROM {audit_ref} WHERE realm = $1 AND ("
+                f"((old_row->>'id')::bigint = ANY($2::bigint[])) OR "
+                f"((new_row->>'id')::bigint = ANY($2::bigint[])))",
+                realm,
+                ids,
+            )
+            tag = (status or "").strip().split()
+            if len(tag) != 2 or tag[0] != "DELETE":
+                raise PostGraphError(
+                    f"purge_record_audit could not read a row count from "
+                    f"command tag {status!r} on '{table_name}_audit'."
+                )
+            return int(tag[1])
+
+        if self._is_pool:
+            async with self.connection.acquire() as conn:
+                return await _op(conn)
+        return await _op(self.connection)
+
+    # ------------------------------------------------- realm and catalogue
+
+    async def realm_exists(self, realm: str) -> bool:
+        """Whether this realm exists.
+
+        Under ``schema_per_realm`` that is a schema; otherwise a realm is a
+        column value, so this asks whether any row carries it.
+        """
+        self._validate_identifier(realm)
+        if self.schema_per_realm:
+            row = await self._fetchrow(
+                "SELECT 1 AS ok FROM information_schema.schemata WHERE schema_name = $1", realm
+            )
+            return row is not None
+        rows = await self._fetch(
+            "SELECT DISTINCT table_name FROM information_schema.columns "
+            "WHERE column_name = 'realm' AND table_schema = CURRENT_SCHEMA()"
+        )
+        for r in rows:
+            ref = self._get_table_ref(r["table_name"])
+            hit = await self._fetchrow(f"SELECT 1 AS ok FROM {ref} WHERE realm = $1 LIMIT 1", realm)
+            if hit is not None:
+                return True
+        return False
+
+    async def list_realms(self, *, prefix: Optional[str] = None) -> List[str]:
+        """Existing realm names, sorted.
+
+        ``prefix`` matches literally: ``_`` and ``%`` in it are escaped, so
+        ``prefix="learner_"`` does not also return ``learners_archive``.
+        """
+        params: List[Any] = []
+        if self.schema_per_realm:
+            sql = (
+                "SELECT schema_name AS name FROM information_schema.schemata "
+                "WHERE schema_name NOT IN ('pg_catalog', 'information_schema') "
+                "AND schema_name NOT LIKE 'pg!_%' ESCAPE '!'"
+            )
+            if prefix:
+                params.append(self._like_literal(prefix) + "%")
+                sql += f" AND schema_name LIKE ${len(params)} ESCAPE '!'"
+        else:
+            rows = await self._fetch(
+                "SELECT DISTINCT table_name FROM information_schema.columns "
+                "WHERE column_name = 'realm' AND table_schema = CURRENT_SCHEMA()"
+            )
+            found: Set[str] = set()
+            for r in rows:
+                ref = self._get_table_ref(r["table_name"])
+                for row in await self._fetch(f"SELECT DISTINCT realm FROM {ref}"):
+                    found.add(row["realm"])
+            if prefix:
+                found = {name for name in found if name.startswith(prefix)}
+            return sorted(found)
+        return sorted(r["name"] for r in await self._fetch(sql + " ORDER BY 1", *params))
+
+    async def table_exists(self, table_name: str, realm: Optional[str] = None) -> bool:
+        """Whether this relation exists. The public form of ``_table_exists``.
+
+        Answers for a base table and for its ``_data`` and ``_audit``
+        companions alike, since each is an ordinary relation.
+        """
+        return await self._table_exists(table_name, realm)
+
+    async def drop_realm(self, realm: str, *, cascade: bool = True) -> bool:
+        """Drop this realm's schema. True if it was there, False if it was not.
+
+        Only under ``schema_per_realm``: without it a realm is a column value
+        spread across shared tables and there is no schema to drop, so this
+        refuses rather than guessing. ``delete_realm`` removes the rows in
+        that mode.
+
+        ``tolerate_existing=False`` on the DDL, because a drop has no "someone
+        else already created it" reading: swallowing a catalogue race here
+        would report a realm gone that is still there.
+        """
+        self._validate_identifier(realm)
+        if not self.schema_per_realm:
+            raise PostGraphError(
+                "drop_realm needs schema_per_realm: without it a realm is a "
+                "column value in shared tables, not a schema, and there is "
+                "nothing to drop. Use delete_realm to remove its rows."
+            )
+        existed = await self.realm_exists(realm)
+        await self._execute_ddl(
+            f'DROP SCHEMA IF EXISTS "{realm}"' + (" CASCADE" if cascade else ""),
+            tolerate_existing=False,
+        )
+        for cache in (self._schema_cache, self._promoted_cache):
+            for key in [k for k in cache if isinstance(k, tuple) and k and k[0] == realm]:
+                cache.pop(key, None)
+        return existed
+
+    async def tables_containing_text(
+        self,
+        needle: str,
+        *,
+        include_realms: Optional[Sequence[str]] = None,
+        exclude_realm_prefixes: Optional[Sequence[str]] = None,
+    ) -> Set[str]:
+        """``{"schema.table"}`` for every table holding *needle* anywhere in a row.
+
+        A residue check, for asserting that something asked to be deleted is
+        actually gone. It casts the whole row to text, so it finds the needle
+        in a payload, in a shadow ``_data`` row and in an ``_audit`` copy
+        alike -- the places a deletion tends to miss.
+
+        Deliberately not fast. One ``LIMIT 1`` probe per table, sequential
+        scans, no indexes: it is for tests and for erasure receipts, not for a
+        request path.
+
+        ``needle`` is matched literally; ``_`` and ``%`` within it are escaped.
+        ``exclude_realm_prefixes`` skips whole families of schemas unless
+        ``include_realms`` names them, which keeps such an assertion quick on
+        a cluster carrying hundreds of unrelated per-tenant schemas.
+        """
+        if not isinstance(needle, str) or needle == "":
+            raise ValueError("tables_containing_text needs a non-empty needle.")
+        pattern = f"%{self._like_literal(needle)}%"
+        included = set(include_realms or ())
+        excluded = tuple(exclude_realm_prefixes or ())
+
+        relations = await self._fetch(
+            "SELECT n.nspname AS schema, c.relname AS table FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relkind IN ('r', 'p') "
+            "AND n.nspname NOT IN ('pg_catalog', 'information_schema') "
+            "AND n.nspname NOT LIKE 'pg!_%' ESCAPE '!' "
+            "ORDER BY 1, 2"
+        )
+
+        hits: Set[str] = set()
+        for row in relations:
+            schema, table = row["schema"], row["table"]
+            if excluded and schema not in included and any(schema.startswith(p) for p in excluded):
+                continue
+            if include_realms is not None and schema not in included:
+                continue
+            try:
+                found = await self._fetchrow(
+                    f'SELECT 1 AS ok FROM "{schema}"."{table}" t '
+                    f"WHERE t::text LIKE $1 ESCAPE '!' LIMIT 1",
+                    pattern,
+                )
+            except Exception as e:  # noqa: BLE001
+                # A table the connected role cannot read, or one dropped
+                # between the catalogue read and the probe. Neither is an
+                # answer about the needle, and neither should fail the scan.
+                logger.debug("Skipping %s.%s during text scan: %s", schema, table, str(e)[:120])
+                continue
+            if found is not None:
+                hits.add(f"{schema}.{table}")
+        return hits
 
     async def reassign_owned_to(self, role: str) -> None:
         """Give every object this role owns in the current database to *role*.
@@ -647,7 +1157,9 @@ class AsyncPostGraph:
         self._validate_identifier(table_name)
         if self.schema_per_realm:
             if not realm:
-                raise PostGraphError("realm must be specified in schema_per_realm mode when creating a table.")
+                raise PostGraphError(
+                    "realm must be specified in schema_per_realm mode when creating a table."
+                )
             self._validate_identifier(realm)
 
         table_ref = self._get_table_ref(table_name, realm)
@@ -666,7 +1178,13 @@ class AsyncPostGraph:
             CREATE OR REPLACE FUNCTION {schema_prefix}update_modified_column()
             RETURNS TRIGGER AS $$
             BEGIN
-                NEW.updated_at = now();
+                -- clock_timestamp(), not now(): now() is the transaction's
+                -- start time, so two writes to one row inside a transaction
+                -- would leave updated_at unchanged between them. That makes
+                -- updated_at unusable as a compare-and-swap token for the
+                -- second write, which is the whole point of expected_updated_at.
+                -- An existing realm picks this up when a table is next declared.
+                NEW.updated_at = clock_timestamp();
                 RETURN NEW;
             END;
             $$ language 'plpgsql';
@@ -725,11 +1243,21 @@ class AsyncPostGraph:
         );
         """
         await self._execute_ddl(query)
-        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
-        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);')
-        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED;")
-        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();")
-        await self._execute_ddl(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);')
+        await self._execute_ddl(
+            f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"
+        )
+        await self._execute_ddl(
+            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);'
+        )
+        await self._execute_ddl(
+            f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED;"
+        )
+        await self._execute_ddl(
+            f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();"
+        )
+        await self._execute_ddl(
+            f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);'
+        )
 
         # Hot payload keys as generated, indexed columns. Maintained by
         # PostgreSQL from payload, so writers are unaffected; see promoted.py.
@@ -766,10 +1294,18 @@ class AsyncPostGraph:
         );
         """
         await self._execute_ddl(data_query)
-        await self._execute_ddl(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
-        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);')
-        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);')
-        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);')
+        await self._execute_ddl(
+            f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"
+        )
+        await self._execute_ddl(
+            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);'
+        )
+        await self._execute_ddl(
+            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);'
+        )
+        await self._execute_ddl(
+            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);'
+        )
 
         # 4. Add vector columns. This must run after the data table exists, since
         # the embedding column is added to both the main and the data table.
@@ -784,7 +1320,9 @@ class AsyncPostGraph:
         )
 
         # 5. Create trigger for updated_at
-        await self._execute_ddl(f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};')
+        await self._execute_ddl(
+            f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};'
+        )
         await self._execute_ddl(f"""
             CREATE TRIGGER "update_{table_name}_modtime"
             BEFORE UPDATE ON {table_ref}
@@ -796,7 +1334,9 @@ class AsyncPostGraph:
         # that re-declaring an existing table as unaudited actually stops the
         # auditing; what the table already recorded is left alone, and is
         # removed only by an explicit drop_audit_table call.
-        await self._execute_ddl(f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
+        await self._execute_ddl(
+            f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};'
+        )
         if audited:
             await self._execute_ddl(f"""
                 CREATE TRIGGER "audit_{table_name}_trigger"
@@ -845,7 +1385,9 @@ class AsyncPostGraph:
 
         if self.schema_per_realm:
             if not realm:
-                raise PostGraphError("realm must be specified in schema_per_realm mode when creating an edge table.")
+                raise PostGraphError(
+                    "realm must be specified in schema_per_realm mode when creating an edge table."
+                )
             self._validate_identifier(realm)
 
         table_ref = self._get_table_ref(table_name, realm)
@@ -856,9 +1398,13 @@ class AsyncPostGraph:
 
         # Check that from_vertex_table and to_vertex_table exist
         if not await self._table_exists(from_vertex_table, realm=realm):
-            raise TableNotFoundError(f"Referenced from_vertex_table '{from_vertex_table}' does not exist.")
+            raise TableNotFoundError(
+                f"Referenced from_vertex_table '{from_vertex_table}' does not exist."
+            )
         if not await self._table_exists(to_vertex_table, realm=realm):
-            raise TableNotFoundError(f"Referenced to_vertex_table '{to_vertex_table}' does not exist.")
+            raise TableNotFoundError(
+                f"Referenced to_vertex_table '{to_vertex_table}' does not exist."
+            )
 
         # Resolve schema prefix for triggers/functions
         if self.schema_per_realm:
@@ -873,7 +1419,7 @@ class AsyncPostGraph:
             id BIGSERIAL,
             space VARCHAR(255) DEFAULT 'default' NOT NULL,
             uuid UUID DEFAULT gen_random_uuid() NOT NULL,
-            fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{from_vertex_table}-{to_vertex_table}' || '/' || id::text) STORED NOT NULL,
+            fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED NOT NULL,
             from_id BIGINT NOT NULL,
             to_id BIGINT NOT NULL,
             relation_type TEXT NOT NULL,
@@ -886,11 +1432,21 @@ class AsyncPostGraph:
         );
         """
         await self._execute_ddl(query)
-        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
-        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);')
-        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{from_vertex_table}-{to_vertex_table}' || '/' || id::text) STORED;")
-        await self._execute_ddl(f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();")
-        await self._execute_ddl(f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);')
+        await self._execute_ddl(
+            f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"
+        )
+        await self._execute_ddl(
+            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);'
+        )
+        await self._execute_ddl(
+            f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED;"
+        )
+        await self._execute_ddl(
+            f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();"
+        )
+        await self._execute_ddl(
+            f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);'
+        )
 
         # Hot payload keys as generated, indexed columns. Maintained by
         # PostgreSQL from payload, so writers are unaffected; see promoted.py.
@@ -927,10 +1483,18 @@ class AsyncPostGraph:
         );
         """
         await self._execute_ddl(data_query)
-        await self._execute_ddl(f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';")
-        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);')
-        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);')
-        await self._execute_ddl(f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);')
+        await self._execute_ddl(
+            f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"
+        )
+        await self._execute_ddl(
+            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);'
+        )
+        await self._execute_ddl(
+            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);'
+        )
+        await self._execute_ddl(
+            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);'
+        )
 
         # 3a. Add vector columns, after both the main and data tables exist.
         if vector_dim and vector_dim > 0:
@@ -947,7 +1511,9 @@ class AsyncPostGraph:
         )
 
         # 4. Create trigger for updated_at
-        await self._execute_ddl(f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};')
+        await self._execute_ddl(
+            f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};'
+        )
         await self._execute_ddl(f"""
             CREATE TRIGGER "update_{table_name}_modtime"
             BEFORE UPDATE ON {table_ref}
@@ -959,7 +1525,9 @@ class AsyncPostGraph:
         # that re-declaring an existing table as unaudited actually stops the
         # auditing; what the table already recorded is left alone, and is
         # removed only by an explicit drop_audit_table call.
-        await self._execute_ddl(f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
+        await self._execute_ddl(
+            f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};'
+        )
         if audited:
             await self._execute_ddl(f"""
                 CREATE TRIGGER "audit_{table_name}_trigger"
@@ -969,12 +1537,24 @@ class AsyncPostGraph:
             """)
 
         # 6. Create custom cascade delete trigger if either boolean is True
-        await self._execute_ddl(f'DROP TRIGGER IF EXISTS "cascade_delete_trigger_{table_name}" ON {table_ref};')
-        await self._execute_ddl(f'DROP FUNCTION IF EXISTS {schema_prefix}"cascade_delete_func_{table_name}"();')
+        await self._execute_ddl(
+            f'DROP TRIGGER IF EXISTS "cascade_delete_trigger_{table_name}" ON {table_ref};'
+        )
+        await self._execute_ddl(
+            f'DROP FUNCTION IF EXISTS {schema_prefix}"cascade_delete_func_{table_name}"();'
+        )
         if cascade_delete_from or cascade_delete_to:
-            from_clause = f'DELETE FROM {from_vertex_ref} WHERE realm = OLD.realm AND id = OLD.from_id;' if cascade_delete_from else ''
-            to_clause = f'DELETE FROM {to_vertex_ref} WHERE realm = OLD.realm AND id = OLD.to_id;' if cascade_delete_to else ''
-            
+            from_clause = (
+                f"DELETE FROM {from_vertex_ref} WHERE realm = OLD.realm AND id = OLD.from_id;"
+                if cascade_delete_from
+                else ""
+            )
+            to_clause = (
+                f"DELETE FROM {to_vertex_ref} WHERE realm = OLD.realm AND id = OLD.to_id;"
+                if cascade_delete_to
+                else ""
+            )
+
             await self._execute_ddl(f"""
                 CREATE OR REPLACE FUNCTION {schema_prefix}"cascade_delete_func_{table_name}"()
                 RETURNS TRIGGER AS $$
@@ -1005,12 +1585,14 @@ class AsyncPostGraph:
         embedding: Optional[List[float]] = None,
         embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
-        space: Optional[str] = "default"
+        space: Optional[str] = "default",
     ) -> Vertex:
         """Add a new vertex. Raises TableExistsError if it already exists."""
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
-            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter."
+            )
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -1018,7 +1600,9 @@ class AsyncPostGraph:
 
         async def _op(conn):
             nonlocal vertex_id
-            table_ref_pg = f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            table_ref_pg = (
+                f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            )
             # Every statement is inside the try, including the INSERT. The
             # handlers below translate a duplicate id and a missing table into
             # this library's own error types, and for four releases the one
@@ -1027,22 +1611,39 @@ class AsyncPostGraph:
             # and the TableExistsError handler was unreachable for the case it
             # names. The SQLAlchemy client never had the bug, which is how the two
             # came to disagree about add_vertex's own documented contract.
-            v_id_str = str(vertex_id) if vertex_id is not None else '(sequence)'
+            v_id_str = str(vertex_id) if vertex_id is not None else "(sequence)"
             try:
                 if vertex_id is None:
                     seq_query = f"SELECT nextval(pg_get_serial_sequence('{table_ref_pg}', 'id'))"
                     v_id_int = await conn.fetchval(seq_query)
                 else:
-                    v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+                    v_id_int = (
+                        int(str(vertex_id).split("/")[-1])
+                        if "/" in str(vertex_id)
+                        else int(vertex_id)
+                    )
 
                 v_id_str = str(v_id_int)
 
                 has_emb = False
                 if vec_str:
                     if self.schema_per_realm:
-                        has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'", realm, table_name) is not None
+                        has_emb = (
+                            await conn.fetchval(
+                                "SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'",
+                                realm,
+                                table_name,
+                            )
+                            is not None
+                        )
                     else:
-                        has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'", table_name) is not None
+                        has_emb = (
+                            await conn.fetchval(
+                                "SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'",
+                                table_name,
+                            )
+                            is not None
+                        )
 
                 if vec_str and has_emb:
                     query = f"""
@@ -1050,7 +1651,9 @@ class AsyncPostGraph:
                     VALUES ($1, $2, $3, $4::jsonb, $5::vector)
                     RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
                     """
-                    row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json, vec_str)
+                    row = await conn.fetchrow(
+                        query, realm, v_id_int, eff_space, payload_json, vec_str
+                    )
                 else:
                     query = f"""
                     INSERT INTO {table_ref} (realm, id, space, payload)
@@ -1066,7 +1669,7 @@ class AsyncPostGraph:
                 emb_dict = None
                 if embeddings:
                     set_clauses = []
-                    up_params: list = [realm, row['id']]
+                    up_params: list = [realm, row["id"]]
                     for col_name, vec in embeddings.items():
                         self._validate_identifier(col_name)
                         up_params.append(f"[{','.join(str(x) for x in vec)}]")
@@ -1079,26 +1682,30 @@ class AsyncPostGraph:
                         emb_dict = dict(embeddings)
 
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 return Vertex(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    space=row.get('space') or 'default',
-                    fqid=row['fqid'],
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    space=row.get("space") or "default",
+                    fqid=row["fqid"],
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
                     embedding=emb,
                     embeddings=emb_dict,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
-            except asyncpg.UniqueViolationError:
-                raise TableExistsError(
-                    f"Vertex with ID '{v_id_str}' already exists in table '{table_name}' under realm '{realm}'."
-                )
+            except asyncpg.UniqueViolationError as e:
+                raise self._unique_error(
+                    e, kind="Vertex", record_id=v_id_str, table_name=table_name, realm=realm
+                ) from e
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
@@ -1166,7 +1773,7 @@ class AsyncPostGraph:
                 "whose conflict is the caller's idempotency key. Use add_vertex for a "
                 "sequence-assigned id."
             )
-        v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+        v_id_int = int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
 
@@ -1176,7 +1783,10 @@ class AsyncPostGraph:
                     f"INSERT INTO {table_ref} (realm, id, space, payload) "
                     f"VALUES ($1, $2, $3, $4::jsonb) "
                     f"ON CONFLICT DO NOTHING",
-                    realm, v_id_int, space, payload_json,
+                    realm,
+                    v_id_int,
+                    space,
+                    payload_json,
                 )
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
@@ -1204,7 +1814,9 @@ class AsyncPostGraph:
         embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
         space: Optional[str] = "default",
-        replace: bool = False
+        replace: bool = False,
+        *,
+        expected_updated_at: Optional[datetime] = None,
     ) -> Vertex:
         """Upsert a vertex, merging the payload JSONB on conflict.
 
@@ -1224,7 +1836,15 @@ class AsyncPostGraph:
         """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
-            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter."
+            )
+        if expected_updated_at is not None and vertex_id is None:
+            raise ValueError(
+                "expected_updated_at requires vertex_id: a sequence-assigned "
+                "id is a row that does not exist yet, so there is no prior "
+                "updated_at for it to have moved from."
+            )
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -1232,55 +1852,101 @@ class AsyncPostGraph:
 
         # Merge by default; replace only when the caller asks. Merging cannot
         # express key removal, which is the whole reason `replace` exists.
-        payload_sql = ("EXCLUDED.payload" if replace
-                       else f"{table_ref}.payload || EXCLUDED.payload")
+        payload_sql = "EXCLUDED.payload" if replace else f"{table_ref}.payload || EXCLUDED.payload"
 
         async def _op(conn):
             nonlocal vertex_id
-            table_ref_pg = f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
-            if vertex_id is None:
-                seq_query = f"SELECT nextval(pg_get_serial_sequence('{table_ref_pg}', 'id'))"
-                v_id_int = await conn.fetchval(seq_query)
-            else:
-                v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
-
-            str(v_id_int)
-
-            has_emb = False
-            if vec_str:
-                if self.schema_per_realm:
-                    has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'", realm, table_name) is not None
-                else:
-                    has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'", table_name) is not None
-
-            if vec_str and has_emb:
-                query = f"""
-                INSERT INTO {table_ref} (realm, id, space, payload, embedding)
-                VALUES ($1, $2, $3, $4::jsonb, $5::vector)
-                ON CONFLICT (realm, id) DO UPDATE
-                SET space = EXCLUDED.space,
-                    payload = {payload_sql},
-                    embedding = EXCLUDED.embedding,
-                    updated_at = CURRENT_TIMESTAMP
-                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
-                """
-                row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json, vec_str)
-            else:
-                query = f"""
-                INSERT INTO {table_ref} (realm, id, space, payload)
-                VALUES ($1, $2, $3, $4::jsonb)
-                ON CONFLICT (realm, id) DO UPDATE
-                SET space = EXCLUDED.space,
-                    payload = {payload_sql},
-                    updated_at = CURRENT_TIMESTAMP
-                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
-                """
-                row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json)
+            table_ref_pg = (
+                f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            )
+            v_id_str = str(vertex_id) if vertex_id is not None else "(sequence)"
+            # Everything inside the try, including the INSERT. Until 1.14.0 the
+            # statement sat above it, so a uniqueness violation escaped as the
+            # driver's own exception -- the same shape of bug add_vertex carried
+            # until 1.11.0, and invisible here for as long as (realm, id) was
+            # the only uniqueness a table had. A unique payload index makes it
+            # reachable: the conflict target absorbs the primary key, and the
+            # other constraint raises.
             try:
+                if vertex_id is None:
+                    seq_query = f"SELECT nextval(pg_get_serial_sequence('{table_ref_pg}', 'id'))"
+                    v_id_int = await conn.fetchval(seq_query)
+                else:
+                    v_id_int = (
+                        int(str(vertex_id).split("/")[-1])
+                        if "/" in str(vertex_id)
+                        else int(vertex_id)
+                    )
+                v_id_str = str(v_id_int)
+
+                has_emb = False
+                if vec_str:
+                    if self.schema_per_realm:
+                        has_emb = (
+                            await conn.fetchval(
+                                "SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'",
+                                realm,
+                                table_name,
+                            )
+                            is not None
+                        )
+                    else:
+                        has_emb = (
+                            await conn.fetchval(
+                                "SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'",
+                                table_name,
+                            )
+                            is not None
+                        )
+
+                if vec_str and has_emb:
+                    params = [realm, v_id_int, eff_space, payload_json, vec_str]
+                    cas = ""
+                    if expected_updated_at is not None:
+                        params.append(expected_updated_at)
+                        cas = f" WHERE {table_ref}.updated_at = ${len(params)}"
+                    query = f"""
+                    INSERT INTO {table_ref} (realm, id, space, payload, embedding)
+                    VALUES ($1, $2, $3, $4::jsonb, $5::vector)
+                    ON CONFLICT (realm, id) DO UPDATE
+                    SET space = EXCLUDED.space,
+                        payload = {payload_sql},
+                        embedding = EXCLUDED.embedding,
+                        updated_at = clock_timestamp(){cas}
+                    RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
+                    """
+                    row = await conn.fetchrow(query, *params)
+                else:
+                    params = [realm, v_id_int, eff_space, payload_json]
+                    cas = ""
+                    if expected_updated_at is not None:
+                        params.append(expected_updated_at)
+                        cas = f" WHERE {table_ref}.updated_at = ${len(params)}"
+                    query = f"""
+                    INSERT INTO {table_ref} (realm, id, space, payload)
+                    VALUES ($1, $2, $3, $4::jsonb)
+                    ON CONFLICT (realm, id) DO UPDATE
+                    SET space = EXCLUDED.space,
+                        payload = {payload_sql},
+                        updated_at = clock_timestamp(){cas}
+                    RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
+                    """
+                    row = await conn.fetchrow(query, *params)
+
+                if row is None:
+                    # The only way RETURNING yields nothing: the row existed,
+                    # so the INSERT took the conflict path, and the DO UPDATE's
+                    # WHERE rejected it. Somebody wrote between the caller's
+                    # read and this statement.
+                    raise ConcurrentModificationError(
+                        f"Vertex '{v_id_str}' in table '{table_name}', realm "
+                        f"'{realm}' was modified since updated_at="
+                        f"{expected_updated_at!r}; the upsert was not applied."
+                    )
                 emb_dict = None
                 if embeddings:
                     set_clauses = []
-                    up_params: list = [realm, row['id']]
+                    up_params: list = [realm, row["id"]]
                     for col_name, vec in embeddings.items():
                         self._validate_identifier(col_name)
                         up_params.append(f"[{','.join(str(x) for x in vec)}]")
@@ -1293,22 +1959,33 @@ class AsyncPostGraph:
                         emb_dict = dict(embeddings)
 
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 return Vertex(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    space=row.get('space') or 'default',
-                    fqid=row['fqid'],
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    space=row.get("space") or "default",
+                    fqid=row["fqid"],
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
                     embedding=emb,
                     embeddings=emb_dict,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
+            except asyncpg.UniqueViolationError as e:
+                # Reachable only through a second uniqueness on the table: the
+                # ON CONFLICT target absorbs (realm, id), so a unique payload
+                # index is what raises here.
+                raise self._unique_error(
+                    e, kind="Vertex", record_id=v_id_str, table_name=table_name, realm=realm
+                ) from e
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
@@ -1324,7 +2001,9 @@ class AsyncPostGraph:
         embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
         space: Optional[str] = None,
-        replace: bool = False
+        replace: bool = False,
+        *,
+        expected_updated_at: Optional[datetime] = None,
     ) -> Optional[Vertex]:
         """Update an existing vertex. Emits a bare UPDATE and never an INSERT.
 
@@ -1342,7 +2021,7 @@ class AsyncPostGraph:
         granted ``UPDATE`` and withheld ``INSERT`` deliberately, and an upsert
         asks it to give that distinction up. This method emits
 
-        ``UPDATE <table> SET payload = ..., updated_at = CURRENT_TIMESTAMP
+        ``UPDATE <table> SET payload = ..., updated_at = clock_timestamp()
         WHERE realm = $1 AND id = $2 RETURNING ...``
 
         so ``UPDATE`` is the only table privilege it needs.
@@ -1383,7 +2062,9 @@ class AsyncPostGraph:
         """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
-            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for a write. It is only valid as a query-time filter.")
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for a write. It is only valid as a query-time filter."
+            )
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -1394,9 +2075,11 @@ class AsyncPostGraph:
         payload_sql = "$3::jsonb" if replace else "payload || $3::jsonb"
 
         async def _op(conn):
-            v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+            v_id_int = (
+                int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
+            )
 
-            set_clauses = [f"payload = {payload_sql}", "updated_at = CURRENT_TIMESTAMP"]
+            set_clauses = [f"payload = {payload_sql}", "updated_at = clock_timestamp()"]
             params: list = [realm, v_id_int, payload_json]
 
             # None means leave the space alone, unlike upsert_vertex.
@@ -1404,7 +2087,9 @@ class AsyncPostGraph:
                 params.append(space)
                 set_clauses.append(f"space = ${len(params)}")
 
-            returning = "realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text"
+            returning = (
+                "realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text"
+            )
             if vec_str and await self._table_has_embedding(conn, table_name, realm):
                 params.append(vec_str)
                 set_clauses.append(f"embedding = ${len(params)}::vector")
@@ -1418,35 +2103,63 @@ class AsyncPostGraph:
                     set_clauses.append(f'"{col_name}" = ${len(params)}::vector')
                 emb_dict = dict(embeddings)
 
+            cas = ""
+            if expected_updated_at is not None:
+                params.append(expected_updated_at)
+                cas = f" AND updated_at = ${len(params)}"
+
             query = f"""
             UPDATE {table_ref}
-            SET {', '.join(set_clauses)}
-            WHERE realm = $1 AND id = $2
+            SET {", ".join(set_clauses)}
+            WHERE realm = $1 AND id = $2{cas}
             RETURNING {returning}
             """
             try:
                 row = await conn.fetchrow(query, *params)
+            except asyncpg.UniqueViolationError as e:
+                raise self._unique_error(
+                    e, kind="Vertex", record_id=str(v_id_int), table_name=table_name, realm=realm
+                ) from e
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
             if row is None:
+                if expected_updated_at is not None:
+                    # No row came back, which means either there is nothing to
+                    # update or updated_at moved. Those are different answers
+                    # and the caller has to be able to tell them apart: a
+                    # missing row is not a lost race.
+                    still_there = await conn.fetchrow(
+                        f"SELECT 1 AS ok FROM {table_ref} WHERE realm = $1 AND id = $2",
+                        realm,
+                        v_id_int,
+                    )
+                    if still_there is not None:
+                        raise ConcurrentModificationError(
+                            f"Vertex '{v_id_int}' in table '{table_name}', "
+                            f"realm '{realm}' was modified since updated_at="
+                            f"{expected_updated_at!r}; the update was not "
+                            f"applied."
+                        )
                 return None
 
             emb = None
-            if 'embedding_text' in row and row['embedding_text']:
-                emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+            if "embedding_text" in row and row["embedding_text"]:
+                emb = [float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()]
             return Vertex(
-                realm=row['realm'],
-                id=str(row['id']),
-                space=row.get('space') or 'default',
-                fqid=row['fqid'],
-                payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                created_at=row['created_at'],
-                updated_at=row['updated_at'],
+                realm=row["realm"],
+                id=str(row["id"]),
+                space=row.get("space") or "default",
+                fqid=row["fqid"],
+                payload=row["payload"]
+                if isinstance(row["payload"], dict)
+                else json.loads(row["payload"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
                 table_name=table_name,
                 embedding=emb,
                 embeddings=emb_dict,
-                uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                _client=self
+                uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                _client=self,
             )
 
         return await self._run_in_tx(_op, user_id)
@@ -1509,7 +2222,9 @@ class AsyncPostGraph:
             results.append(e)
         return results
 
-    async def get_vertex(self, table_name: str, realm: str, vertex_id: str, strict: bool = False) -> Optional[Vertex]:
+    async def get_vertex(
+        self, table_name: str, realm: str, vertex_id: str, strict: bool = False
+    ) -> Optional[Vertex]:
         """Fetch a vertex by realm and id or uuid.
 
         When *strict* is True, raises VertexNotFoundError instead of returning None.
@@ -1517,18 +2232,22 @@ class AsyncPostGraph:
         self._validate_identifier(table_name)
         v_str = str(vertex_id).strip()
 
-        if len(v_str) == 36 and '-' in v_str:
+        if len(v_str) == 36 and "-" in v_str:
             result = await self.get_vertex_by_uuid(table_name, realm, v_str)
             if strict and result is None:
-                raise VertexNotFoundError(f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'.")
+                raise VertexNotFoundError(
+                    f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'."
+                )
             return result
 
         try:
-            v_id_int = int(v_str.split('/')[-1]) if '/' in v_str else int(v_str)
+            v_id_int = int(v_str.split("/")[-1]) if "/" in v_str else int(v_str)
         except ValueError:
             result = await self.get_vertex_by_uuid(table_name, realm, v_str)
             if strict and result is None:
-                raise VertexNotFoundError(f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'.")
+                raise VertexNotFoundError(
+                    f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'."
+                )
             return result
 
         table_ref = self._get_table_ref(table_name, realm)
@@ -1547,21 +2266,25 @@ class AsyncPostGraph:
                     return None
 
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
 
                 return Vertex(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    space=row.get('space') or 'default',
-                    fqid=row['fqid'],
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    space=row.get("space") or "default",
+                    fqid=row["fqid"],
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
                     embedding=emb,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
@@ -1572,15 +2295,13 @@ class AsyncPostGraph:
         else:
             result = await _op(self.connection)
         if strict and result is None:
-            raise VertexNotFoundError(f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'.")
+            raise VertexNotFoundError(
+                f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'."
+            )
         return result
 
     async def get_vertices(
-        self,
-        table_name: str,
-        realm: str,
-        space: Optional[str] = None,
-        limit: Optional[int] = None
+        self, table_name: str, realm: str, space: Optional[str] = None, limit: Optional[int] = None
     ) -> List[Vertex]:
         """Fetch all vertices in a realm, optionally filtered by space."""
         self._validate_identifier(table_name)
@@ -1611,21 +2332,29 @@ class AsyncPostGraph:
                 vertices = []
                 for row in rows:
                     emb = None
-                    if 'embedding_text' in row and row['embedding_text']:
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    vertices.append(Vertex(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        space=row.get('space') or 'default',
-                        fqid=row['fqid'],
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    vertices.append(
+                        Vertex(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            space=row.get("space") or "default",
+                            fqid=row["fqid"],
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return vertices
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
@@ -1657,8 +2386,10 @@ class AsyncPostGraph:
                     space_clause = ""
                     if space and space != RESERVED_SPACE_ALL:
                         all_params.append(space)
-                        space_clause = f" AND (t.space = ${base+2} OR (${base+2} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
-                    parts.append(f"SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text, to_jsonb(t)->>'embedding' AS embedding_text FROM {tref} t WHERE t.realm = ${base+1}{space_clause}")
+                        space_clause = f" AND (t.space = ${base + 2} OR (${base + 2} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+                    parts.append(
+                        f"SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text, to_jsonb(t)->>'embedding' AS embedding_text FROM {tref} t WHERE t.realm = ${base + 1}{space_clause}"
+                    )
                 query = " UNION ALL ".join(parts) + " ORDER BY realm, id ASC"
                 if limit:
                     all_params.append(limit)
@@ -1688,21 +2419,29 @@ class AsyncPostGraph:
                 vertices = []
                 for row in rows:
                     emb = None
-                    if 'embedding_text' in row and row['embedding_text']:
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    vertices.append(Vertex(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        space=row.get('space') or 'default',
-                        fqid=row['fqid'],
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    vertices.append(
+                        Vertex(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            space=row.get("space") or "default",
+                            fqid=row["fqid"],
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return vertices
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
@@ -1767,7 +2506,8 @@ class AsyncPostGraph:
             )
         await self.connection.execute(
             "SELECT pg_advisory_xact_lock($1::int, $2::int)",
-            ADVISORY_CLASSID, advisory_key(realm, table_name),
+            ADVISORY_CLASSID,
+            advisory_key(realm, table_name),
         )
 
     async def newest_vertex(
@@ -1786,8 +2526,12 @@ class AsyncPostGraph:
         two of them can read this same row.
         """
         rows = await self.find_vertices(
-            table_name, realm=realm, space=space,
-            order_by_column="id", descending=True, limit=1,
+            table_name,
+            realm=realm,
+            space=space,
+            order_by_column="id",
+            descending=True,
+            limit=1,
         )
         return rows[0] if rows else None
 
@@ -1838,8 +2582,7 @@ class AsyncPostGraph:
         if order_by_column is not None:
             if order_by is not None:
                 raise PostGraphError(
-                    "Pass order_by (a payload key) or order_by_column (a real column), "
-                    "not both."
+                    "Pass order_by (a payload key) or order_by_column (a real column), not both."
                 )
             validate_order_column(order_by_column, VERTEX_ORDER_COLUMNS)
 
@@ -1895,21 +2638,29 @@ class AsyncPostGraph:
                 vertices = []
                 for row in rows:
                     emb = None
-                    if 'embedding_text' in row and row['embedding_text']:
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    vertices.append(Vertex(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        space=row.get('space') or 'default',
-                        fqid=row['fqid'],
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    vertices.append(
+                        Vertex(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            space=row.get("space") or "default",
+                            fqid=row["fqid"],
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return vertices
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
@@ -1953,8 +2704,8 @@ class AsyncPostGraph:
             clauses += where_sql
             try:
                 return await conn.fetchval(
-                    f"SELECT COUNT(*) FROM {table_ref} t WHERE t.realm = $1{clauses}",
-                    *params)
+                    f"SELECT COUNT(*) FROM {table_ref} t WHERE t.realm = $1{clauses}", *params
+                )
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
@@ -1997,8 +2748,8 @@ class AsyncPostGraph:
             clauses += where_sql
             try:
                 return await conn.fetchval(
-                    f"SELECT COUNT(*) FROM {table_ref} t WHERE t.realm = $1{clauses}",
-                    *params)
+                    f"SELECT COUNT(*) FROM {table_ref} t WHERE t.realm = $1{clauses}", *params
+                )
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
@@ -2029,7 +2780,8 @@ class AsyncPostGraph:
         if not where:
             raise ValueError(
                 "delete_vertices requires a non-empty where; to remove an "
-                "entire realm use delete_realm, which is explicit about it.")
+                "entire realm use delete_realm, which is explicit about it."
+            )
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
 
@@ -2043,8 +2795,8 @@ class AsyncPostGraph:
             clauses += where_sql
             try:
                 res = await conn.execute(
-                    f"DELETE FROM {table_ref} t WHERE t.realm = $1{clauses}",
-                    *params)
+                    f"DELETE FROM {table_ref} t WHERE t.realm = $1{clauses}", *params
+                )
                 # asyncpg returns the command tag, e.g. 'DELETE 42'.
                 return int(res.split()[-1])
             except asyncpg.UndefinedTableError:
@@ -2056,8 +2808,12 @@ class AsyncPostGraph:
         self,
         table_name: str,
         realm: str,
-        key: str,
+        key: Union[str, Sequence[str]],
         numeric: bool = False,
+        *,
+        unique: bool = False,
+        scope_by_space: bool = True,
+        index_name: Optional[str] = None,
     ) -> str:
         """Index the ``(payload->>'key')`` expression; returns the index name.
 
@@ -2068,30 +2824,81 @@ class AsyncPostGraph:
         cast the numeric comparisons use; building it will fail if existing
         rows hold non-numeric text under the key, which is the correct time
         to find that out.
+
+        ``key`` may be several keys, for a predicate over a combination --
+        ``("institution_id", "slug")``. ``numeric`` applies to every key in
+        the tuple, which is why it is rejected for a composite index: a mixed
+        index is the thing a caller actually wants there, and silently casting
+        all of them would build the wrong index rather than refuse.
+
+        ``unique=True`` makes it a uniqueness constraint rather than an
+        optimisation, and a violation arrives as
+        :class:`~post_graph.errors.UniqueConstraintError` carrying this index
+        name. ``scope_by_space`` decides what the uniqueness is *per*:
+
+        * ``True`` (the default) leads with ``(realm, space, ...)``, so each
+          space has its own namespace. Two tenants can each hold a
+          ``"oliver"`` while a duplicate inside one tenant is refused.
+        * ``False`` leads with ``(realm, ...)``, for a key that must be unique
+          across every space of the realm.
+
+        A non-unique index over a single key keeps exactly the name and shape
+        earlier releases built, so an existing caller does not create a second
+        index alongside the one it already has.
+
+        ``index_name`` overrides the derived name and must fit in 63 bytes.
+        PostgreSQL truncates longer identifiers silently, which would let two
+        distinct indexes become one and drop a uniqueness constraint nobody
+        was told about -- so this refuses instead. A derived name too long to
+        fit is shortened with a hash rather than truncated.
         """
         self._validate_identifier(table_name)
-        self._validate_payload_key(key)
+        keys = self._payload_index_keys(
+            key, numeric=numeric, validate_payload_key=self._validate_payload_key
+        )
         table_ref = self._get_table_ref(table_name, realm)
-        safe = re.sub(r"[^a-z0-9_]", "_", key.lower())
-        index_name = f"idx_{table_name}_payload_{safe}" + ("_num" if numeric else "")
-        expr = (f"(((payload->>'{key}'))::numeric)" if numeric
-                else f"((payload->>'{key}'))")
+        final_name, columns = self._plan_payload_index(
+            table_name,
+            keys,
+            numeric=numeric,
+            unique=unique,
+            scope_by_space=scope_by_space,
+            index_name=index_name,
+            validate_identifier=self._validate_identifier,
+        )
+
+        unique_sql = "UNIQUE " if unique else ""
 
         async def _op(conn):
             try:
                 await conn.execute(
-                    f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_ref} ({expr})")
-                return index_name
+                    f'CREATE {unique_sql}INDEX IF NOT EXISTS "{final_name}" '
+                    f"ON {table_ref} ({', '.join(columns)})"
+                )
+                return final_name
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
+            except asyncpg.UniqueViolationError as e:
+                # Building a UNIQUE index over rows that already contain
+                # duplicates. Not a race: the data is the problem, and the
+                # constraint does not exist afterwards.
+                if is_concurrent_creation(e):
+                    logger.debug("Payload index %r created concurrently.", final_name)
+                    return final_name
+                raise UniqueConstraintError(
+                    f"Cannot create unique index {final_name!r} on "
+                    f"'{table_name}': existing rows already hold duplicate "
+                    f"values for {keys}. {e}",
+                    constraint_name=getattr(e, "constraint_name", None),
+                ) from e
             except Exception as e:
                 # IF NOT EXISTS is check-then-create, so replicas indexing the
                 # same hot key at once collide on pg_class. The index exists
                 # either way, which is the whole contract.
                 if not is_concurrent_creation(e):
                     raise
-                logger.debug("Payload index %r created concurrently.", index_name)
-                return index_name
+                logger.debug("Payload index %r created concurrently.", final_name)
+                return final_name
 
         if self._is_pool:
             async with self.connection.acquire() as conn:
@@ -2099,7 +2906,9 @@ class AsyncPostGraph:
         else:
             return await _op(self.connection)
 
-    async def get_vertex_by_uuid(self, table_name: str, realm: str, uuid: str, strict: bool = False) -> Optional[Vertex]:
+    async def get_vertex_by_uuid(
+        self, table_name: str, realm: str, uuid: str, strict: bool = False
+    ) -> Optional[Vertex]:
         """Fetch a vertex record by its UUID.
 
         When *strict* is True, raises VertexNotFoundError instead of returning None.
@@ -2122,21 +2931,25 @@ class AsyncPostGraph:
                     return None
 
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
 
                 return Vertex(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    space=row.get('space') or 'default',
-                    fqid=row['fqid'],
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    space=row.get("space") or "default",
+                    fqid=row["fqid"],
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
                     embedding=emb,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
@@ -2149,7 +2962,9 @@ class AsyncPostGraph:
         else:
             result = await _op(self.connection)
         if strict and result is None:
-            raise VertexNotFoundError(f"Vertex with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'.")
+            raise VertexNotFoundError(
+                f"Vertex with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'."
+            )
         return result
 
     async def vector_search(
@@ -2174,11 +2989,11 @@ class AsyncPostGraph:
         dominate the neighbourhood. Supported for the default ``main`` scope;
         combining it with ``data``/``both`` scopes raises rather than
         silently ignoring the predicate.
-        
+
         Parameters:
           - search_data_table: If True and search_scope is 'main', searches the associated data table.
           - search_scope: 'main' (search main vertex table), 'data' (search associated data table), or 'both' (search both tables).
-        
+
         Distance metrics:
           - 'cosine': <=> (cosine distance)
           - 'l2': <-> (Euclidean distance)
@@ -2203,7 +3018,8 @@ class AsyncPostGraph:
         if where and scope != "main":
             raise ValueError(
                 "vector_search(where=...) is supported for the 'main' scope "
-                "only; filtering the data/both scopes is not implemented.")
+                "only; filtering the data/both scopes is not implemented."
+            )
 
         effective_space = space if space and space != RESERVED_SPACE_ALL else None
         space_filter = ""
@@ -2276,27 +3092,33 @@ class AsyncPostGraph:
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
             except asyncpg.UndefinedColumnError:
-                logger.warning(f"Table '{table_name}' or data table does not have a vector embedding column.")
+                logger.warning(
+                    f"Table '{table_name}' or data table does not have a vector embedding column."
+                )
                 return []
 
             results = []
             for r in rows:
                 emb = None
-                if r['embedding_text']:
-                    emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+                if r["embedding_text"]:
+                    emb = [
+                        float(x) for x in r["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 v = Vertex(
-                    realm=r['realm'],
-                    id=str(r['id']),
-                    space=r.get('space') or 'default',
-                    fqid=r['fqid'],
-                    payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
-                    created_at=r['created_at'],
-                    updated_at=r['updated_at'],
+                    realm=r["realm"],
+                    id=str(r["id"]),
+                    space=r.get("space") or "default",
+                    fqid=r["fqid"],
+                    payload=r["payload"]
+                    if isinstance(r["payload"], dict)
+                    else json.loads(r["payload"]),
+                    created_at=r["created_at"],
+                    updated_at=r["updated_at"],
                     table_name=table_name,
                     embedding=emb,
-                    _client=self
+                    _client=self,
                 )
-                dist = float(r['distance'])
+                dist = float(r["distance"])
                 results.append((v, dist))
             return results
 
@@ -2372,25 +3194,29 @@ class AsyncPostGraph:
             results = []
             for r in rows:
                 emb = None
-                if r['embedding_text']:
-                    emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+                if r["embedding_text"]:
+                    emb = [
+                        float(x) for x in r["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 e = Edge(
-                    realm=r['realm'],
-                    id=str(r['id']),
-                    from_id=str(r['from_id']),
-                    to_id=str(r['to_id']),
-                    relation_type=r['relation_type'],
-                    space=r.get('space') or 'default',
-                    fqid=r['fqid'],
-                    payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
+                    realm=r["realm"],
+                    id=str(r["id"]),
+                    from_id=str(r["from_id"]),
+                    to_id=str(r["to_id"]),
+                    relation_type=r["relation_type"],
+                    space=r.get("space") or "default",
+                    fqid=r["fqid"],
+                    payload=r["payload"]
+                    if isinstance(r["payload"], dict)
+                    else json.loads(r["payload"]),
                     embedding=emb,
-                    created_at=r['created_at'],
-                    updated_at=r['updated_at'],
+                    created_at=r["created_at"],
+                    updated_at=r["updated_at"],
                     table_name=table_name,
-                    uuid=str(r['uuid_text']) if r.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(r["uuid_text"]) if r.get("uuid_text") else None,
+                    _client=self,
                 )
-                results.append((e, float(r['distance'])))
+                results.append((e, float(r["distance"])))
             return results
 
         if self._is_pool:
@@ -2399,7 +3225,9 @@ class AsyncPostGraph:
         else:
             return await _op(self.connection)
 
-    async def delete_vertex(self, table_name: str, realm: str, vertex_id: str, user_id: Optional[str] = None) -> bool:
+    async def delete_vertex(
+        self, table_name: str, realm: str, vertex_id: str, user_id: Optional[str] = None
+    ) -> bool:
         """Delete a vertex. Cascading foreign keys will automatically delete referencing edges."""
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
@@ -2467,21 +3295,29 @@ class AsyncPostGraph:
                 vertices = []
                 for row in rows:
                     emb = None
-                    if 'embedding_text' in row and row['embedding_text']:
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    vertices.append(Vertex(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        space=row.get('space') or 'default',
-                        fqid=row['fqid'],
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    vertices.append(
+                        Vertex(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            space=row.get("space") or "default",
+                            fqid=row["fqid"],
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return vertices
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
@@ -2542,24 +3378,32 @@ class AsyncPostGraph:
                 edges = []
                 for row in rows:
                     emb = None
-                    if row.get('embedding_text'):
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    edges.append(Edge(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        fqid=row['fqid'],
-                        from_id=str(row['from_id']),
-                        to_id=str(row['to_id']),
-                        relation_type=row['relation_type'],
-                        space=row.get('space') or 'default',
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if row.get("embedding_text"):
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    edges.append(
+                        Edge(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            fqid=row["fqid"],
+                            from_id=str(row["from_id"]),
+                            to_id=str(row["to_id"]),
+                            relation_type=row["relation_type"],
+                            space=row.get("space") or "default",
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return edges
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
@@ -2582,7 +3426,7 @@ class AsyncPostGraph:
         user_id: Optional[str] = None,
         check_cycle: Union[bool, List[str]] = False,
         space: Optional[str] = "default",
-        embedding: Optional[List[float]] = None
+        embedding: Optional[List[float]] = None,
     ) -> Edge:
         """Add a new edge. Raises TableExistsError if it already exists.
 
@@ -2591,7 +3435,9 @@ class AsyncPostGraph:
         """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
-            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter."
+            )
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -2603,21 +3449,23 @@ class AsyncPostGraph:
             from_table = schema["from_id"]
             to_table = schema["to_id"]
 
-            table_ref_pg = f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            table_ref_pg = (
+                f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            )
             if edge_id is None:
                 seq_query = f"SELECT nextval(pg_get_serial_sequence('{table_ref_pg}', 'id'))"
                 e_id_int = await conn.fetchval(seq_query)
             else:
-                e_id_int = int(str(edge_id).split('/')[-1]) if '/' in str(edge_id) else int(edge_id)
+                e_id_int = int(str(edge_id).split("/")[-1]) if "/" in str(edge_id) else int(edge_id)
 
-            from_id_int = int(str(from_id).split('/')[-1]) if '/' in str(from_id) else int(from_id)
-            to_id_int = int(str(to_id).split('/')[-1]) if '/' in str(to_id) else int(to_id)
+            from_id_int = int(str(from_id).split("/")[-1]) if "/" in str(from_id) else int(from_id)
+            to_id_int = int(str(to_id).split("/")[-1]) if "/" in str(to_id) else int(to_id)
 
             e_id_str = str(e_id_int)
 
             if check_cycle:
                 cycle_tables = check_cycle if isinstance(check_cycle, list) else [table_name]
-                
+
                 path = await self.shortest_path(
                     realm=realm,
                     start_table=to_table,
@@ -2625,10 +3473,11 @@ class AsyncPostGraph:
                     target_table=from_table,
                     target_id=str(from_id_int),
                     edge_tables=cycle_tables,
-                    conn=conn
+                    conn=conn,
                 )
                 if path:
                     from post_graph.errors import CyclicReferenceError
+
                     raise CyclicReferenceError(
                         f"Adding edge '{e_id_str}' from '{from_id}' to '{to_id}' would create a cyclic reference. "
                         f"Existing path: {' -> '.join(path['path'])}"
@@ -2644,7 +3493,16 @@ class AsyncPostGraph:
                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::vector)
                 RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
                 """
-                args = (realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json, vec_str)
+                args = (
+                    realm,
+                    e_id_int,
+                    eff_space,
+                    from_id_int,
+                    to_id_int,
+                    relation_type,
+                    payload_json,
+                    vec_str,
+                )
             else:
                 if vec_str and not has_emb:
                     logger.warning(
@@ -2656,7 +3514,15 @@ class AsyncPostGraph:
                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
                 RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
                 """
-                args = (realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json)
+                args = (
+                    realm,
+                    e_id_int,
+                    eff_space,
+                    from_id_int,
+                    to_id_int,
+                    relation_type,
+                    payload_json,
+                )
 
             try:
                 row = await conn.fetchrow(query, *args)
@@ -2665,30 +3531,36 @@ class AsyncPostGraph:
                         f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"
                     )
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 return Edge(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    fqid=row['fqid'],
-                    from_id=str(row['from_id']),
-                    to_id=str(row['to_id']),
-                    relation_type=row['relation_type'],
-                    space=row.get('space') or 'default',
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    fqid=row["fqid"],
+                    from_id=str(row["from_id"]),
+                    to_id=str(row["to_id"]),
+                    relation_type=row["relation_type"],
+                    space=row.get("space") or "default",
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
                     embedding=emb,
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
-            except asyncpg.UniqueViolationError:
-                raise TableExistsError(
-                    f"Edge with ID '{e_id_str}' already exists in table '{table_name}' under realm '{realm}'."
-                )
+            except asyncpg.UniqueViolationError as e:
+                raise self._unique_error(
+                    e, kind="Edge", record_id=e_id_str, table_name=table_name, realm=realm
+                ) from e
             except asyncpg.ForeignKeyViolationError as e:
-                raise VertexNotFoundError(f"Foreign key violation: referenced vertices do not exist. Details: {e}")
+                raise VertexNotFoundError(
+                    f"Foreign key violation: referenced vertices do not exist. Details: {e}"
+                )
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
@@ -2707,7 +3579,7 @@ class AsyncPostGraph:
         check_cycle: Union[bool, List[str]] = False,
         space: Optional[str] = "default",
         embedding: Optional[List[float]] = None,
-        replace: bool = False
+        replace: bool = False,
     ) -> Edge:
         """Upsert an edge, merging the payload JSONB on conflict.
 
@@ -2723,7 +3595,9 @@ class AsyncPostGraph:
         """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
-            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter."
+            )
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -2731,8 +3605,7 @@ class AsyncPostGraph:
 
         # Merge by default; replace only when the caller asks. Merging cannot
         # express key removal, which is the whole reason `replace` exists.
-        payload_sql = ("EXCLUDED.payload" if replace
-                       else f"{table_ref}.payload || EXCLUDED.payload")
+        payload_sql = "EXCLUDED.payload" if replace else f"{table_ref}.payload || EXCLUDED.payload"
 
         async def _op(conn):
             nonlocal edge_id
@@ -2740,21 +3613,23 @@ class AsyncPostGraph:
             from_table = schema["from_id"]
             to_table = schema["to_id"]
 
-            table_ref_pg = f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            table_ref_pg = (
+                f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            )
             if edge_id is None:
                 seq_query = f"SELECT nextval(pg_get_serial_sequence('{table_ref_pg}', 'id'))"
                 e_id_int = await conn.fetchval(seq_query)
             else:
-                e_id_int = int(str(edge_id).split('/')[-1]) if '/' in str(edge_id) else int(edge_id)
+                e_id_int = int(str(edge_id).split("/")[-1]) if "/" in str(edge_id) else int(edge_id)
 
-            from_id_int = int(str(from_id).split('/')[-1]) if '/' in str(from_id) else int(from_id)
-            to_id_int = int(str(to_id).split('/')[-1]) if '/' in str(to_id) else int(to_id)
+            from_id_int = int(str(from_id).split("/")[-1]) if "/" in str(from_id) else int(from_id)
+            to_id_int = int(str(to_id).split("/")[-1]) if "/" in str(to_id) else int(to_id)
 
             e_id_str = str(e_id_int)
 
             if check_cycle:
                 cycle_tables = check_cycle if isinstance(check_cycle, list) else [table_name]
-                
+
                 path = await self.shortest_path(
                     realm=realm,
                     start_table=to_table,
@@ -2763,10 +3638,11 @@ class AsyncPostGraph:
                     target_id=str(from_id_int),
                     edge_tables=cycle_tables,
                     conn=conn,
-                    direction='out'
+                    direction="out",
                 )
                 if path:
                     from post_graph.errors import CyclicReferenceError
+
                     raise CyclicReferenceError(
                         f"Upserting edge '{e_id_str}' from '{from_id}' to '{to_id}' would create a cyclic reference. "
                         f"Existing path: {' -> '.join(path['path'])}"
@@ -2787,10 +3663,19 @@ class AsyncPostGraph:
                     relation_type = EXCLUDED.relation_type,
                     payload = {payload_sql},
                     embedding = EXCLUDED.embedding,
-                    updated_at = CURRENT_TIMESTAMP
+                    updated_at = clock_timestamp()
                 RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text, embedding::text AS embedding_text
                 """
-                args = (realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json, vec_str)
+                args = (
+                    realm,
+                    e_id_int,
+                    eff_space,
+                    from_id_int,
+                    to_id_int,
+                    relation_type,
+                    payload_json,
+                    vec_str,
+                )
             else:
                 if vec_str and not has_emb:
                     logger.warning(
@@ -2806,40 +3691,60 @@ class AsyncPostGraph:
                     to_id = EXCLUDED.to_id,
                     relation_type = EXCLUDED.relation_type,
                     payload = {payload_sql},
-                    updated_at = CURRENT_TIMESTAMP
+                    updated_at = clock_timestamp()
                 RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
                 """
-                args = (realm, e_id_int, eff_space, from_id_int, to_id_int, relation_type, payload_json)
+                args = (
+                    realm,
+                    e_id_int,
+                    eff_space,
+                    from_id_int,
+                    to_id_int,
+                    relation_type,
+                    payload_json,
+                )
 
             try:
                 row = await conn.fetchrow(query, *args)
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 return Edge(
                     embedding=emb,
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    fqid=row['fqid'],
-                    from_id=str(row['from_id']),
-                    to_id=str(row['to_id']),
-                    relation_type=row['relation_type'],
-                    space=row.get('space') or 'default',
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    fqid=row["fqid"],
+                    from_id=str(row["from_id"]),
+                    to_id=str(row["to_id"]),
+                    relation_type=row["relation_type"],
+                    space=row.get("space") or "default",
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
+            except asyncpg.UniqueViolationError as e:
+                raise self._unique_error(
+                    e, kind="Edge", record_id=None, table_name=table_name, realm=realm
+                ) from e
             except asyncpg.ForeignKeyViolationError as e:
-                raise VertexNotFoundError(f"Foreign key violation: referenced vertices do not exist. Details: {e}")
+                raise VertexNotFoundError(
+                    f"Foreign key violation: referenced vertices do not exist. Details: {e}"
+                )
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
         return await self._run_in_tx(_op, user_id)
 
-    async def get_edge(self, table_name: str, realm: str, edge_id: str, strict: bool = False) -> Optional[Edge]:
+    async def get_edge(
+        self, table_name: str, realm: str, edge_id: str, strict: bool = False
+    ) -> Optional[Edge]:
         """Fetch an edge by realm and id or uuid.
 
         When *strict* is True, raises EdgeNotFoundError instead of returning None.
@@ -2847,10 +3752,12 @@ class AsyncPostGraph:
         self._validate_identifier(table_name)
         e_str = str(edge_id).strip()
 
-        if len(e_str) == 36 and '-' in e_str:
+        if len(e_str) == 36 and "-" in e_str:
             result = await self.get_edge_by_uuid(table_name, realm, e_str)
             if strict and result is None:
-                raise EdgeNotFoundError(f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'.")
+                raise EdgeNotFoundError(
+                    f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'."
+                )
             return result
 
         table_ref = self._get_table_ref(table_name, realm)
@@ -2864,27 +3771,33 @@ class AsyncPostGraph:
             if not row:
                 result = await self.get_edge_by_uuid(table_name, realm, e_str)
                 if strict and result is None:
-                    raise EdgeNotFoundError(f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'.")
+                    raise EdgeNotFoundError(
+                        f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'."
+                    )
                 return result
             return Edge(
-                realm=row['realm'],
-                id=str(row['id']),
-                fqid=row['fqid'],
-                from_id=str(row['from_id']),
-                to_id=str(row['to_id']),
-                relation_type=row['relation_type'],
-                space=row.get('space') or 'default',
-                payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                created_at=row['created_at'],
-                updated_at=row['updated_at'],
+                realm=row["realm"],
+                id=str(row["id"]),
+                fqid=row["fqid"],
+                from_id=str(row["from_id"]),
+                to_id=str(row["to_id"]),
+                relation_type=row["relation_type"],
+                space=row.get("space") or "default",
+                payload=row["payload"]
+                if isinstance(row["payload"], dict)
+                else json.loads(row["payload"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
                 table_name=table_name,
-                uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                _client=self
+                uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                _client=self,
             )
         except asyncpg.UndefinedTableError:
             raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
-    async def get_edge_by_uuid(self, table_name: str, realm: str, uuid: str, strict: bool = False) -> Optional[Edge]:
+    async def get_edge_by_uuid(
+        self, table_name: str, realm: str, uuid: str, strict: bool = False
+    ) -> Optional[Edge]:
         """Fetch an edge record by its UUID.
 
         When *strict* is True, raises EdgeNotFoundError instead of returning None.
@@ -2901,28 +3814,34 @@ class AsyncPostGraph:
             row = await self._fetchrow(query, realm, uuid_str)
             if not row:
                 if strict:
-                    raise EdgeNotFoundError(f"Edge with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'.")
+                    raise EdgeNotFoundError(
+                        f"Edge with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'."
+                    )
                 return None
             return Edge(
-                realm=row['realm'],
-                id=str(row['id']),
-                fqid=row['fqid'],
-                from_id=str(row['from_id']),
-                to_id=str(row['to_id']),
-                relation_type=row['relation_type'],
-                space=row.get('space') or 'default',
-                payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                created_at=row['created_at'],
-                updated_at=row['updated_at'],
+                realm=row["realm"],
+                id=str(row["id"]),
+                fqid=row["fqid"],
+                from_id=str(row["from_id"]),
+                to_id=str(row["to_id"]),
+                relation_type=row["relation_type"],
+                space=row.get("space") or "default",
+                payload=row["payload"]
+                if isinstance(row["payload"], dict)
+                else json.loads(row["payload"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
                 table_name=table_name,
-                uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                _client=self
+                uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                _client=self,
             )
         except asyncpg.UndefinedTableError:
             raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
         except (asyncpg.DataError, asyncpg.InvalidTextRepresentationError):
             if strict:
-                raise EdgeNotFoundError(f"Edge with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'.")
+                raise EdgeNotFoundError(
+                    f"Edge with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'."
+                )
             return None
 
     async def get_edges(
@@ -2966,24 +3885,32 @@ class AsyncPostGraph:
                 edges = []
                 for row in rows:
                     emb = None
-                    if row.get('embedding_text'):
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    edges.append(Edge(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        fqid=row['fqid'],
-                        from_id=str(row['from_id']),
-                        to_id=str(row['to_id']),
-                        relation_type=row['relation_type'],
-                        space=row.get('space') or 'default',
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if row.get("embedding_text"):
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    edges.append(
+                        Edge(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            fqid=row["fqid"],
+                            from_id=str(row["from_id"]),
+                            to_id=str(row["to_id"]),
+                            relation_type=row["relation_type"],
+                            space=row.get("space") or "default",
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return edges
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
@@ -3016,11 +3943,13 @@ class AsyncPostGraph:
                     extra = ""
                     if space and space != RESERVED_SPACE_ALL:
                         all_params.append(space)
-                        extra += f" AND (t.space = ${base+2} OR (${base+2} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+                        extra += f" AND (t.space = ${base + 2} OR (${base + 2} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
                     if relation_type:
                         all_params.append(relation_type)
                         extra += f" AND t.relation_type = ${len(all_params)}"
-                    parts.append(f"SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type, t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text, to_jsonb(t)->>'embedding' AS embedding_text FROM {tref} t WHERE t.realm = ${base+1}{extra}")
+                    parts.append(
+                        f"SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type, t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text, to_jsonb(t)->>'embedding' AS embedding_text FROM {tref} t WHERE t.realm = ${base + 1}{extra}"
+                    )
                 query = " UNION ALL ".join(parts) + " ORDER BY realm, id ASC"
                 if limit:
                     all_params.append(limit)
@@ -3054,24 +3983,32 @@ class AsyncPostGraph:
                 edges = []
                 for row in rows:
                     emb = None
-                    if row.get('embedding_text'):
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    edges.append(Edge(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        fqid=row['fqid'],
-                        from_id=str(row['from_id']),
-                        to_id=str(row['to_id']),
-                        relation_type=row['relation_type'],
-                        space=row.get('space') or 'default',
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if row.get("embedding_text"):
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    edges.append(
+                        Edge(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            fqid=row["fqid"],
+                            from_id=str(row["from_id"]),
+                            to_id=str(row["to_id"]),
+                            relation_type=row["relation_type"],
+                            space=row.get("space") or "default",
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return edges
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
@@ -3107,8 +4044,7 @@ class AsyncPostGraph:
         if order_by_column is not None:
             if order_by is not None:
                 raise PostGraphError(
-                    "Pass order_by (a payload key) or order_by_column (a real column), "
-                    "not both."
+                    "Pass order_by (a payload key) or order_by_column (a real column), not both."
                 )
             validate_order_column(order_by_column, EDGE_ORDER_COLUMNS)
         table_ref = self._get_table_ref(table_name, realm)
@@ -3164,24 +4100,32 @@ class AsyncPostGraph:
                 edges = []
                 for row in rows:
                     emb = None
-                    if row.get('embedding_text'):
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    edges.append(Edge(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        fqid=row['fqid'],
-                        from_id=str(row['from_id']),
-                        to_id=str(row['to_id']),
-                        relation_type=row['relation_type'],
-                        space=row.get('space') or 'default',
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if row.get("embedding_text"):
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    edges.append(
+                        Edge(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            fqid=row["fqid"],
+                            from_id=str(row["from_id"]),
+                            to_id=str(row["to_id"]),
+                            relation_type=row["relation_type"],
+                            space=row.get("space") or "default",
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return edges
             except asyncpg.UndefinedTableError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
@@ -3192,7 +4136,9 @@ class AsyncPostGraph:
         else:
             return await _op(self.connection)
 
-    async def delete_edge(self, table_name: str, realm: str, edge_id: str, user_id: Optional[str] = None) -> bool:
+    async def delete_edge(
+        self, table_name: str, realm: str, edge_id: str, user_id: Optional[str] = None
+    ) -> bool:
         """Delete an edge."""
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
@@ -3211,8 +4157,9 @@ class AsyncPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
-    async def drop_audit_table(self, table_name: str, realm: Optional[str] = None,
-                               user_id: Optional[str] = None) -> bool:
+    async def drop_audit_table(
+        self, table_name: str, realm: Optional[str] = None, user_id: Optional[str] = None
+    ) -> bool:
         """Drop a table's shadow audit table and stop it being written to.
 
         Deliberately a separate, explicit call rather than a side effect of
@@ -3237,18 +4184,19 @@ class AsyncPostGraph:
         self._validate_identifier(table_name)
         if self.schema_per_realm and not realm:
             raise PostGraphError(
-                "realm must be specified in schema_per_realm mode when dropping an audit table.")
+                "realm must be specified in schema_per_realm mode when dropping an audit table."
+            )
         table_ref = self._get_table_ref(table_name, realm)
         audit_table_ref = self._get_table_ref(f"{table_name}_audit", realm)
 
         async def _op(conn):
-            existed = await conn.fetchval(
-                "SELECT to_regclass($1) IS NOT NULL", audit_table_ref)
+            existed = await conn.fetchval("SELECT to_regclass($1) IS NOT NULL", audit_table_ref)
             # Drop the trigger first. Dropping the table out from under a live
             # trigger would leave every subsequent write to the base table
             # failing on a missing audit target.
             await conn.execute(
-                f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
+                f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};'
+            )
             await conn.execute(f"DROP TABLE IF EXISTS {audit_table_ref};")
             return bool(existed)
 
@@ -3256,6 +4204,7 @@ class AsyncPostGraph:
 
     async def delete_realm(self, realm: str, user_id: Optional[str] = None) -> int:
         """Delete all rows belonging to a specific realm from all graph tables (vertices, edges, and audit tables)."""
+
         async def _op(conn):
             if self.schema_per_realm:
                 query = """
@@ -3274,12 +4223,12 @@ class AsyncPostGraph:
                 """
                 rows = await conn.fetch(query)
 
-            tables = [row['table_name'] for row in rows]
-            
+            tables = [row["table_name"] for row in rows]
+
             total_deleted = 0
             for table in tables:
                 table_ref = self._get_table_ref(table, realm)
-                delete_query = f'DELETE FROM {table_ref} WHERE realm = $1'
+                delete_query = f"DELETE FROM {table_ref} WHERE realm = $1"
                 res = await conn.execute(delete_query, realm)
                 if res.startswith("DELETE "):
                     total_deleted += int(res.split(" ")[1])
@@ -3287,7 +4236,9 @@ class AsyncPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
-    async def get_edge_schema(self, edge_table: str, realm: Optional[str] = None, conn = None) -> Dict[str, str]:
+    async def get_edge_schema(
+        self, edge_table: str, realm: Optional[str] = None, conn=None
+    ) -> Dict[str, str]:
         """
         Query system catalog pg_constraint to discover referenced vertex tables
         for 'from_id' and 'to_id' keys of the edge table. Caches the schema.
@@ -3323,7 +4274,7 @@ class AsyncPostGraph:
 
         schema = {}
         for row in rows:
-            schema[row['column_name']] = row['referenced_table']
+            schema[row["column_name"]] = row["referenced_table"]
 
         if len(schema) < 2:
             raise PostGraphError(
@@ -3340,87 +4291,95 @@ class AsyncPostGraph:
         vertex_table: str,
         vertex_id: str,
         edge_tables: List[str],
-        direction: str = 'out'
+        direction: str = "out",
     ) -> List[Tuple[Vertex, Edge]]:
         """
         Get direct neighbor vertices and connecting edges.
         Returns a list of tuples: (NeighborVertex, ConnectingEdge)
         """
         self._validate_identifier(vertex_table)
-        if direction not in ('out', 'in', 'both'):
+        if direction not in ("out", "in", "both"):
             raise ValueError("Direction must be 'out', 'in', or 'both'")
 
-        v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+        v_id_int = int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
 
         results = []
         for edge_table in edge_tables:
             self._validate_identifier(edge_table)
             schema = await self.get_edge_schema(edge_table, realm=realm)
 
-            from_ref = schema['from_id']
-            to_ref = schema['to_id']
+            from_ref = schema["from_id"]
+            to_ref = schema["to_id"]
 
             queries = []
 
             # 1. Outgoing paths: from_id is the start, to_id is the neighbor
-            if direction in ('out', 'both') and from_ref == vertex_table:
+            if direction in ("out", "both") and from_ref == vertex_table:
                 edge_ref = self._get_table_ref(edge_table, realm)
                 to_ref_ref = self._get_table_ref(to_ref, realm)
-                queries.append((
-                    to_ref,
-                    f"""
+                queries.append(
+                    (
+                        to_ref,
+                        f"""
                     SELECT
                         v.id AS v_id, v.space AS v_space, v.fqid AS v_fqid, v.payload AS v_payload, v.created_at AS v_created_at, v.updated_at AS v_updated_at,
                         e.id AS e_id, e.space AS e_space, e.fqid AS e_fqid, e.from_id AS e_from, e.to_id AS e_to, e.relation_type AS e_rel, e.payload AS e_payload, e.created_at AS e_created_at, e.updated_at AS e_updated_at
                     FROM {edge_ref} e
                     JOIN {to_ref_ref} v ON e.realm = v.realm AND e.to_id = v.id
                     WHERE e.realm = $1 AND e.from_id = $2
-                    """
-                ))
+                    """,
+                    )
+                )
 
             # 2. Incoming paths: to_id is the start, from_id is the neighbor
-            if direction in ('in', 'both') and to_ref == vertex_table:
+            if direction in ("in", "both") and to_ref == vertex_table:
                 edge_ref = self._get_table_ref(edge_table, realm)
                 from_ref_ref = self._get_table_ref(from_ref, realm)
-                queries.append((
-                    from_ref,
-                    f"""
+                queries.append(
+                    (
+                        from_ref,
+                        f"""
                     SELECT
                         v.id AS v_id, v.space AS v_space, v.fqid AS v_fqid, v.payload AS v_payload, v.created_at AS v_created_at, v.updated_at AS v_updated_at,
                         e.id AS e_id, e.space AS e_space, e.fqid AS e_fqid, e.from_id AS e_from, e.to_id AS e_to, e.relation_type AS e_rel, e.payload AS e_payload, e.created_at AS e_created_at, e.updated_at AS e_updated_at
                     FROM {edge_ref} e
                     JOIN {from_ref_ref} v ON e.realm = v.realm AND e.from_id = v.id
                     WHERE e.realm = $1 AND e.to_id = $2
-                    """
-                ))
+                    """,
+                    )
+                )
 
             for neighbor_table, sql in queries:
                 rows = await self._fetch(sql, realm, v_id_int)
                 for r in rows:
                     v = Vertex(
                         realm=realm,
-                        id=str(r['v_id']),
-                        space=r.get('v_space') or 'default',
-                        fqid=r['v_fqid'],
-                        payload=r['v_payload'] if isinstance(r['v_payload'], dict) else json.loads(r['v_payload']),
-                        created_at=r['v_created_at'],
-                        updated_at=r['v_updated_at'],
+                        id=str(r["v_id"]),
+                        space=r.get("v_space") or "default",
+                        fqid=r["v_fqid"],
+                        payload=r["v_payload"]
+                        if isinstance(r["v_payload"], dict)
+                        else json.loads(r["v_payload"]),
+                        created_at=r["v_created_at"],
+                        updated_at=r["v_updated_at"],
                         table_name=neighbor_table,
-                        _client=self
+                        _client=self,
                     )
                     e = Edge(
                         realm=realm,
-                        id=str(r['e_id']),
-                        fqid=r['e_fqid'],
-                        from_id=str(r['e_from']),
-                        to_id=str(r['e_to']),
-                        relation_type=r['e_rel'],
-                        space=r.get('e_space') or 'default',
-                        payload=r['e_payload'] if isinstance(r['e_payload'], dict) else json.loads(r['e_payload']),
-                        created_at=r['e_created_at'],
-                        updated_at=r['e_updated_at'],
+                        id=str(r["e_id"]),
+                        fqid=r["e_fqid"],
+                        from_id=str(r["e_from"]),
+                        to_id=str(r["e_to"]),
+                        relation_type=r["e_rel"],
+                        space=r.get("e_space") or "default",
+                        payload=r["e_payload"]
+                        if isinstance(r["e_payload"], dict)
+                        else json.loads(r["e_payload"]),
+                        created_at=r["e_created_at"],
+                        updated_at=r["e_updated_at"],
                         table_name=edge_table,
-                        _client=self
+                        _client=self,
                     )
                     results.append((v, e))
 
@@ -3451,14 +4410,15 @@ class AsyncPostGraph:
         cache_key = (realm, table_name)
         if cache_key in self._promoted_cache:
             return self._promoted_cache[cache_key]
-        schema = realm if self.schema_per_realm else 'public'
+        schema = realm if self.schema_per_realm else "public"
         rows = await self._fetch(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = $1 AND table_name = $2 "
             "AND (column_name LIKE 'pt\\_%' OR column_name LIKE 'p\\_%')",
-            schema, table_name,
+            schema,
+            table_name,
         )
-        cols = {r['column_name'] for r in rows}
+        cols = {r["column_name"] for r in rows}
         self._promoted_cache[cache_key] = cols
         return cols
 
@@ -3533,13 +4493,13 @@ class AsyncPostGraph:
         start_id: str,
         edge_tables: List[str],
         max_depth: int = 3,
-        direction: str = 'out',
+        direction: str = "out",
         relation_types: Optional[List[str]] = None,
         as_of: Optional[str] = None,
         payload_null_keys: Optional[List[str]] = None,
         space: Optional[str] = None,
-        valid_from_key: str = 'valid_from',
-        valid_to_key: str = 'valid_to',
+        valid_from_key: str = "valid_from",
+        valid_to_key: str = "valid_to",
     ) -> List[Dict[str, Any]]:
         """
         Perform a dynamic graph traversal starting from (start_table, start_id)
@@ -3559,10 +4519,10 @@ class AsyncPostGraph:
                              vertex will still wander into other tenants' data.
         """
         self._validate_identifier(start_table)
-        if direction not in ('out', 'in', 'both'):
+        if direction not in ("out", "in", "both"):
             raise ValueError("Direction must be 'out', 'in', or 'both'")
 
-        start_id_str = str(start_id).split('/')[-1] if '/' in str(start_id) else str(start_id)
+        start_id_str = str(start_id).split("/")[-1] if "/" in str(start_id) else str(start_id)
 
         # One filter fragment is shared by every edge table in the walk, so a
         # promoted column may only be used when *all* of them have it. Mixed
@@ -3574,19 +4534,24 @@ class AsyncPostGraph:
 
         # $1..$4 are realm, start id, start table and depth; filters follow.
         filter_sql, filter_params = self._edge_filter_sql(
-            relation_types, as_of, payload_null_keys, space,
-            valid_from_key, valid_to_key, first_param=5,
+            relation_types,
+            as_of,
+            payload_null_keys,
+            space,
+            valid_from_key,
+            valid_to_key,
+            first_param=5,
             promoted_columns=promoted_columns,
         )
 
         subqueries = []
         for edge_table in edge_tables:
             schema = await self.get_edge_schema(edge_table, realm=realm)
-            from_ref = schema['from_id']
-            to_ref = schema['to_id']
+            from_ref = schema["from_id"]
+            to_ref = schema["to_id"]
             edge_ref = self._get_table_ref(edge_table, realm)
 
-            if direction in ('out', 'both'):
+            if direction in ("out", "both"):
                 subqueries.append(f"""
                 SELECT 
                     to_id::text AS next_id, 
@@ -3599,7 +4564,7 @@ class AsyncPostGraph:
                 WHERE realm = $1 AND from_id = (CASE WHEN t.current_id ~ '^[0-9]+$' THEN t.current_id::bigint ELSE NULL END) AND t.current_table = '{from_ref}'{filter_sql}
                 """)
 
-            if direction in ('in', 'both'):
+            if direction in ("in", "both"):
                 subqueries.append(f"""
                 SELECT 
                     from_id::text AS next_id, 
@@ -3648,16 +4613,18 @@ class AsyncPostGraph:
         SELECT current_id, current_table, depth, path, edge_path, edge_ids FROM graph_traversal;
         """
 
-        rows = await self._fetch(cte_query, realm, start_id_str, start_table, max_depth, *filter_params)
+        rows = await self._fetch(
+            cte_query, realm, start_id_str, start_table, max_depth, *filter_params
+        )
 
         return [
             {
-                'id': row['current_id'],
-                'table_name': row['current_table'],
-                'depth': row['depth'],
-                'path': row['path'],
-                'edge_path': row['edge_path'],
-                'edge_ids': row['edge_ids']
+                "id": row["current_id"],
+                "table_name": row["current_table"],
+                "depth": row["depth"],
+                "path": row["path"],
+                "edge_path": row["edge_path"],
+                "edge_ids": row["edge_ids"],
             }
             for row in rows
         ]
@@ -3671,8 +4638,8 @@ class AsyncPostGraph:
         target_id: str,
         edge_tables: List[str],
         max_depth: int = 5,
-        direction: str = 'out',
-        conn = None
+        direction: str = "out",
+        conn=None,
     ) -> Optional[Dict[str, Any]]:
         """
         Find shortest path from (start_table, start_id) to (target_table, target_id)
@@ -3680,20 +4647,20 @@ class AsyncPostGraph:
         """
         self._validate_identifier(start_table)
         self._validate_identifier(target_table)
-        if direction not in ('out', 'in', 'both'):
+        if direction not in ("out", "in", "both"):
             raise ValueError("Direction must be 'out', 'in', or 'both'")
 
-        start_id_str = str(start_id).split('/')[-1] if '/' in str(start_id) else str(start_id)
-        target_id_str = str(target_id).split('/')[-1] if '/' in str(target_id) else str(target_id)
+        start_id_str = str(start_id).split("/")[-1] if "/" in str(start_id) else str(start_id)
+        target_id_str = str(target_id).split("/")[-1] if "/" in str(target_id) else str(target_id)
 
         subqueries = []
         for edge_table in edge_tables:
             schema = await self.get_edge_schema(edge_table, realm=realm)
-            from_ref = schema['from_id']
-            to_ref = schema['to_id']
+            from_ref = schema["from_id"]
+            to_ref = schema["to_id"]
             edge_ref = self._get_table_ref(edge_table, realm)
 
-            if direction in ('out', 'both'):
+            if direction in ("out", "both"):
                 subqueries.append(f"""
                 SELECT 
                     to_id::text AS next_id, 
@@ -3705,7 +4672,7 @@ class AsyncPostGraph:
                 WHERE realm = $1 AND from_id = (CASE WHEN t.current_id ~ '^[0-9]+$' THEN t.current_id::bigint ELSE NULL END) AND t.current_table = '{from_ref}'
                 """)
 
-            if direction in ('in', 'both'):
+            if direction in ("in", "both"):
                 subqueries.append(f"""
                 SELECT 
                     from_id::text AS next_id, 
@@ -3759,18 +4726,22 @@ class AsyncPostGraph:
         """
 
         if conn:
-            row = await conn.fetchrow(cte_query, realm, start_id_str, start_table, max_depth, target_id_str, target_table)
+            row = await conn.fetchrow(
+                cte_query, realm, start_id_str, start_table, max_depth, target_id_str, target_table
+            )
         else:
-            row = await self._fetchrow(cte_query, realm, start_id_str, start_table, max_depth, target_id_str, target_table)
-            
+            row = await self._fetchrow(
+                cte_query, realm, start_id_str, start_table, max_depth, target_id_str, target_table
+            )
+
         if not row:
             return None
 
         return {
-            'depth': row['depth'],
-            'path': row['path'],
-            'edge_path': row['edge_path'],
-            'edge_ids': row['edge_ids']
+            "depth": row["depth"],
+            "path": row["path"],
+            "edge_path": row["edge_path"],
+            "edge_ids": row["edge_ids"],
         }
 
     async def connected_components(
@@ -3962,8 +4933,13 @@ class AsyncPostGraph:
 
         async def _op(conn):
             row = await conn.fetchrow(
-                cte_query, realm, start_id_str, start_table,
-                max_depth, target_id_str, target_table,
+                cte_query,
+                realm,
+                start_id_str,
+                start_table,
+                max_depth,
+                target_id_str,
+                target_table,
             )
             if not row:
                 return None
@@ -3989,11 +4965,11 @@ class AsyncPostGraph:
         payload: Dict[str, Any],
         timestamp: Optional[Any] = None,
         embedding: Optional[List[float]] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
     ) -> DataRecord:
         """Append a historical record to {table_name}_data table for a vertex."""
         self._validate_identifier(table_name)
-        v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+        v_id_int = int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
         payload_json = json.dumps(payload or {})
         data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
         # RETURNING can only name the target table unqualified: PostgreSQL
@@ -4007,9 +4983,22 @@ class AsyncPostGraph:
             if vec_str:
                 data_t_name = f"{table_name}_data"
                 if self.schema_per_realm:
-                    has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'", realm, data_t_name) is not None
+                    has_emb = (
+                        await conn.fetchval(
+                            "SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = 'embedding'",
+                            realm,
+                            data_t_name,
+                        )
+                        is not None
+                    )
                 else:
-                    has_emb = await conn.fetchval("SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'", data_t_name) is not None
+                    has_emb = (
+                        await conn.fetchval(
+                            "SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'",
+                            data_t_name,
+                        )
+                        is not None
+                    )
 
             if vec_str and not has_emb:
                 logger.warning(
@@ -4024,7 +5013,9 @@ class AsyncPostGraph:
                     VALUES ($1, $2, $3::jsonb, $4, $5::vector)
                     RETURNING data_id, realm, id, payload, timestamp, to_jsonb({data_table_bare})->>'embedding' AS embedding_text
                     """
-                    row = await conn.fetchrow(query, realm, v_id_int, payload_json, timestamp, vec_str)
+                    row = await conn.fetchrow(
+                        query, realm, v_id_int, payload_json, timestamp, vec_str
+                    )
                 else:
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload, embedding)
@@ -4049,30 +5040,28 @@ class AsyncPostGraph:
                     row = await conn.fetchrow(query, realm, v_id_int, payload_json)
 
             emb = None
-            if 'embedding_text' in row and row['embedding_text']:
-                emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+            if "embedding_text" in row and row["embedding_text"]:
+                emb = [float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()]
 
             return DataRecord(
-                data_id=str(row['data_id']),
-                realm=row['realm'],
-                id=str(row['id']),
-                payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                timestamp=row['timestamp'],
-                embedding=emb
+                data_id=str(row["data_id"]),
+                realm=row["realm"],
+                id=str(row["id"]),
+                payload=row["payload"]
+                if isinstance(row["payload"], dict)
+                else json.loads(row["payload"]),
+                timestamp=row["timestamp"],
+                embedding=emb,
             )
 
         return await self._run_in_tx(_op, user_id)
 
     async def get_vertex_data(
-        self,
-        table_name: str,
-        realm: str,
-        vertex_id: Union[str, int],
-        limit: Optional[int] = None
+        self, table_name: str, realm: str, vertex_id: Union[str, int], limit: Optional[int] = None
     ) -> List[DataRecord]:
         """Fetch append-only data records for a vertex sorted by timestamp descending."""
         self._validate_identifier(table_name)
-        v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+        v_id_int = int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
         data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
 
         limit_clause = f"LIMIT {limit}" if limit and limit > 0 else ""
@@ -4087,35 +5076,31 @@ class AsyncPostGraph:
         results = []
         for r in rows:
             emb = None
-            if 'embedding_text' in r and r['embedding_text']:
-                emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+            if "embedding_text" in r and r["embedding_text"]:
+                emb = [float(x) for x in r["embedding_text"].strip("[]").split(",") if x.strip()]
             results.append(
                 DataRecord(
-                    data_id=str(r['data_id']),
-                    realm=r['realm'],
-                    id=str(r['id']),
-                    payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
-                    timestamp=r['timestamp'],
-                    embedding=emb
+                    data_id=str(r["data_id"]),
+                    realm=r["realm"],
+                    id=str(r["id"]),
+                    payload=r["payload"]
+                    if isinstance(r["payload"], dict)
+                    else json.loads(r["payload"]),
+                    timestamp=r["timestamp"],
+                    embedding=emb,
                 )
             )
         return results
 
     async def get_latest_vertex_data(
-        self,
-        table_name: str,
-        realm: str,
-        vertex_id: Union[str, int]
+        self, table_name: str, realm: str, vertex_id: Union[str, int]
     ) -> Optional[DataRecord]:
         """Fetch the latest append-only data record (version) for a vertex."""
         records = await self.get_vertex_data(table_name, realm, vertex_id, limit=1)
         return records[0] if records else None
 
     async def get_vertex_data_by_id(
-        self,
-        table_name: str,
-        realm: str,
-        data_id: Union[str, int]
+        self, table_name: str, realm: str, data_id: Union[str, int]
     ) -> Optional[DataRecord]:
         """Query a specific data entry / version by its sequential data_id."""
         self._validate_identifier(table_name)
@@ -4132,15 +5117,15 @@ class AsyncPostGraph:
             return None
         r = rows[0]
         emb = None
-        if 'embedding_text' in r and r['embedding_text']:
-            emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+        if "embedding_text" in r and r["embedding_text"]:
+            emb = [float(x) for x in r["embedding_text"].strip("[]").split(",") if x.strip()]
         return DataRecord(
-            data_id=str(r['data_id']),
-            realm=r['realm'],
-            id=str(r['id']),
-            payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
-            timestamp=r['timestamp'],
-            embedding=emb
+            data_id=str(r["data_id"]),
+            realm=r["realm"],
+            id=str(r["id"]),
+            payload=r["payload"] if isinstance(r["payload"], dict) else json.loads(r["payload"]),
+            timestamp=r["timestamp"],
+            embedding=emb,
         )
 
     async def add_edge_data(
@@ -4151,36 +5136,33 @@ class AsyncPostGraph:
         payload: Dict[str, Any],
         timestamp: Optional[Any] = None,
         embedding: Optional[List[float]] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
     ) -> DataRecord:
         """Append a historical record to {table_name}_data table for an edge."""
-        return await self.add_vertex_data(table_name, realm, edge_id, payload, timestamp=timestamp, embedding=embedding, user_id=user_id)
+        return await self.add_vertex_data(
+            table_name,
+            realm,
+            edge_id,
+            payload,
+            timestamp=timestamp,
+            embedding=embedding,
+            user_id=user_id,
+        )
 
     async def get_edge_data(
-        self,
-        table_name: str,
-        realm: str,
-        edge_id: Union[str, int],
-        limit: Optional[int] = None
+        self, table_name: str, realm: str, edge_id: Union[str, int], limit: Optional[int] = None
     ) -> List[DataRecord]:
         """Fetch append-only data records for an edge sorted by timestamp descending."""
         return await self.get_vertex_data(table_name, realm, edge_id, limit=limit)
 
     async def get_latest_edge_data(
-        self,
-        table_name: str,
-        realm: str,
-        edge_id: Union[str, int]
+        self, table_name: str, realm: str, edge_id: Union[str, int]
     ) -> Optional[DataRecord]:
         """Fetch the latest append-only data record for an edge."""
         return await self.get_latest_vertex_data(table_name, realm, edge_id)
 
     async def get_edge_data_by_id(
-        self,
-        table_name: str,
-        realm: str,
-        data_id: Union[str, int]
+        self, table_name: str, realm: str, data_id: Union[str, int]
     ) -> Optional[DataRecord]:
         """Query a specific data entry by its sequential data_id for an edge."""
         return await self.get_vertex_data_by_id(table_name, realm, data_id)
-

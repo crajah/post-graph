@@ -3,7 +3,10 @@ import json
 import logging
 import random
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import text
 from sqlalchemy.exc import DataError, DBAPIError, IntegrityError, ProgrammingError
@@ -18,11 +21,14 @@ from post_graph._query import (
     advisory_key,
     validate_order_column,
 )
+from post_graph._shared import SharedLogic
 from post_graph.errors import (
+    CommitFailedError,
+    ConcurrentModificationError,
     EdgeNotFoundError,
+    NestedTransactionError,
     PostGraphError,
     ReservedSpaceError,
-    TableExistsError,
     TableNotFoundError,
     VertexNotFoundError,
 )
@@ -33,12 +39,22 @@ logger = logging.getLogger("post_graph")
 RESERVED_SPACE_ALL = "__all__"
 
 
-class SQLAlchemyPostGraph:
-    def __init__(self, engine_or_connection: Union[AsyncEngine, AsyncConnection], schema_per_realm: bool = False):
+class SQLAlchemyPostGraph(SharedLogic):
+    def __init__(
+        self,
+        engine_or_connection: Union[AsyncEngine, AsyncConnection],
+        schema_per_realm: bool = False,
+    ):
         self.engine_or_connection = engine_or_connection
         self.schema_per_realm = schema_per_realm
         self._schema_cache = {}
         self._promoted_cache = {}
+        # Set on the client transaction() yields: the actor every call in the
+        # block is attributed to unless it names its own, and the marker that
+        # makes a nested transaction() refuse.
+        self._tx_user_id: Optional[str] = None
+        # Set when that block exits, so a reference kept past it fails loudly.
+        self._poisoned = False
 
     @classmethod
     def from_dsn(
@@ -86,8 +102,10 @@ class SQLAlchemyPostGraph:
         """Ensure identifiers are safe and valid to prevent SQL injection."""
         if not identifier or not isinstance(identifier, str):
             raise ValueError("Identifier must be a non-empty string.")
-        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', identifier):
-            raise ValueError(f"Invalid identifier name: '{identifier}'. Only alphanumeric characters and underscores are allowed.")
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", identifier):
+            raise ValueError(
+                f"Invalid identifier name: '{identifier}'. Only alphanumeric characters and underscores are allowed."
+            )
 
     @staticmethod
     def _prepare_filters(filters):
@@ -127,8 +145,7 @@ class SQLAlchemyPostGraph:
         """
         if not isinstance(key, str) or not cls._PAYLOAD_KEY_RE.match(key):
             raise ValueError(
-                f"Invalid payload key: {key!r}. Allowed: letters, digits, "
-                f"underscore, dot and dash."
+                f"Invalid payload key: {key!r}. Allowed: letters, digits, underscore, dot and dash."
             )
         return key
 
@@ -165,9 +182,15 @@ class SQLAlchemyPostGraph:
                 names = []
                 for j, v in enumerate(value):
                     pname = f"w{n}_{j}"
-                    params[pname] = (float(v) if numeric else
-                                     "true" if v is True else
-                                     "false" if v is False else str(v))
+                    params[pname] = (
+                        float(v)
+                        if numeric
+                        else "true"
+                        if v is True
+                        else "false"
+                        if v is False
+                        else str(v)
+                    )
                     names.append(f"CAST(:{pname} AS numeric)" if numeric else f":{pname}")
                 if numeric:
                     sql += f" AND ({accessor})::numeric IN ({', '.join(names)})"
@@ -178,15 +201,17 @@ class SQLAlchemyPostGraph:
                 if value is None:
                     raise ValueError(
                         f"({key!r}, {op!r}, None): comparisons with None are "
-                        f"ambiguous; use the 'is_null' / 'not_null' ops.")
+                        f"ambiguous; use the 'is_null' / 'not_null' ops."
+                    )
                 pname = f"w{n}"
                 if cls._where_value_is_numeric(value):
                     params[pname] = value
                     sql += f" AND ({accessor})::numeric {op} CAST(:{pname} AS numeric)"
                     numeric_keys.add(key)
                 else:
-                    params[pname] = ("true" if value is True else
-                                     "false" if value is False else str(value))
+                    params[pname] = (
+                        "true" if value is True else "false" if value is False else str(value)
+                    )
                     sql += f" AND {accessor} {op} :{pname}"
         return sql, numeric_keys
 
@@ -194,7 +219,9 @@ class SQLAlchemyPostGraph:
         """Construct table reference string based on schema_per_realm setting."""
         if self.schema_per_realm:
             if not realm:
-                raise PostGraphError("realm must be specified when schema_per_realm mode is enabled.")
+                raise PostGraphError(
+                    "realm must be specified when schema_per_realm mode is enabled."
+                )
             self._validate_identifier(realm)
             return f'"{realm}"."{table_name}"'
         else:
@@ -210,7 +237,9 @@ class SQLAlchemyPostGraph:
         rows = result.mappings().all()
         return [dict(r) for r in rows]
 
-    async def fetchrow(self, conn: AsyncConnection, query_str: str, **params) -> Optional[Dict[str, Any]]:
+    async def fetchrow(
+        self, conn: AsyncConnection, query_str: str, **params
+    ) -> Optional[Dict[str, Any]]:
         """Execute a SQL query and return the first row as a dict."""
         result = await conn.execute(text(query_str), params)
         row = result.mappings().first()
@@ -222,9 +251,17 @@ class SQLAlchemyPostGraph:
     _fetchrow = fetchrow
 
     #: Statements that have a transactional path and must not take this one.
-    _TRANSACTIONAL_STATEMENTS = frozenset({
-        "insert", "update", "delete", "merge", "copy", "truncate", "with",
-    })
+    _TRANSACTIONAL_STATEMENTS = frozenset(
+        {
+            "insert",
+            "update",
+            "delete",
+            "merge",
+            "copy",
+            "truncate",
+            "with",
+        }
+    )
 
     async def execute_outside_transaction(self, statement: str) -> None:
         """Run one statement with no transaction around it.
@@ -289,16 +326,49 @@ class SQLAlchemyPostGraph:
         async with autocommit.connect() as conn:
             await conn.execute(text(statement))
 
+    @property
+    def _bound(self) -> bool:
+        """Whether this client holds a connection rather than an engine.
+
+        Also the choke point for the poison check. The read paths here
+        dispatch on this rather than through ``_run_in_tx`` or ``_provision``,
+        so a client stashed past its ``transaction()`` block otherwise reached
+        a closed connection and SQLAlchemy reported it as
+        ``ResourceClosedError`` -- true, and not the mistake that was made.
+        Putting the check where the connection is chosen is the one place it
+        cannot be forgotten.
+        """
+        self._assert_usable()
+        return isinstance(self.engine_or_connection, AsyncConnection)
+
+    def _assert_usable(self) -> None:
+        """Refuse a client whose transaction() block has already exited."""
+        if self._poisoned:
+            raise PostGraphError(
+                "This client was yielded by transaction() and that block has "
+                "exited. Its connection is closed or back in the pool, so a "
+                "write here would land outside any transaction. Use the "
+                "client the block was opened on."
+            )
+
     async def _run_in_tx(self, func, user_id: Optional[str] = None):
         """Helper to run a function block within a transaction and optional audit user context."""
+        self._assert_usable()
+        # Inside transaction(), a call that named no actor is attributed to the
+        # transaction's rather than to nobody.
+        user_id = user_id if user_id else self._tx_user_id
+
         async def _execute_block(conn):
             if user_id:
-                await conn.execute(text("SELECT set_config('app.current_user_id', :user_id, true)"), {"user_id": str(user_id)})
+                await conn.execute(
+                    text("SELECT set_config('app.current_user_id', :user_id, true)"),
+                    {"user_id": str(user_id)},
+                )
             else:
                 await conn.execute(text("SELECT set_config('app.current_user_id', '', true)"))
             return await func(conn)
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             if self.engine_or_connection.in_transaction():
                 return await _execute_block(self.engine_or_connection)
             else:
@@ -308,12 +378,16 @@ class SQLAlchemyPostGraph:
             async with self.engine_or_connection.begin() as conn:
                 return await _execute_block(conn)
 
-    async def _table_exists(self, conn: AsyncConnection, table_name: str, realm: Optional[str] = None) -> bool:
+    async def _table_exists(
+        self, conn: AsyncConnection, table_name: str, realm: Optional[str] = None
+    ) -> bool:
         """Check if a table exists in PostgreSQL catalog."""
         self._validate_identifier(table_name)
         if self.schema_per_realm:
             if not realm:
-                raise PostGraphError("realm must be specified when checking table existence in schema_per_realm mode.")
+                raise PostGraphError(
+                    "realm must be specified when checking table existence in schema_per_realm mode."
+                )
             self._validate_identifier(realm)
             query = """
             SELECT 1 
@@ -331,8 +405,9 @@ class SQLAlchemyPostGraph:
             row = await self._fetchrow(conn, query, table_name=table_name)
         return row is not None
 
-    async def _execute_ddl(self, conn: AsyncConnection, sql: str,
-                           tolerate_existing: bool = True) -> None:
+    async def _execute_ddl(
+        self, conn: AsyncConnection, sql: str, tolerate_existing: bool = True
+    ) -> None:
         """Run one provisioning statement, tolerating a concurrent creator.
 
         The savepoint is the whole point. Unlike the asyncpg client, this one
@@ -361,6 +436,11 @@ class SQLAlchemyPostGraph:
     async def _provision(self, op, attempts: int = 8):
         """Run a provisioning transaction, retrying if it deadlocks.
 
+        Also the choke point for the poison check: every read and every DDL
+        path here goes through it, so a client stashed past its
+        ``transaction()`` block fails with this library's message rather than
+        SQLAlchemy's about a closed connection.
+
         Deadlock is unavoidable when several sessions take locks on a schema, a
         trigger function and the catalog in whatever order they arrive, and it
         aborts the whole transaction rather than a single statement -- so it
@@ -369,9 +449,10 @@ class SQLAlchemyPostGraph:
         losers converge. Jitter keeps replicas from backing off in lockstep and
         deadlocking again on the retry.
         """
+        self._assert_usable()
         for attempt in range(1, max(1, attempts) + 1):
             try:
-                if isinstance(self.engine_or_connection, AsyncConnection):
+                if self._bound:
                     return await op(self.engine_or_connection)
                 async with self.engine_or_connection.begin() as conn:
                     return await op(conn)
@@ -380,12 +461,16 @@ class SQLAlchemyPostGraph:
                     # Exponential, not linear: contention scales with replica
                     # count and a linear ramp runs out of road.
                     delay = min(2.0, 0.05 * (2 ** (attempt - 1))) * (1.0 + random.random())
-                    logger.debug("Provisioning contended (attempt %d/%d), retrying in %.3fs: %s",
-                                 attempt, attempts, delay, str(e)[:120])
+                    logger.debug(
+                        "Provisioning contended (attempt %d/%d), retrying in %.3fs: %s",
+                        attempt,
+                        attempts,
+                        delay,
+                        str(e)[:120],
+                    )
                     await asyncio.sleep(delay)
                     continue
                 raise
-
 
     async def reassign_owned_to(self, role: str) -> None:
         """Give every object this role owns in the current database to *role*.
@@ -403,6 +488,324 @@ class SQLAlchemyPostGraph:
             await self._execute_ddl(conn, sql, tolerate_existing=False)
 
         await self._provision(_op)
+
+    async def purge_record_audit(self, table_name: str, realm: str, record_ids) -> int:
+        """Delete the shadow audit rows for specific records. Returns the count.
+
+        The SQLAlchemy counterpart; see the asyncpg method for why both
+        ``old_row`` and ``new_row`` have to be matched and why a missing audit
+        table is 0 rather than an error.
+        """
+        self._validate_identifier(table_name)
+        if self.schema_per_realm:
+            self._validate_identifier(realm)
+        ids = self._normalise_ids(record_ids)
+        if not ids:
+            return 0
+        audit_ref = self._get_table_ref(f"{table_name}_audit", realm)
+
+        async def _op(conn):
+            present = (
+                await conn.execute(text("SELECT to_regclass(:ref) IS NOT NULL"), {"ref": audit_ref})
+            ).scalar()
+            if not present:
+                return 0
+            result = await conn.execute(
+                text(
+                    f"DELETE FROM {audit_ref} WHERE realm = :realm AND ("
+                    f"((old_row->>'id')::bigint = ANY(:ids)) OR "
+                    f"((new_row->>'id')::bigint = ANY(:ids)))"
+                ),
+                {"realm": realm, "ids": ids},
+            )
+            return int(result.rowcount)
+
+        return await self._provision(_op)
+
+    async def realm_exists(self, realm: str) -> bool:
+        """Whether this realm exists. See the asyncpg method."""
+        self._validate_identifier(realm)
+
+        async def _op(conn):
+            if self.schema_per_realm:
+                row = (
+                    await conn.execute(
+                        text(
+                            "SELECT 1 FROM information_schema.schemata WHERE schema_name = :realm"
+                        ),
+                        {"realm": realm},
+                    )
+                ).first()
+                return row is not None
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT DISTINCT table_name FROM information_schema.columns "
+                        "WHERE column_name = 'realm' "
+                        "AND table_schema = CURRENT_SCHEMA()"
+                    )
+                )
+            ).fetchall()
+            for r in rows:
+                ref = self._get_table_ref(r[0])
+                hit = (
+                    await conn.execute(
+                        text(f"SELECT 1 FROM {ref} WHERE realm = :realm LIMIT 1"), {"realm": realm}
+                    )
+                ).first()
+                if hit is not None:
+                    return True
+            return False
+
+        return await self._provision(_op)
+
+    async def list_realms(self, *, prefix: Optional[str] = None) -> List[str]:
+        """Existing realm names, sorted. ``prefix`` matches literally."""
+
+        async def _op(conn):
+            if self.schema_per_realm:
+                sql = (
+                    "SELECT schema_name FROM information_schema.schemata "
+                    "WHERE schema_name NOT IN "
+                    "('pg_catalog', 'information_schema') "
+                    "AND schema_name NOT LIKE 'pg!_%' ESCAPE '!'"
+                )
+                params: Dict[str, Any] = {}
+                if prefix:
+                    params["prefix"] = self._like_literal(prefix) + "%"
+                    sql += " AND schema_name LIKE :prefix ESCAPE '!'"
+                rows = (await conn.execute(text(sql + " ORDER BY 1"), params)).fetchall()
+                return sorted(r[0] for r in rows)
+            tables = (
+                await conn.execute(
+                    text(
+                        "SELECT DISTINCT table_name FROM information_schema.columns "
+                        "WHERE column_name = 'realm' "
+                        "AND table_schema = CURRENT_SCHEMA()"
+                    )
+                )
+            ).fetchall()
+            found: Set[str] = set()
+            for t in tables:
+                ref = self._get_table_ref(t[0])
+                for r in (await conn.execute(text(f"SELECT DISTINCT realm FROM {ref}"))).fetchall():
+                    found.add(r[0])
+            if prefix:
+                found = {n for n in found if n.startswith(prefix)}
+            return sorted(found)
+
+        return await self._provision(_op)
+
+    async def table_exists(self, table_name: str, realm: Optional[str] = None) -> bool:
+        """Whether this relation exists. The public form of ``_table_exists``."""
+
+        async def _op(conn):
+            return await self._table_exists(conn, table_name, realm)
+
+        return await self._provision(_op)
+
+    async def drop_realm(self, realm: str, *, cascade: bool = True) -> bool:
+        """Drop this realm's schema. True if it was there. See the asyncpg method."""
+        self._validate_identifier(realm)
+        if not self.schema_per_realm:
+            raise PostGraphError(
+                "drop_realm needs schema_per_realm: without it a realm is a "
+                "column value in shared tables, not a schema, and there is "
+                "nothing to drop. Use delete_realm to remove its rows."
+            )
+        existed = await self.realm_exists(realm)
+
+        async def _op(conn):
+            await self._execute_ddl(
+                conn,
+                f'DROP SCHEMA IF EXISTS "{realm}"' + (" CASCADE" if cascade else ""),
+                tolerate_existing=False,
+            )
+
+        await self._provision(_op)
+        for cache in (self._schema_cache, self._promoted_cache):
+            for key in [k for k in cache if isinstance(k, tuple) and k and k[0] == realm]:
+                cache.pop(key, None)
+        return existed
+
+    async def tables_containing_text(
+        self,
+        needle: str,
+        *,
+        include_realms: Optional[Sequence[str]] = None,
+        exclude_realm_prefixes: Optional[Sequence[str]] = None,
+    ) -> Set[str]:
+        """``{"schema.table"}`` for every table holding *needle*.
+
+        The SQLAlchemy counterpart; see the asyncpg method. Deliberately not
+        fast: it is for tests and erasure receipts, not a request path.
+        """
+        if not isinstance(needle, str) or needle == "":
+            raise ValueError("tables_containing_text needs a non-empty needle.")
+        pattern = f"%{self._like_literal(needle)}%"
+        included = set(include_realms or ())
+        excluded = tuple(exclude_realm_prefixes or ())
+
+        async def _list(conn):
+            return (
+                await conn.execute(
+                    text(
+                        "SELECT n.nspname, c.relname FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE c.relkind IN ('r', 'p') "
+                        "AND n.nspname NOT IN ('pg_catalog', 'information_schema') "
+                        "AND n.nspname NOT LIKE 'pg!_%' ESCAPE '!' "
+                        "ORDER BY 1, 2"
+                    )
+                )
+            ).fetchall()
+
+        relations = await self._provision(_list)
+        hits: Set[str] = set()
+        for schema, table in relations:
+            if excluded and schema not in included and any(schema.startswith(p) for p in excluded):
+                continue
+            if include_realms is not None and schema not in included:
+                continue
+
+            async def _probe(conn, schema=schema, table=table):
+                return (
+                    await conn.execute(
+                        text(
+                            f'SELECT 1 FROM "{schema}"."{table}" t '
+                            f"WHERE t::text LIKE :pattern ESCAPE '!' LIMIT 1"
+                        ),
+                        {"pattern": pattern},
+                    )
+                ).first()
+
+            try:
+                found = await self._provision(_probe)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Skipping %s.%s during text scan: %s", schema, table, str(e)[:120])
+                continue
+            if found is not None:
+                hits.add(f"{schema}.{table}")
+        return hits
+
+    @staticmethod
+    async def ensure_database(
+        dsn: str, *, database: str, maintenance_database: str = "postgres"
+    ) -> str:
+        """Create *database* if it is absent; return a DSN pointing at it.
+
+        The SQLAlchemy counterpart; see the asyncpg method for the validation,
+        the deploy-herd race and why the DSN is rewritten on the way out.
+        Runs on an AUTOCOMMIT connection, since ``CREATE DATABASE`` cannot be
+        inside a transaction and SQLAlchemy opens one otherwise.
+        """
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        SQLAlchemyPostGraph._validate_database_name(database, what="database")
+        SQLAlchemyPostGraph._validate_database_name(
+            maintenance_database, what="maintenance_database"
+        )
+
+        def _with_path(target: str) -> str:
+            parsed = urlsplit(dsn)
+            return urlunsplit(parsed._replace(path=f"/{target}"))
+
+        engine = create_async_engine(_with_path(maintenance_database)).execution_options(
+            isolation_level="AUTOCOMMIT"
+        )
+        try:
+            async with engine.connect() as conn:
+                exists = (
+                    await conn.execute(
+                        text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": database}
+                    )
+                ).scalar()
+                if not exists:
+                    try:
+                        await conn.execute(text(f'CREATE DATABASE "{database}"'))
+                    except Exception as e:  # noqa: BLE001
+                        # A lost race is success: the database exists. Both
+                        # shapes it takes -- 42P04, and a unique violation on
+                        # pg_database's own index -- are concurrent creation.
+                        if not is_concurrent_creation(e):
+                            raise PostGraphError(
+                                f"ensure_database could not create {database!r}: {e}."
+                            ) from e
+                        logger.debug("Database %r created concurrently.", database)
+        except PostGraphError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise PostGraphError(
+                f"ensure_database could not reach the maintenance database "
+                f"{maintenance_database!r} in order to create {database!r}: {e}."
+            ) from e
+        finally:
+            await engine.dispose()
+        return _with_path(database)
+
+    @asynccontextmanager
+    async def transaction(
+        self, *, user_id: str, idle_in_transaction_timeout_ms: Optional[int] = None
+    ):
+        """One transaction spanning several calls; yields a client bound to it.
+
+        The SQLAlchemy counterpart; see the asyncpg method for why the actor is
+        remembered, why nesting is refused, why the timeout is ``SET LOCAL``
+        and why the yielded client is poisoned on exit.
+        """
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError(
+                "transaction() requires a non-empty user_id: it is the actor "
+                "every write in the block is attributed to."
+            )
+        if self._tx_user_id is not None:
+            raise NestedTransactionError(
+                "transaction() is already open on this client. A nested block "
+                "would be a SAVEPOINT whose exit commits nothing, so a caller "
+                "believing it had committed would be wrong with nothing to "
+                "say so. Use the client you were given."
+            )
+        ms = idle_in_transaction_timeout_ms
+        if ms is not None and (isinstance(ms, bool) or not isinstance(ms, int) or ms <= 0):
+            raise ValueError(f"idle_in_transaction_timeout_ms must be a positive int, got {ms!r}.")
+
+        target = self.engine_or_connection
+        own_connection = not isinstance(target, AsyncConnection)
+        conn = await target.connect() if own_connection else target
+        scoped = SQLAlchemyPostGraph(conn, schema_per_realm=self.schema_per_realm)
+        scoped._tx_user_id = user_id
+        scoped._schema_cache = self._schema_cache
+        scoped._promoted_cache = self._promoted_cache
+        tx = await conn.begin()
+        try:
+            if ms is not None:
+                await conn.execute(
+                    text(f"SET LOCAL idle_in_transaction_session_timeout = '{ms}ms'")
+                )
+            yield scoped
+        except BaseException:
+            try:
+                await tx.rollback()
+            except Exception as rollback_error:  # noqa: BLE001
+                logger.warning(
+                    "Rollback failed after an error in transaction(); the "
+                    "original exception is being re-raised: %s",
+                    rollback_error,
+                )
+            raise
+        else:
+            try:
+                await tx.commit()
+            except Exception as e:  # noqa: BLE001
+                raise CommitFailedError(
+                    f"The transaction body completed and COMMIT failed: {e}. "
+                    f"Any effect outside the database has happened; whether "
+                    f"the writes are durable is unknown."
+                ) from e
+        finally:
+            scoped._poisoned = True
+            if own_connection:
+                await conn.close()
 
     async def create_vertex_table(
         self,
@@ -426,7 +829,9 @@ class SQLAlchemyPostGraph:
         self._validate_identifier(table_name)
         if self.schema_per_realm:
             if not realm:
-                raise PostGraphError("realm must be specified in schema_per_realm mode when creating a table.")
+                raise PostGraphError(
+                    "realm must be specified in schema_per_realm mode when creating a table."
+                )
             self._validate_identifier(realm)
 
         table_ref = self._get_table_ref(table_name, realm)
@@ -444,7 +849,10 @@ class SQLAlchemyPostGraph:
                 await self._execute_ddl(conn, (f'CREATE SCHEMA IF NOT EXISTS "{realm}"'))
 
             # Create trigger function for updated_at
-            await self._execute_ddl(conn, (f"""
+            await self._execute_ddl(
+                conn,
+                (
+                    f"""
                 CREATE OR REPLACE FUNCTION {schema_prefix}update_modified_column()
                 RETURNS TRIGGER AS $$
                 BEGIN
@@ -452,10 +860,15 @@ class SQLAlchemyPostGraph:
                     RETURN NEW;
                 END;
                 $$ language 'plpgsql';
-            """))
+            """
+                ),
+            )
 
             # Create shared trigger function for auditing
-            await self._execute_ddl(conn, (f"""
+            await self._execute_ddl(
+                conn,
+                (
+                    f"""
                 CREATE OR REPLACE FUNCTION {schema_prefix}audit_trigger_func()
                 RETURNS TRIGGER AS $$
                 DECLARE
@@ -490,7 +903,9 @@ class SQLAlchemyPostGraph:
                     END IF;
                 END;
                 $$ LANGUAGE plpgsql;
-            """))
+            """
+                ),
+            )
 
             # 1. Create main table
             query = f"""
@@ -507,15 +922,42 @@ class SQLAlchemyPostGraph:
             );
             """
             await self._execute_ddl(conn, (query))
-            await self._execute_ddl(conn, (f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"))
-            await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);'))
-            await self._execute_ddl(conn, (f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED;"))
-            await self._execute_ddl(conn, (f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();"))
+            await self._execute_ddl(
+                conn,
+                (
+                    f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);'
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED;"
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();"
+                ),
+            )
             # Hot payload keys as generated, indexed columns; see promoted.py.
-            for _stmt in _promoted.all_column_ddl(table_ref, table_name, temporal_keys, promoted_keys):
+            for _stmt in _promoted.all_column_ddl(
+                table_ref, table_name, temporal_keys, promoted_keys
+            ):
                 await self._execute_ddl(conn, (_stmt))
             self._promoted_cache.pop((realm, table_name), None)
-            await self._execute_ddl(conn, (f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);'))
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);'
+                ),
+            )
 
             # 2. Create shadow audit table, unless the table is declared unaudited
             if audited:
@@ -546,55 +988,133 @@ class SQLAlchemyPostGraph:
             );
             """
             await self._execute_ddl(conn, (data_query))
-            await self._execute_ddl(conn, (f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"))
-            await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);'))
-            await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);'))
-            await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);'))
+            await self._execute_ddl(
+                conn,
+                (
+                    f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);'
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);'
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);'
+                ),
+            )
 
             # 4. Add vector columns. Must run after the data table exists, since the
             # embedding column is added to both the main and the data table.
             if vector_dim and vector_dim > 0:
                 try:
                     await self._execute_ddl(conn, ("CREATE EXTENSION IF NOT EXISTS vector;"))
-                    await self._execute_ddl(conn, (f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"))
-                    await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);'))
-                    await self._execute_ddl(conn, (f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"))
-                    await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);'))
+                    await self._execute_ddl(
+                        conn,
+                        (
+                            f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"
+                        ),
+                    )
+                    await self._execute_ddl(
+                        conn,
+                        (
+                            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);'
+                        ),
+                    )
+                    await self._execute_ddl(
+                        conn,
+                        (
+                            f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"
+                        ),
+                    )
+                    await self._execute_ddl(
+                        conn,
+                        (
+                            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);'
+                        ),
+                    )
                 except Exception as e:
-                    raise PostGraphError(f"Failed to initialize pgvector extension or embedding column for table '{table_name}': {e}")
+                    raise PostGraphError(
+                        f"Failed to initialize pgvector extension or embedding column for table '{table_name}': {e}"
+                    )
 
             if vector_columns:
                 try:
                     await self._execute_ddl(conn, ("CREATE EXTENSION IF NOT EXISTS vector;"))
                     for col_name, dim in vector_columns.items():
                         self._validate_identifier(col_name)
-                        await self._execute_ddl(conn, (f'ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'))
-                        await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" ON {table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'))
-                        await self._execute_ddl(conn, (f'ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'))
-                        await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_{col_name}" ON {data_table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'))
+                        await self._execute_ddl(
+                            conn,
+                            (
+                                f'ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'
+                            ),
+                        )
+                        await self._execute_ddl(
+                            conn,
+                            (
+                                f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" ON {table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'
+                            ),
+                        )
+                        await self._execute_ddl(
+                            conn,
+                            (
+                                f'ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'
+                            ),
+                        )
+                        await self._execute_ddl(
+                            conn,
+                            (
+                                f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_{col_name}" ON {data_table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'
+                            ),
+                        )
                 except Exception as e:
-                    raise PostGraphError(f"Failed to add vector columns to table '{table_name}': {e}")
+                    raise PostGraphError(
+                        f"Failed to add vector columns to table '{table_name}': {e}"
+                    )
 
-            await self._execute_ddl(conn, (f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};'))
-            await self._execute_ddl(conn, (f"""
+            await self._execute_ddl(
+                conn, (f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};')
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f"""
                 CREATE TRIGGER "update_{table_name}_modtime"
                 BEFORE UPDATE ON {table_ref}
                 FOR EACH ROW
                 EXECUTE FUNCTION {schema_prefix}update_modified_column();
-            """))
+            """
+                ),
+            )
 
             # 5. Create trigger for auditing
             # The drop runs unconditionally so that re-declaring an existing
             # table as unaudited actually stops the auditing; what it already
             # recorded is removed only by an explicit drop_audit_table call.
-            await self._execute_ddl(conn, (f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};'))
+            await self._execute_ddl(
+                conn, (f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
+            )
             if audited:
-                await self._execute_ddl(conn, (f"""
+                await self._execute_ddl(
+                    conn,
+                    (
+                        f"""
                     CREATE TRIGGER "audit_{table_name}_trigger"
                     AFTER INSERT OR UPDATE OR DELETE ON {table_ref}
                     FOR EACH ROW
                     EXECUTE FUNCTION {schema_prefix}audit_trigger_func();
-                """))
+                """
+                    ),
+                )
 
         await self._provision(_op)
 
@@ -634,7 +1154,9 @@ class SQLAlchemyPostGraph:
 
         if self.schema_per_realm:
             if not realm:
-                raise PostGraphError("realm must be specified in schema_per_realm mode when creating an edge table.")
+                raise PostGraphError(
+                    "realm must be specified in schema_per_realm mode when creating an edge table."
+                )
             self._validate_identifier(realm)
 
         table_ref = self._get_table_ref(table_name, realm)
@@ -652,9 +1174,13 @@ class SQLAlchemyPostGraph:
         async def _op(conn):
             # Check that from_vertex_table and to_vertex_table exist
             if not await self._table_exists(conn, from_vertex_table, realm=realm):
-                raise TableNotFoundError(f"Referenced from_vertex_table '{from_vertex_table}' does not exist.")
+                raise TableNotFoundError(
+                    f"Referenced from_vertex_table '{from_vertex_table}' does not exist."
+                )
             if not await self._table_exists(conn, to_vertex_table, realm=realm):
-                raise TableNotFoundError(f"Referenced to_vertex_table '{to_vertex_table}' does not exist.")
+                raise TableNotFoundError(
+                    f"Referenced to_vertex_table '{to_vertex_table}' does not exist."
+                )
 
             # 1. Create main edge table
             query = f"""
@@ -663,7 +1189,7 @@ class SQLAlchemyPostGraph:
                 id BIGSERIAL,
                 space VARCHAR(255) DEFAULT 'default' NOT NULL,
                 uuid UUID DEFAULT gen_random_uuid() NOT NULL,
-                fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{from_vertex_table}-{to_vertex_table}' || '/' || id::text) STORED NOT NULL,
+                fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED NOT NULL,
                 from_id BIGINT NOT NULL,
                 to_id BIGINT NOT NULL,
                 relation_type TEXT NOT NULL,
@@ -676,15 +1202,42 @@ class SQLAlchemyPostGraph:
             );
             """
             await self._execute_ddl(conn, (query))
-            await self._execute_ddl(conn, (f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"))
-            await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);'))
-            await self._execute_ddl(conn, (f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{from_vertex_table}-{to_vertex_table}' || '/' || id::text) STORED;"))
-            await self._execute_ddl(conn, (f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();"))
+            await self._execute_ddl(
+                conn,
+                (
+                    f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_space" ON {table_ref} (realm, space);'
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS fqid TEXT GENERATED ALWAYS AS (realm || '/' || '{table_name}' || '/' || id::text) STORED;"
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS uuid UUID DEFAULT gen_random_uuid();"
+                ),
+            )
             # Hot payload keys as generated, indexed columns; see promoted.py.
-            for _stmt in _promoted.all_column_ddl(table_ref, table_name, temporal_keys, promoted_keys):
+            for _stmt in _promoted.all_column_ddl(
+                table_ref, table_name, temporal_keys, promoted_keys
+            ):
                 await self._execute_ddl(conn, (_stmt))
             self._promoted_cache.pop((realm, table_name), None)
-            await self._execute_ddl(conn, (f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);'))
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE UNIQUE INDEX IF NOT EXISTS "idx_{table_name}_uuid" ON {table_ref} (uuid);'
+                ),
+            )
 
             # 2. Create shadow audit table, unless the table is declared unaudited
             if audited:
@@ -715,72 +1268,173 @@ class SQLAlchemyPostGraph:
             );
             """
             await self._execute_ddl(conn, (data_query))
-            await self._execute_ddl(conn, (f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"))
-            await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);'))
-            await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);'))
-            await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);'))
+            await self._execute_ddl(
+                conn,
+                (
+                    f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS space VARCHAR(255) DEFAULT 'default';"
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_space" ON {data_table_ref} (realm, space);'
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_id" ON {data_table_ref} (realm, id);'
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_payload" ON {data_table_ref} USING gin (payload);'
+                ),
+            )
 
             # 3. Create indexes
-            await self._execute_ddl(conn, (
-                f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_to" ON {table_ref} (realm, to_id);'
-            ))
-            await self._execute_ddl(conn, (
-                f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_payload" ON {table_ref} USING gin (payload);'
-            ))
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_to" ON {table_ref} (realm, to_id);'
+                ),
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_payload" ON {table_ref} USING gin (payload);'
+                ),
+            )
 
             # 3a. Add vector columns
             if vector_dim and vector_dim > 0:
                 try:
                     await self._execute_ddl(conn, ("CREATE EXTENSION IF NOT EXISTS vector;"))
-                    await self._execute_ddl(conn, (f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"))
-                    await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);'))
-                    await self._execute_ddl(conn, (f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"))
-                    await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);'))
+                    await self._execute_ddl(
+                        conn,
+                        (
+                            f"ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"
+                        ),
+                    )
+                    await self._execute_ddl(
+                        conn,
+                        (
+                            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_embedding" ON {table_ref} USING hnsw (embedding vector_cosine_ops);'
+                        ),
+                    )
+                    await self._execute_ddl(
+                        conn,
+                        (
+                            f"ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS embedding vector({vector_dim});"
+                        ),
+                    )
+                    await self._execute_ddl(
+                        conn,
+                        (
+                            f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_embedding" ON {data_table_ref} USING hnsw (embedding vector_cosine_ops);'
+                        ),
+                    )
                 except Exception as e:
-                    raise PostGraphError(f"Failed to initialize pgvector extension or embedding column for edge table '{table_name}': {e}")
+                    raise PostGraphError(
+                        f"Failed to initialize pgvector extension or embedding column for edge table '{table_name}': {e}"
+                    )
 
             if vector_columns:
                 try:
                     await self._execute_ddl(conn, ("CREATE EXTENSION IF NOT EXISTS vector;"))
                     for col_name, dim in vector_columns.items():
                         self._validate_identifier(col_name)
-                        await self._execute_ddl(conn, (f'ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'))
-                        await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" ON {table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'))
-                        await self._execute_ddl(conn, (f'ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'))
-                        await self._execute_ddl(conn, (f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_{col_name}" ON {data_table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'))
+                        await self._execute_ddl(
+                            conn,
+                            (
+                                f'ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'
+                            ),
+                        )
+                        await self._execute_ddl(
+                            conn,
+                            (
+                                f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_{col_name}" ON {table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'
+                            ),
+                        )
+                        await self._execute_ddl(
+                            conn,
+                            (
+                                f'ALTER TABLE {data_table_ref} ADD COLUMN IF NOT EXISTS "{col_name}" vector({dim});'
+                            ),
+                        )
+                        await self._execute_ddl(
+                            conn,
+                            (
+                                f'CREATE INDEX IF NOT EXISTS "idx_{table_name}_data_{col_name}" ON {data_table_ref} USING hnsw ("{col_name}" vector_cosine_ops);'
+                            ),
+                        )
                 except Exception as e:
-                    raise PostGraphError(f"Failed to add vector columns to edge table '{table_name}': {e}")
+                    raise PostGraphError(
+                        f"Failed to add vector columns to edge table '{table_name}': {e}"
+                    )
 
             # 4. Create trigger for updated_at
-            await self._execute_ddl(conn, (f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};'))
-            await self._execute_ddl(conn, (f"""
+            await self._execute_ddl(
+                conn, (f'DROP TRIGGER IF EXISTS "update_{table_name}_modtime" ON {table_ref};')
+            )
+            await self._execute_ddl(
+                conn,
+                (
+                    f"""
                 CREATE TRIGGER "update_{table_name}_modtime"
                 BEFORE UPDATE ON {table_ref}
                 FOR EACH ROW
                 EXECUTE FUNCTION {schema_prefix}update_modified_column();
-            """))
+            """
+                ),
+            )
 
             # 5. Create trigger for auditing
             # The drop runs unconditionally so that re-declaring an existing
             # table as unaudited actually stops the auditing; what it already
             # recorded is removed only by an explicit drop_audit_table call.
-            await self._execute_ddl(conn, (f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};'))
+            await self._execute_ddl(
+                conn, (f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
+            )
             if audited:
-                await self._execute_ddl(conn, (f"""
+                await self._execute_ddl(
+                    conn,
+                    (
+                        f"""
                     CREATE TRIGGER "audit_{table_name}_trigger"
                     AFTER INSERT OR UPDATE OR DELETE ON {table_ref}
                     FOR EACH ROW
                     EXECUTE FUNCTION {schema_prefix}audit_trigger_func();
-                """))
+                """
+                    ),
+                )
 
             # 6. Create custom cascade delete trigger if either boolean is True
-            await self._execute_ddl(conn, (f'DROP TRIGGER IF EXISTS "cascade_delete_trigger_{table_name}" ON {table_ref};'))
-            await self._execute_ddl(conn, (f'DROP FUNCTION IF EXISTS {schema_prefix}"cascade_delete_func_{table_name}"();'))
+            await self._execute_ddl(
+                conn,
+                (f'DROP TRIGGER IF EXISTS "cascade_delete_trigger_{table_name}" ON {table_ref};'),
+            )
+            await self._execute_ddl(
+                conn,
+                (f'DROP FUNCTION IF EXISTS {schema_prefix}"cascade_delete_func_{table_name}"();'),
+            )
             if cascade_delete_from or cascade_delete_to:
-                from_clause = f'DELETE FROM {from_vertex_ref} WHERE realm = OLD.realm AND id = OLD.from_id;' if cascade_delete_from else ''
-                to_clause = f'DELETE FROM {to_vertex_ref} WHERE realm = OLD.realm AND id = OLD.to_id;' if cascade_delete_to else ''
-                
-                await self._execute_ddl(conn, (f"""
+                from_clause = (
+                    f"DELETE FROM {from_vertex_ref} WHERE realm = OLD.realm AND id = OLD.from_id;"
+                    if cascade_delete_from
+                    else ""
+                )
+                to_clause = (
+                    f"DELETE FROM {to_vertex_ref} WHERE realm = OLD.realm AND id = OLD.to_id;"
+                    if cascade_delete_to
+                    else ""
+                )
+
+                await self._execute_ddl(
+                    conn,
+                    (
+                        f"""
                     CREATE OR REPLACE FUNCTION {schema_prefix}"cascade_delete_func_{table_name}"()
                     RETURNS TRIGGER AS $$
                     BEGIN
@@ -789,13 +1443,20 @@ class SQLAlchemyPostGraph:
                         RETURN OLD;
                     END;
                     $$ LANGUAGE plpgsql;
-                """))
-                await self._execute_ddl(conn, (f"""
+                """
+                    ),
+                )
+                await self._execute_ddl(
+                    conn,
+                    (
+                        f"""
                     CREATE TRIGGER "cascade_delete_trigger_{table_name}"
                     AFTER DELETE ON {table_ref}
                     FOR EACH ROW
                     EXECUTE FUNCTION {schema_prefix}"cascade_delete_func_{table_name}"();
-                """))
+                """
+                    ),
+                )
 
         await self._provision(_op)
 
@@ -812,12 +1473,14 @@ class SQLAlchemyPostGraph:
         embedding: Optional[List[float]] = None,
         embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
-        space: Optional[str] = "default"
+        space: Optional[str] = "default",
     ) -> Vertex:
         """Add a new vertex. Raises TableExistsError if it already exists."""
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
-            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter."
+            )
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -825,12 +1488,16 @@ class SQLAlchemyPostGraph:
 
         async def _op(conn):
             nonlocal vertex_id
-            table_ref_pg = f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            table_ref_pg = (
+                f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            )
             if vertex_id is None:
                 seq_query = f"SELECT nextval(pg_get_serial_sequence('{table_ref_pg}', 'id'))"
                 v_id_int = (await conn.execute(text(seq_query))).scalar()
             else:
-                v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+                v_id_int = (
+                    int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
+                )
 
             v_id_str = str(v_id_int)
 
@@ -840,26 +1507,39 @@ class SQLAlchemyPostGraph:
                 VALUES (:realm, :id, :space, CAST(:payload AS JSONB), CAST(:vec AS vector))
                 RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
                 """
-                kwargs = {"realm": realm, "id": v_id_int, "space": eff_space, "payload": payload_json, "vec": vec_str}
+                kwargs = {
+                    "realm": realm,
+                    "id": v_id_int,
+                    "space": eff_space,
+                    "payload": payload_json,
+                    "vec": vec_str,
+                }
             else:
                 query = f"""
                 INSERT INTO {table_ref} (realm, id, space, payload)
                 VALUES (:realm, :id, :space, CAST(:payload AS JSONB))
                 RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
                 """
-                kwargs = {"realm": realm, "id": v_id_int, "space": eff_space, "payload": payload_json}
+                kwargs = {
+                    "realm": realm,
+                    "id": v_id_int,
+                    "space": eff_space,
+                    "payload": payload_json,
+                }
 
             try:
                 row = await self._fetchrow(conn, query, **kwargs)
                 if vertex_id is not None:
                     await conn.execute(
-                        text(f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))")
+                        text(
+                            f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"
+                        )
                     )
 
                 emb_dict = None
                 if embeddings:
                     set_parts = []
-                    up_params: Dict[str, Any] = {"_emb_realm": realm, "_emb_id": row['id']}
+                    up_params: Dict[str, Any] = {"_emb_realm": realm, "_emb_id": row["id"]}
                     for i, (col_name, vec) in enumerate(embeddings.items()):
                         self._validate_identifier(col_name)
                         pname = f"_emb_v{i}"
@@ -867,33 +1547,39 @@ class SQLAlchemyPostGraph:
                         set_parts.append(f'"{col_name}" = CAST(:{pname} AS vector)')
                     if set_parts:
                         await conn.execute(
-                            text(f"UPDATE {table_ref} SET {', '.join(set_parts)} WHERE realm = :_emb_realm AND id = :_emb_id"),
+                            text(
+                                f"UPDATE {table_ref} SET {', '.join(set_parts)} WHERE realm = :_emb_realm AND id = :_emb_id"
+                            ),
                             up_params,
                         )
                         emb_dict = dict(embeddings)
 
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 return Vertex(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    space=row.get('space') or 'default',
-                    fqid=row['fqid'],
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    space=row.get("space") or "default",
+                    fqid=row["fqid"],
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
                     embedding=emb,
                     embeddings=emb_dict,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
             except IntegrityError as e:
                 if "unique" in str(e).lower() or "duplicate" in str(e).lower():
-                    raise TableExistsError(
-                        f"Vertex with ID '{v_id_str}' already exists in table '{table_name}' under realm '{realm}'."
-                    )
+                    raise self._unique_error(
+                        e, kind="Vertex", record_id=v_id_str, table_name=table_name, realm=realm
+                    ) from e
                 raise PostGraphError(f"Integrity error: {e}")
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
@@ -933,7 +1619,7 @@ class SQLAlchemyPostGraph:
                 "whose conflict is the caller's idempotency key. Use add_vertex for a "
                 "sequence-assigned id."
             )
-        v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+        v_id_int = int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
 
@@ -944,10 +1630,15 @@ class SQLAlchemyPostGraph:
                 f"ON CONFLICT DO NOTHING"
             )
             try:
-                result = await conn.execute(text(query), {
-                    "realm": realm, "id": v_id_int,
-                    "space": space, "payload": payload_json,
-                })
+                result = await conn.execute(
+                    text(query),
+                    {
+                        "realm": realm,
+                        "id": v_id_int,
+                        "space": space,
+                        "payload": payload_json,
+                    },
+                )
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
@@ -971,7 +1662,9 @@ class SQLAlchemyPostGraph:
         embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
         space: Optional[str] = "default",
-        replace: bool = False
+        replace: bool = False,
+        *,
+        expected_updated_at: Optional[datetime] = None,
     ) -> Vertex:
         """Upsert a vertex, merging the payload JSONB on conflict.
 
@@ -984,7 +1677,15 @@ class SQLAlchemyPostGraph:
         """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
-            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter."
+            )
+        if expected_updated_at is not None and vertex_id is None:
+            raise ValueError(
+                "expected_updated_at requires vertex_id: a sequence-assigned "
+                "id is a row that does not exist yet, so there is no prior "
+                "updated_at for it to have moved from."
+            )
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -992,19 +1693,25 @@ class SQLAlchemyPostGraph:
 
         # Merge by default; replace only when the caller asks. Merging cannot
         # express key removal, which is the whole reason `replace` exists.
-        payload_sql = ("EXCLUDED.payload" if replace
-                       else f"{table_ref}.payload || EXCLUDED.payload")
+        payload_sql = "EXCLUDED.payload" if replace else f"{table_ref}.payload || EXCLUDED.payload"
 
         async def _op(conn):
             nonlocal vertex_id
-            table_ref_pg = f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            table_ref_pg = (
+                f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            )
             if vertex_id is None:
                 seq_query = f"SELECT nextval(pg_get_serial_sequence('{table_ref_pg}', 'id'))"
                 v_id_int = (await conn.execute(text(seq_query))).scalar()
             else:
-                v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+                v_id_int = (
+                    int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
+                )
 
-            str(v_id_int)
+            v_id_str = str(v_id_int)
+            cas = ""
+            if expected_updated_at is not None:
+                cas = f" WHERE {table_ref}.updated_at = :_cas_ts"
 
             if vec_str:
                 query = f"""
@@ -1014,10 +1721,16 @@ class SQLAlchemyPostGraph:
                 SET space = EXCLUDED.space,
                     payload = {payload_sql},
                     embedding = EXCLUDED.embedding,
-                    updated_at = CURRENT_TIMESTAMP
+                    updated_at = clock_timestamp(){cas}
                 RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
                 """
-                kwargs = {"realm": realm, "id": v_id_int, "space": eff_space, "payload": payload_json, "vec": vec_str}
+                kwargs = {
+                    "realm": realm,
+                    "id": v_id_int,
+                    "space": eff_space,
+                    "payload": payload_json,
+                    "vec": vec_str,
+                }
             else:
                 query = f"""
                 INSERT INTO {table_ref} (realm, id, space, payload)
@@ -1025,18 +1738,35 @@ class SQLAlchemyPostGraph:
                 ON CONFLICT (realm, id) DO UPDATE
                 SET space = EXCLUDED.space,
                     payload = {payload_sql},
-                    updated_at = CURRENT_TIMESTAMP
+                    updated_at = clock_timestamp(){cas}
                 RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
                 """
-                kwargs = {"realm": realm, "id": v_id_int, "space": eff_space, "payload": payload_json}
+                kwargs = {
+                    "realm": realm,
+                    "id": v_id_int,
+                    "space": eff_space,
+                    "payload": payload_json,
+                }
+
+            if expected_updated_at is not None:
+                kwargs["_cas_ts"] = expected_updated_at
 
             try:
                 row = await self._fetchrow(conn, query, **kwargs)
+                if row is None:
+                    # The only way RETURNING yields nothing: the row existed,
+                    # so the INSERT took the conflict path, and the DO UPDATE's
+                    # WHERE rejected it.
+                    raise ConcurrentModificationError(
+                        f"Vertex '{v_id_str}' in table '{table_name}', realm "
+                        f"'{realm}' was modified since updated_at="
+                        f"{expected_updated_at!r}; the upsert was not applied."
+                    )
 
                 emb_dict = None
                 if embeddings:
                     set_parts = []
-                    up_params: Dict[str, Any] = {"_emb_realm": realm, "_emb_id": row['id']}
+                    up_params: Dict[str, Any] = {"_emb_realm": realm, "_emb_id": row["id"]}
                     for i, (col_name, vec) in enumerate(embeddings.items()):
                         self._validate_identifier(col_name)
                         pname = f"_emb_v{i}"
@@ -1044,27 +1774,33 @@ class SQLAlchemyPostGraph:
                         set_parts.append(f'"{col_name}" = CAST(:{pname} AS vector)')
                     if set_parts:
                         await conn.execute(
-                            text(f"UPDATE {table_ref} SET {', '.join(set_parts)} WHERE realm = :_emb_realm AND id = :_emb_id"),
+                            text(
+                                f"UPDATE {table_ref} SET {', '.join(set_parts)} WHERE realm = :_emb_realm AND id = :_emb_id"
+                            ),
                             up_params,
                         )
                         emb_dict = dict(embeddings)
 
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 return Vertex(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    space=row.get('space') or 'default',
-                    fqid=row['fqid'],
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    space=row.get("space") or "default",
+                    fqid=row["fqid"],
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
                     embedding=emb,
                     embeddings=emb_dict,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
@@ -1083,7 +1819,9 @@ class SQLAlchemyPostGraph:
         embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
         space: Optional[str] = None,
-        replace: bool = False
+        replace: bool = False,
+        *,
+        expected_updated_at: Optional[datetime] = None,
     ) -> Optional[Vertex]:
         """Update an existing vertex. Emits a bare UPDATE and never an INSERT.
 
@@ -1097,7 +1835,9 @@ class SQLAlchemyPostGraph:
         """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
-            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for a write. It is only valid as a query-time filter.")
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for a write. It is only valid as a query-time filter."
+            )
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -1107,9 +1847,11 @@ class SQLAlchemyPostGraph:
         payload_sql = "CAST(:payload AS JSONB)" if replace else "payload || CAST(:payload AS JSONB)"
 
         async def _op(conn):
-            v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+            v_id_int = (
+                int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
+            )
 
-            set_parts = [f"payload = {payload_sql}", "updated_at = CURRENT_TIMESTAMP"]
+            set_parts = [f"payload = {payload_sql}", "updated_at = clock_timestamp()"]
             kwargs: Dict[str, Any] = {"realm": realm, "id": v_id_int, "payload": payload_json}
 
             # None means leave the space alone, unlike upsert_vertex.
@@ -1117,7 +1859,9 @@ class SQLAlchemyPostGraph:
                 kwargs["space"] = space
                 set_parts.append("space = :space")
 
-            returning = "realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text"
+            returning = (
+                "realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text"
+            )
             if vec_str:
                 kwargs["vec"] = vec_str
                 set_parts.append("embedding = CAST(:vec AS vector)")
@@ -1132,37 +1876,70 @@ class SQLAlchemyPostGraph:
                     set_parts.append(f'"{col_name}" = CAST(:{pname} AS vector)')
                 emb_dict = dict(embeddings)
 
+            cas = ""
+            if expected_updated_at is not None:
+                kwargs["_cas_ts"] = expected_updated_at
+                cas = " AND updated_at = :_cas_ts"
+
             query = f"""
             UPDATE {table_ref}
-            SET {', '.join(set_parts)}
-            WHERE realm = :realm AND id = :id
+            SET {", ".join(set_parts)}
+            WHERE realm = :realm AND id = :id{cas}
             RETURNING {returning}
             """
             try:
                 row = await self._fetchrow(conn, query, **kwargs)
+            except IntegrityError as e:
+                if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                    raise self._unique_error(
+                        e,
+                        kind="Vertex",
+                        record_id=str(v_id_int),
+                        table_name=table_name,
+                        realm=realm,
+                    ) from e
+                raise PostGraphError(f"Integrity error: {e}")
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
                 raise PostGraphError(f"Programming error: {e}")
             if row is None:
+                if expected_updated_at is not None:
+                    # Nothing to update and somebody else updated it are
+                    # different answers; a missing row is not a lost race.
+                    still_there = await self._fetchrow(
+                        conn,
+                        f"SELECT 1 AS ok FROM {table_ref} WHERE realm = :realm AND id = :id",
+                        realm=realm,
+                        id=v_id_int,
+                    )
+                    if still_there is not None:
+                        raise ConcurrentModificationError(
+                            f"Vertex '{v_id_int}' in table '{table_name}', "
+                            f"realm '{realm}' was modified since updated_at="
+                            f"{expected_updated_at!r}; the update was not "
+                            f"applied."
+                        )
                 return None
 
             emb = None
-            if 'embedding_text' in row and row['embedding_text']:
-                emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+            if "embedding_text" in row and row["embedding_text"]:
+                emb = [float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()]
             return Vertex(
-                realm=row['realm'],
-                id=str(row['id']),
-                space=row.get('space') or 'default',
-                fqid=row['fqid'],
-                payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                created_at=row['created_at'],
-                updated_at=row['updated_at'],
+                realm=row["realm"],
+                id=str(row["id"]),
+                space=row.get("space") or "default",
+                fqid=row["fqid"],
+                payload=row["payload"]
+                if isinstance(row["payload"], dict)
+                else json.loads(row["payload"]),
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
                 table_name=table_name,
                 embedding=emb,
                 embeddings=emb_dict,
-                uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                _client=self
+                uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                _client=self,
             )
 
         return await self._run_in_tx(_op, user_id)
@@ -1223,7 +2000,9 @@ class SQLAlchemyPostGraph:
             results.append(e)
         return results
 
-    async def get_vertex(self, table_name: str, realm: str, vertex_id: str, strict: bool = False) -> Optional[Vertex]:
+    async def get_vertex(
+        self, table_name: str, realm: str, vertex_id: str, strict: bool = False
+    ) -> Optional[Vertex]:
         """Fetch a vertex by realm and id or uuid.
 
         When *strict* is True, raises VertexNotFoundError instead of returning None.
@@ -1231,18 +2010,22 @@ class SQLAlchemyPostGraph:
         self._validate_identifier(table_name)
         v_str = str(vertex_id).strip()
 
-        if len(v_str) == 36 and '-' in v_str:
+        if len(v_str) == 36 and "-" in v_str:
             result = await self.get_vertex_by_uuid(table_name, realm, v_str)
             if strict and result is None:
-                raise VertexNotFoundError(f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'.")
+                raise VertexNotFoundError(
+                    f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'."
+                )
             return result
 
         try:
-            v_id_int = int(v_str.split('/')[-1]) if '/' in v_str else int(v_str)
+            v_id_int = int(v_str.split("/")[-1]) if "/" in v_str else int(v_str)
         except ValueError:
             result = await self.get_vertex_by_uuid(table_name, realm, v_str)
             if strict and result is None:
-                raise VertexNotFoundError(f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'.")
+                raise VertexNotFoundError(
+                    f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'."
+                )
             return result
 
         table_ref = self._get_table_ref(table_name, realm)
@@ -1261,42 +2044,44 @@ class SQLAlchemyPostGraph:
                     return None
 
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
 
                 return Vertex(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    space=row.get('space') or 'default',
-                    fqid=row['fqid'],
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    space=row.get("space") or "default",
+                    fqid=row["fqid"],
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
                     embedding=emb,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
                 raise PostGraphError(f"Programming error: {e}")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             result = await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
                 result = await _op(conn)
         if strict and result is None:
-            raise VertexNotFoundError(f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'.")
+            raise VertexNotFoundError(
+                f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'."
+            )
         return result
 
     async def get_vertices(
-        self,
-        table_name: str,
-        realm: str,
-        space: Optional[str] = None,
-        limit: Optional[int] = None
+        self, table_name: str, realm: str, space: Optional[str] = None, limit: Optional[int] = None
     ) -> List[Vertex]:
         """Fetch all vertices in a realm, optionally filtered by space."""
         self._validate_identifier(table_name)
@@ -1328,26 +2113,34 @@ class SQLAlchemyPostGraph:
                 vertices = []
                 for row in rows:
                     emb = None
-                    if 'embedding_text' in row and row['embedding_text']:
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    vertices.append(Vertex(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        space=row.get('space') or 'default',
-                        fqid=row['fqid'],
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    vertices.append(
+                        Vertex(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            space=row.get("space") or "default",
+                            fqid=row["fqid"],
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return vertices
             except ProgrammingError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -1376,7 +2169,9 @@ class SQLAlchemyPostGraph:
                         sp = f"sp{i}"
                         params[sp] = space
                         space_clause = f" AND (t.space = :{sp} OR (:{sp} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
-                    parts.append(f"SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text, to_jsonb(t)->>'embedding' AS embedding_text FROM {tref} t WHERE t.realm = :{rp}{space_clause}")
+                    parts.append(
+                        f"SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text, to_jsonb(t)->>'embedding' AS embedding_text FROM {tref} t WHERE t.realm = :{rp}{space_clause}"
+                    )
                 query = " UNION ALL ".join(parts) + " ORDER BY realm, id ASC"
                 if limit:
                     params["limit"] = limit
@@ -1406,26 +2201,34 @@ class SQLAlchemyPostGraph:
                 vertices = []
                 for row in rows:
                     emb = None
-                    if 'embedding_text' in row and row['embedding_text']:
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    vertices.append(Vertex(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        space=row.get('space') or 'default',
-                        fqid=row['fqid'],
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    vertices.append(
+                        Vertex(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            space=row.get("space") or "default",
+                            fqid=row["fqid"],
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return vertices
             except ProgrammingError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -1475,8 +2278,12 @@ class SQLAlchemyPostGraph:
         writer can append here.
         """
         rows = await self.find_vertices(
-            table_name, realm=realm, space=space,
-            order_by_column="id", descending=True, limit=1,
+            table_name,
+            realm=realm,
+            space=space,
+            order_by_column="id",
+            descending=True,
+            limit=1,
         )
         return rows[0] if rows else None
 
@@ -1523,8 +2330,7 @@ class SQLAlchemyPostGraph:
         if order_by_column is not None:
             if order_by is not None:
                 raise PostGraphError(
-                    "Pass order_by (a payload key) or order_by_column (a real column), "
-                    "not both."
+                    "Pass order_by (a payload key) or order_by_column (a real column), not both."
                 )
             validate_order_column(order_by_column, VERTEX_ORDER_COLUMNS)
 
@@ -1577,32 +2383,42 @@ class SQLAlchemyPostGraph:
                 vertices = []
                 for row in rows:
                     emb = None
-                    if 'embedding_text' in row and row['embedding_text']:
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    vertices.append(Vertex(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        space=row.get('space') or 'default',
-                        fqid=row['fqid'],
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    vertices.append(
+                        Vertex(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            space=row.get("space") or "default",
+                            fqid=row["fqid"],
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return vertices
             except ProgrammingError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
                 return await _op(conn)
 
-    async def get_vertex_by_uuid(self, table_name: str, realm: str, uuid: str, strict: bool = False) -> Optional[Vertex]:
+    async def get_vertex_by_uuid(
+        self, table_name: str, realm: str, uuid: str, strict: bool = False
+    ) -> Optional[Vertex]:
         """Fetch a vertex record by its UUID.
 
         When *strict* is True, raises VertexNotFoundError instead of returning None.
@@ -1625,34 +2441,40 @@ class SQLAlchemyPostGraph:
                     return None
 
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
 
                 return Vertex(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    space=row.get('space') or 'default',
-                    fqid=row['fqid'],
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    space=row.get("space") or "default",
+                    fqid=row["fqid"],
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
                     embedding=emb,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
             except (ProgrammingError, DataError, DBAPIError) as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
                 return None
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             result = await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
                 result = await _op(conn)
         if strict and result is None:
-            raise VertexNotFoundError(f"Vertex with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'.")
+            raise VertexNotFoundError(
+                f"Vertex with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'."
+            )
         return result
 
     async def vector_search(
@@ -1752,7 +2574,8 @@ class SQLAlchemyPostGraph:
             if where:
                 raise ValueError(
                     "vector_search(where=...) is supported for the 'main' scope "
-                    "only; filtering the data/both scopes is not implemented.")
+                    "only; filtering the data/both scopes is not implemented."
+                )
             fetch_params = {"realm": realm, "vec": vec_str, "top_k": top_k}
             if effective_space:
                 fetch_params["space"] = effective_space
@@ -1769,25 +2592,29 @@ class SQLAlchemyPostGraph:
             results = []
             for r in rows:
                 emb = None
-                if r['embedding_text']:
-                    emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+                if r["embedding_text"]:
+                    emb = [
+                        float(x) for x in r["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 v = Vertex(
-                    realm=r['realm'],
-                    id=str(r['id']),
-                    space=r.get('space') or 'default',
-                    fqid=r['fqid'],
-                    payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
-                    created_at=r['created_at'],
-                    updated_at=r['updated_at'],
+                    realm=r["realm"],
+                    id=str(r["id"]),
+                    space=r.get("space") or "default",
+                    fqid=r["fqid"],
+                    payload=r["payload"]
+                    if isinstance(r["payload"], dict)
+                    else json.loads(r["payload"]),
+                    created_at=r["created_at"],
+                    updated_at=r["updated_at"],
                     table_name=table_name,
                     embedding=emb,
-                    _client=self
+                    _client=self,
                 )
-                dist = float(r['distance'])
+                dist = float(r["distance"])
                 results.append((v, dist))
             return results
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -1859,28 +2686,32 @@ class SQLAlchemyPostGraph:
             results = []
             for r in rows:
                 emb = None
-                if r['embedding_text']:
-                    emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+                if r["embedding_text"]:
+                    emb = [
+                        float(x) for x in r["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 e = Edge(
-                    realm=r['realm'],
-                    id=str(r['id']),
-                    from_id=str(r['from_id']),
-                    to_id=str(r['to_id']),
-                    relation_type=r['relation_type'],
-                    space=r.get('space') or 'default',
-                    fqid=r['fqid'],
-                    payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
+                    realm=r["realm"],
+                    id=str(r["id"]),
+                    from_id=str(r["from_id"]),
+                    to_id=str(r["to_id"]),
+                    relation_type=r["relation_type"],
+                    space=r.get("space") or "default",
+                    fqid=r["fqid"],
+                    payload=r["payload"]
+                    if isinstance(r["payload"], dict)
+                    else json.loads(r["payload"]),
                     embedding=emb,
-                    created_at=r['created_at'],
-                    updated_at=r['updated_at'],
+                    created_at=r["created_at"],
+                    updated_at=r["updated_at"],
                     table_name=table_name,
-                    uuid=str(r['uuid_text']) if r.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(r["uuid_text"]) if r.get("uuid_text") else None,
+                    _client=self,
                 )
-                results.append((e, float(r['distance'])))
+                results.append((e, float(r["distance"])))
             return results
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -1916,14 +2747,15 @@ class SQLAlchemyPostGraph:
             where_sql, _ = self._compile_where(where, params)
             clauses += where_sql
             try:
-                result = await conn.execute(text(
-                    f"SELECT COUNT(*) FROM {table_ref} t WHERE t.realm = :realm{clauses}"),
-                    params)
+                result = await conn.execute(
+                    text(f"SELECT COUNT(*) FROM {table_ref} t WHERE t.realm = :realm{clauses}"),
+                    params,
+                )
                 return int(result.scalar_one())
             except ProgrammingError:
                 raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         async with self.engine_or_connection.connect() as conn:
             return await _op(conn)
@@ -1961,14 +2793,15 @@ class SQLAlchemyPostGraph:
             where_sql, _ = self._compile_where(where, params)
             clauses += where_sql
             try:
-                result = await conn.execute(text(
-                    f"SELECT COUNT(*) FROM {table_ref} t WHERE t.realm = :realm{clauses}"),
-                    params)
+                result = await conn.execute(
+                    text(f"SELECT COUNT(*) FROM {table_ref} t WHERE t.realm = :realm{clauses}"),
+                    params,
+                )
                 return int(result.scalar_one())
             except ProgrammingError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         async with self.engine_or_connection.connect() as conn:
             return await _op(conn)
@@ -1990,7 +2823,8 @@ class SQLAlchemyPostGraph:
         if not where:
             raise ValueError(
                 "delete_vertices requires a non-empty where; to remove an "
-                "entire realm use delete_realm, which is explicit about it.")
+                "entire realm use delete_realm, which is explicit about it."
+            )
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
 
@@ -2003,9 +2837,9 @@ class SQLAlchemyPostGraph:
             where_sql, _ = self._compile_where(where, params)
             clauses += where_sql
             try:
-                res = await conn.execute(text(
-                    f"DELETE FROM {table_ref} t WHERE t.realm = :realm{clauses}"),
-                    params)
+                res = await conn.execute(
+                    text(f"DELETE FROM {table_ref} t WHERE t.realm = :realm{clauses}"), params
+                )
                 return int(res.rowcount)
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
@@ -2018,8 +2852,12 @@ class SQLAlchemyPostGraph:
         self,
         table_name: str,
         realm: str,
-        key: str,
+        key: Union[str, Sequence[str]],
         numeric: bool = False,
+        *,
+        unique: bool = False,
+        scope_by_space: bool = True,
+        index_name: Optional[str] = None,
     ) -> str:
         """Index the ``(payload->>'key')`` expression; returns the index name.
 
@@ -2029,18 +2867,42 @@ class SQLAlchemyPostGraph:
         non-numeric text under the key -- the correct time to find out.
         """
         self._validate_identifier(table_name)
-        self._validate_payload_key(key)
+        keys = self._payload_index_keys(
+            key, numeric=numeric, validate_payload_key=self._validate_payload_key
+        )
         table_ref = self._get_table_ref(table_name, realm)
-        safe = re.sub(r"[^a-z0-9_]", "_", key.lower())
-        index_name = f"idx_{table_name}_payload_{safe}" + ("_num" if numeric else "")
-        expr = (f"(((payload->>'{key}'))::numeric)" if numeric
-                else f"((payload->>'{key}'))")
+        final_name, columns = self._plan_payload_index(
+            table_name,
+            keys,
+            numeric=numeric,
+            unique=unique,
+            scope_by_space=scope_by_space,
+            index_name=index_name,
+            validate_identifier=self._validate_identifier,
+        )
+        index_name = final_name
+        unique_sql = "UNIQUE " if unique else ""
 
         async def _op(conn):
             try:
-                await conn.execute(text(
-                    f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_ref} ({expr})"))
+                await conn.execute(
+                    text(
+                        f'CREATE {unique_sql}INDEX IF NOT EXISTS "{index_name}" '
+                        f"ON {table_ref} ({', '.join(columns)})"
+                    )
+                )
                 return index_name
+            except IntegrityError as e:
+                if is_concurrent_creation(e):
+                    logger.debug("Payload index %r created concurrently.", index_name)
+                    return index_name
+                raise self._unique_error(
+                    e,
+                    kind=f"Unique index {index_name!r}",
+                    record_id=None,
+                    table_name=table_name,
+                    realm=realm,
+                ) from e
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
@@ -2057,14 +2919,16 @@ class SQLAlchemyPostGraph:
                 logger.debug("Payload index %r created concurrently.", index_name)
                 return index_name
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             name = await _op(self.engine_or_connection)
             await self.engine_or_connection.commit()
             return name
         async with self.engine_or_connection.begin() as conn:
             return await _op(conn)
 
-    async def delete_vertex(self, table_name: str, realm: str, vertex_id: str, user_id: Optional[str] = None) -> bool:
+    async def delete_vertex(
+        self, table_name: str, realm: str, vertex_id: str, user_id: Optional[str] = None
+    ) -> bool:
         """Delete a vertex. Cascading foreign keys will automatically delete referencing edges."""
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
@@ -2129,26 +2993,32 @@ class SQLAlchemyPostGraph:
                 rows = result.mappings().all()
                 vertices = []
                 for row in rows:
-                    payload = row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload'])
-                    vertices.append(Vertex(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        space=row.get('space') or 'default',
-                        fqid=row['fqid'],
-                        payload=payload,
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    payload = (
+                        row["payload"]
+                        if isinstance(row["payload"], dict)
+                        else json.loads(row["payload"])
+                    )
+                    vertices.append(
+                        Vertex(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            space=row.get("space") or "default",
+                            fqid=row["fqid"],
+                            payload=payload,
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return vertices
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
                 raise PostGraphError(f"Programming error: {e}")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -2201,29 +3071,35 @@ class SQLAlchemyPostGraph:
                 rows = result.mappings().all()
                 edges = []
                 for row in rows:
-                    payload = row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload'])
-                    edges.append(Edge(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        fqid=row['fqid'],
-                        from_id=str(row['from_id']),
-                        to_id=str(row['to_id']),
-                        relation_type=row['relation_type'],
-                        space=row.get('space') or 'default',
-                        payload=payload,
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    payload = (
+                        row["payload"]
+                        if isinstance(row["payload"], dict)
+                        else json.loads(row["payload"])
+                    )
+                    edges.append(
+                        Edge(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            fqid=row["fqid"],
+                            from_id=str(row["from_id"]),
+                            to_id=str(row["to_id"]),
+                            relation_type=row["relation_type"],
+                            space=row.get("space") or "default",
+                            payload=payload,
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return edges
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
                 raise PostGraphError(f"Programming error: {e}")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -2243,7 +3119,7 @@ class SQLAlchemyPostGraph:
         user_id: Optional[str] = None,
         check_cycle: Union[bool, List[str]] = False,
         space: Optional[str] = "default",
-        embedding: Optional[List[float]] = None
+        embedding: Optional[List[float]] = None,
     ) -> Edge:
         """Add a new edge. Raises TableExistsError if it already exists.
 
@@ -2252,7 +3128,9 @@ class SQLAlchemyPostGraph:
         """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
-            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter."
+            )
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -2264,15 +3142,17 @@ class SQLAlchemyPostGraph:
             from_table = schema["from_id"]
             to_table = schema["to_id"]
 
-            table_ref_pg = f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            table_ref_pg = (
+                f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            )
             if edge_id is None:
                 seq_query = f"SELECT nextval(pg_get_serial_sequence('{table_ref_pg}', 'id'))"
                 e_id_int = (await conn.execute(text(seq_query))).scalar()
             else:
-                e_id_int = int(str(edge_id).split('/')[-1]) if '/' in str(edge_id) else int(edge_id)
+                e_id_int = int(str(edge_id).split("/")[-1]) if "/" in str(edge_id) else int(edge_id)
 
-            from_id_int = int(str(from_id).split('/')[-1]) if '/' in str(from_id) else int(from_id)
-            to_id_int = int(str(to_id).split('/')[-1]) if '/' in str(to_id) else int(to_id)
+            from_id_int = int(str(from_id).split("/")[-1]) if "/" in str(from_id) else int(from_id)
+            to_id_int = int(str(to_id).split("/")[-1]) if "/" in str(to_id) else int(to_id)
 
             e_id_str = str(e_id_int)
 
@@ -2286,10 +3166,11 @@ class SQLAlchemyPostGraph:
                     target_table=from_table,
                     target_id=str(from_id_int),
                     edge_tables=cycle_tables,
-                    conn=conn
+                    conn=conn,
                 )
                 if path:
                     from post_graph.errors import CyclicReferenceError
+
                     raise CyclicReferenceError(
                         f"Adding edge '{e_id_str}' from '{from_id}' to '{to_id}' would create a cyclic reference. "
                         f"Existing path: {' -> '.join(path['path'])}"
@@ -2301,49 +3182,72 @@ class SQLAlchemyPostGraph:
                 VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB), CAST(:vec AS vector))
                 RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
                 """
-                kwargs = {"realm": realm, "id": e_id_int, "space": eff_space, "from_id": from_id_int,
-                          "to_id": to_id_int, "relation_type": relation_type, "payload": payload_json, "vec": vec_str}
+                kwargs = {
+                    "realm": realm,
+                    "id": e_id_int,
+                    "space": eff_space,
+                    "from_id": from_id_int,
+                    "to_id": to_id_int,
+                    "relation_type": relation_type,
+                    "payload": payload_json,
+                    "vec": vec_str,
+                }
             else:
                 query = f"""
                 INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
                 VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB))
                 RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
                 """
-                kwargs = {"realm": realm, "id": e_id_int, "space": eff_space, "from_id": from_id_int,
-                          "to_id": to_id_int, "relation_type": relation_type, "payload": payload_json}
+                kwargs = {
+                    "realm": realm,
+                    "id": e_id_int,
+                    "space": eff_space,
+                    "from_id": from_id_int,
+                    "to_id": to_id_int,
+                    "relation_type": relation_type,
+                    "payload": payload_json,
+                }
 
             try:
                 row = await self._fetchrow(conn, query, **kwargs)
                 if edge_id is not None:
                     await conn.execute(
-                        text(f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))")
+                        text(
+                            f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"
+                        )
                     )
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 return Edge(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    fqid=row['fqid'],
-                    from_id=str(row['from_id']),
-                    to_id=str(row['to_id']),
-                    relation_type=row['relation_type'],
-                    space=row.get('space') or 'default',
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    fqid=row["fqid"],
+                    from_id=str(row["from_id"]),
+                    to_id=str(row["to_id"]),
+                    relation_type=row["relation_type"],
+                    space=row.get("space") or "default",
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
                     embedding=emb,
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
             except IntegrityError as e:
                 if "unique" in str(e).lower() or "duplicate" in str(e).lower():
-                    raise TableExistsError(
-                        f"Edge with ID '{e_id_str}' already exists in table '{table_name}' under realm '{realm}'."
-                    )
+                    raise self._unique_error(
+                        e, kind="Edge", record_id=e_id_str, table_name=table_name, realm=realm
+                    ) from e
                 elif "foreign key" in str(e).lower():
-                    raise VertexNotFoundError(f"Foreign key violation: referenced vertices do not exist. Details: {e}")
+                    raise VertexNotFoundError(
+                        f"Foreign key violation: referenced vertices do not exist. Details: {e}"
+                    )
                 raise PostGraphError(f"Integrity error: {e}")
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
@@ -2365,7 +3269,7 @@ class SQLAlchemyPostGraph:
         check_cycle: Union[bool, List[str]] = False,
         space: Optional[str] = "default",
         embedding: Optional[List[float]] = None,
-        replace: bool = False
+        replace: bool = False,
     ) -> Edge:
         """Upsert an edge, merging the payload JSONB on conflict.
 
@@ -2381,7 +3285,9 @@ class SQLAlchemyPostGraph:
         """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
-            raise ReservedSpaceError(f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter.")
+            raise ReservedSpaceError(
+                f"'{RESERVED_SPACE_ALL}' is a reserved space name and cannot be used for creation. It is only valid as a query-time filter."
+            )
         payload_json = json.dumps(payload or {})
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding else None
@@ -2389,8 +3295,7 @@ class SQLAlchemyPostGraph:
 
         # Merge by default; replace only when the caller asks. Merging cannot
         # express key removal, which is the whole reason `replace` exists.
-        payload_sql = ("EXCLUDED.payload" if replace
-                       else f"{table_ref}.payload || EXCLUDED.payload")
+        payload_sql = "EXCLUDED.payload" if replace else f"{table_ref}.payload || EXCLUDED.payload"
 
         async def _op(conn):
             nonlocal edge_id
@@ -2398,15 +3303,17 @@ class SQLAlchemyPostGraph:
             from_table = schema["from_id"]
             to_table = schema["to_id"]
 
-            table_ref_pg = f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            table_ref_pg = (
+                f'"{realm}"."{table_name}"' if self.schema_per_realm else f'"{table_name}"'
+            )
             if edge_id is None:
                 seq_query = f"SELECT nextval(pg_get_serial_sequence('{table_ref_pg}', 'id'))"
                 e_id_int = (await conn.execute(text(seq_query))).scalar()
             else:
-                e_id_int = int(str(edge_id).split('/')[-1]) if '/' in str(edge_id) else int(edge_id)
+                e_id_int = int(str(edge_id).split("/")[-1]) if "/" in str(edge_id) else int(edge_id)
 
-            from_id_int = int(str(from_id).split('/')[-1]) if '/' in str(from_id) else int(from_id)
-            to_id_int = int(str(to_id).split('/')[-1]) if '/' in str(to_id) else int(to_id)
+            from_id_int = int(str(from_id).split("/")[-1]) if "/" in str(from_id) else int(from_id)
+            to_id_int = int(str(to_id).split("/")[-1]) if "/" in str(to_id) else int(to_id)
 
             str(e_id_int)
 
@@ -2421,11 +3328,14 @@ class SQLAlchemyPostGraph:
                     target_id=str(from_id_int),
                     edge_tables=cycle_tables,
                     conn=conn,
-                    direction='out'
+                    direction="out",
                 )
                 if path:
                     from post_graph.errors import CyclicReferenceError
-                    raise CyclicReferenceError(f"Adding edge from '{from_id}' to '{to_id}' in table '{table_name}' would create a cycle.")
+
+                    raise CyclicReferenceError(
+                        f"Adding edge from '{from_id}' to '{to_id}' in table '{table_name}' would create a cycle."
+                    )
 
             if vec_str:
                 query = f"""
@@ -2438,11 +3348,19 @@ class SQLAlchemyPostGraph:
                     relation_type = EXCLUDED.relation_type,
                     payload = {payload_sql},
                     embedding = EXCLUDED.embedding,
-                    updated_at = CURRENT_TIMESTAMP
+                    updated_at = clock_timestamp()
                 RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
                 """
-                kwargs = {"realm": realm, "id": e_id_int, "space": eff_space, "from_id": from_id_int,
-                          "to_id": to_id_int, "relation_type": relation_type, "payload": payload_json, "vec": vec_str}
+                kwargs = {
+                    "realm": realm,
+                    "id": e_id_int,
+                    "space": eff_space,
+                    "from_id": from_id_int,
+                    "to_id": to_id_int,
+                    "relation_type": relation_type,
+                    "payload": payload_json,
+                    "vec": vec_str,
+                }
             else:
                 query = f"""
                 INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
@@ -2453,36 +3371,55 @@ class SQLAlchemyPostGraph:
                     to_id = EXCLUDED.to_id,
                     relation_type = EXCLUDED.relation_type,
                     payload = {payload_sql},
-                    updated_at = CURRENT_TIMESTAMP
+                    updated_at = clock_timestamp()
                 RETURNING realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
                 """
-                kwargs = {"realm": realm, "id": e_id_int, "space": eff_space, "from_id": from_id_int,
-                          "to_id": to_id_int, "relation_type": relation_type, "payload": payload_json}
+                kwargs = {
+                    "realm": realm,
+                    "id": e_id_int,
+                    "space": eff_space,
+                    "from_id": from_id_int,
+                    "to_id": to_id_int,
+                    "relation_type": relation_type,
+                    "payload": payload_json,
+                }
 
             try:
                 row = await self._fetchrow(conn, query, **kwargs)
                 emb = None
-                if 'embedding_text' in row and row['embedding_text']:
-                    emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 return Edge(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    fqid=row['fqid'],
-                    from_id=str(row['from_id']),
-                    to_id=str(row['to_id']),
-                    relation_type=row['relation_type'],
-                    space=row.get('space') or 'default',
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    fqid=row["fqid"],
+                    from_id=str(row["from_id"]),
+                    to_id=str(row["to_id"]),
+                    relation_type=row["relation_type"],
+                    space=row.get("space") or "default",
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
                     embedding=emb,
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
             except IntegrityError as e:
                 if "foreign key" in str(e).lower():
-                    raise VertexNotFoundError(f"Foreign key violation: referenced vertices do not exist. Details: {e}")
+                    raise VertexNotFoundError(
+                        f"Foreign key violation: referenced vertices do not exist. Details: {e}"
+                    )
+                if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                    # Reachable through a second uniqueness on the table: the
+                    # ON CONFLICT target absorbs (realm, id).
+                    raise self._unique_error(
+                        e, kind="Edge", record_id=None, table_name=table_name, realm=realm
+                    ) from e
                 raise PostGraphError(f"Integrity error: {e}")
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
@@ -2491,7 +3428,9 @@ class SQLAlchemyPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
-    async def get_edge(self, table_name: str, realm: str, edge_id: str, strict: bool = False) -> Optional[Edge]:
+    async def get_edge(
+        self, table_name: str, realm: str, edge_id: str, strict: bool = False
+    ) -> Optional[Edge]:
         """Fetch an edge by realm and id or uuid.
 
         When *strict* is True, raises EdgeNotFoundError instead of returning None.
@@ -2499,10 +3438,12 @@ class SQLAlchemyPostGraph:
         self._validate_identifier(table_name)
         e_str = str(edge_id).strip()
 
-        if len(e_str) == 36 and '-' in e_str:
+        if len(e_str) == 36 and "-" in e_str:
             result = await self.get_edge_by_uuid(table_name, realm, e_str)
             if strict and result is None:
-                raise EdgeNotFoundError(f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'.")
+                raise EdgeNotFoundError(
+                    f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'."
+                )
             return result
 
         table_ref = self._get_table_ref(table_name, realm)
@@ -2518,35 +3459,41 @@ class SQLAlchemyPostGraph:
                 if not row:
                     return await self.get_edge_by_uuid(table_name, realm, e_str)
                 return Edge(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    fqid=row['fqid'],
-                    from_id=str(row['from_id']),
-                    to_id=str(row['to_id']),
-                    relation_type=row['relation_type'],
-                    space=row.get('space') or 'default',
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    fqid=row["fqid"],
+                    from_id=str(row["from_id"]),
+                    to_id=str(row["to_id"]),
+                    relation_type=row["relation_type"],
+                    space=row.get("space") or "default",
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
                 raise PostGraphError(f"Programming error: {e}")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             result = await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
                 result = await _op(conn)
         if strict and result is None:
-            raise EdgeNotFoundError(f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'.")
+            raise EdgeNotFoundError(
+                f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'."
+            )
         return result
 
-    async def get_edge_by_uuid(self, table_name: str, realm: str, uuid: str, strict: bool = False) -> Optional[Edge]:
+    async def get_edge_by_uuid(
+        self, table_name: str, realm: str, uuid: str, strict: bool = False
+    ) -> Optional[Edge]:
         """Fetch an edge record by its UUID.
 
         When *strict* is True, raises EdgeNotFoundError instead of returning None.
@@ -2566,32 +3513,36 @@ class SQLAlchemyPostGraph:
                 if not row:
                     return None
                 return Edge(
-                    realm=row['realm'],
-                    id=str(row['id']),
-                    fqid=row['fqid'],
-                    from_id=str(row['from_id']),
-                    to_id=str(row['to_id']),
-                    relation_type=row['relation_type'],
-                    space=row.get('space') or 'default',
-                    payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                    created_at=row['created_at'],
-                    updated_at=row['updated_at'],
+                    realm=row["realm"],
+                    id=str(row["id"]),
+                    fqid=row["fqid"],
+                    from_id=str(row["from_id"]),
+                    to_id=str(row["to_id"]),
+                    relation_type=row["relation_type"],
+                    space=row.get("space") or "default",
+                    payload=row["payload"]
+                    if isinstance(row["payload"], dict)
+                    else json.loads(row["payload"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
                     table_name=table_name,
-                    uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                    _client=self
+                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                    _client=self,
                 )
             except (ProgrammingError, DataError, DBAPIError) as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
                 return None
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             result = await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
                 result = await _op(conn)
         if strict and result is None:
-            raise EdgeNotFoundError(f"Edge with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'.")
+            raise EdgeNotFoundError(
+                f"Edge with uuid '{uuid}' not found in table '{table_name}', realm '{realm}'."
+            )
         return result
 
     async def get_edges(
@@ -2636,29 +3587,37 @@ class SQLAlchemyPostGraph:
                 edges = []
                 for row in rows:
                     emb = None
-                    if 'embedding_text' in row and row['embedding_text']:
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    edges.append(Edge(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        fqid=row['fqid'],
-                        from_id=str(row['from_id']),
-                        to_id=str(row['to_id']),
-                        relation_type=row['relation_type'],
-                        space=row.get('space') or 'default',
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    edges.append(
+                        Edge(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            fqid=row["fqid"],
+                            from_id=str(row["from_id"]),
+                            to_id=str(row["to_id"]),
+                            relation_type=row["relation_type"],
+                            space=row.get("space") or "default",
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return edges
             except ProgrammingError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -2692,7 +3651,9 @@ class SQLAlchemyPostGraph:
                         rt = f"rt{i}"
                         params[rt] = relation_type
                         extra += f" AND t.relation_type = :{rt}"
-                    parts.append(f"SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type, t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text, to_jsonb(t)->>'embedding' AS embedding_text FROM {tref} t WHERE t.realm = :{rp}{extra}")
+                    parts.append(
+                        f"SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type, t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text, to_jsonb(t)->>'embedding' AS embedding_text FROM {tref} t WHERE t.realm = :{rp}{extra}"
+                    )
                 query = " UNION ALL ".join(parts) + " ORDER BY realm, id ASC"
                 if limit:
                     params["limit"] = limit
@@ -2726,29 +3687,37 @@ class SQLAlchemyPostGraph:
                 edges = []
                 for row in rows:
                     emb = None
-                    if 'embedding_text' in row and row['embedding_text']:
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    edges.append(Edge(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        fqid=row['fqid'],
-                        from_id=str(row['from_id']),
-                        to_id=str(row['to_id']),
-                        relation_type=row['relation_type'],
-                        space=row.get('space') or 'default',
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    edges.append(
+                        Edge(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            fqid=row["fqid"],
+                            from_id=str(row["from_id"]),
+                            to_id=str(row["to_id"]),
+                            relation_type=row["relation_type"],
+                            space=row.get("space") or "default",
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return edges
             except ProgrammingError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -2779,8 +3748,7 @@ class SQLAlchemyPostGraph:
         if order_by_column is not None:
             if order_by is not None:
                 raise PostGraphError(
-                    "Pass order_by (a payload key) or order_by_column (a real column), "
-                    "not both."
+                    "Pass order_by (a payload key) or order_by_column (a real column), not both."
                 )
             validate_order_column(order_by_column, EDGE_ORDER_COLUMNS)
         table_ref = self._get_table_ref(table_name, realm)
@@ -2835,35 +3803,45 @@ class SQLAlchemyPostGraph:
                 edges = []
                 for row in rows:
                     emb = None
-                    if 'embedding_text' in row and row['embedding_text']:
-                        emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
-                    edges.append(Edge(
-                        realm=row['realm'],
-                        id=str(row['id']),
-                        fqid=row['fqid'],
-                        from_id=str(row['from_id']),
-                        to_id=str(row['to_id']),
-                        relation_type=row['relation_type'],
-                        space=row.get('space') or 'default',
-                        payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                        created_at=row['created_at'],
-                        updated_at=row['updated_at'],
-                        table_name=table_name,
-                        embedding=emb,
-                        uuid=str(row['uuid_text']) if row.get('uuid_text') else None,
-                        _client=self
-                    ))
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
+                    edges.append(
+                        Edge(
+                            realm=row["realm"],
+                            id=str(row["id"]),
+                            fqid=row["fqid"],
+                            from_id=str(row["from_id"]),
+                            to_id=str(row["to_id"]),
+                            relation_type=row["relation_type"],
+                            space=row.get("space") or "default",
+                            payload=row["payload"]
+                            if isinstance(row["payload"], dict)
+                            else json.loads(row["payload"]),
+                            created_at=row["created_at"],
+                            updated_at=row["updated_at"],
+                            table_name=table_name,
+                            embedding=emb,
+                            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+                            _client=self,
+                        )
+                    )
                 return edges
             except ProgrammingError:
                 raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
                 return await _op(conn)
 
-    async def delete_edge(self, table_name: str, realm: str, edge_id: str, user_id: Optional[str] = None) -> bool:
+    async def delete_edge(
+        self, table_name: str, realm: str, edge_id: str, user_id: Optional[str] = None
+    ) -> bool:
         """Delete an edge."""
         self._validate_identifier(table_name)
         table_ref = self._get_table_ref(table_name, realm)
@@ -2884,8 +3862,9 @@ class SQLAlchemyPostGraph:
 
         return await self._run_in_tx(_op, user_id)
 
-    async def drop_audit_table(self, table_name: str, realm: Optional[str] = None,
-                               user_id: Optional[str] = None) -> bool:
+    async def drop_audit_table(
+        self, table_name: str, realm: Optional[str] = None, user_id: Optional[str] = None
+    ) -> bool:
         """Drop a table's shadow audit table and stop it being written to.
 
         Deliberately a separate, explicit call rather than a side effect of
@@ -2910,19 +3889,22 @@ class SQLAlchemyPostGraph:
         self._validate_identifier(table_name)
         if self.schema_per_realm and not realm:
             raise PostGraphError(
-                "realm must be specified in schema_per_realm mode when dropping an audit table.")
+                "realm must be specified in schema_per_realm mode when dropping an audit table."
+            )
         table_ref = self._get_table_ref(table_name, realm)
         audit_table_ref = self._get_table_ref(f"{table_name}_audit", realm)
 
         async def _op(conn):
             res = await conn.execute(
-                text("SELECT to_regclass(:ref) IS NOT NULL"), {"ref": audit_table_ref})
+                text("SELECT to_regclass(:ref) IS NOT NULL"), {"ref": audit_table_ref}
+            )
             existed = res.scalar()
             # Drop the trigger first. Dropping the table out from under a live
             # trigger would leave every subsequent write to the base table
             # failing on a missing audit target.
-            await conn.execute(text(
-                f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};'))
+            await conn.execute(
+                text(f'DROP TRIGGER IF EXISTS "audit_{table_name}_trigger" ON {table_ref};')
+            )
             await conn.execute(text(f"DROP TABLE IF EXISTS {audit_table_ref};"))
             return bool(existed)
 
@@ -2930,6 +3912,7 @@ class SQLAlchemyPostGraph:
 
     async def delete_realm(self, realm: str, user_id: Optional[str] = None) -> int:
         """Delete all rows belonging to a specific realm from all graph tables (vertices, edges, and audit tables)."""
+
         async def _op(conn):
             if self.schema_per_realm:
                 query = """
@@ -2948,19 +3931,21 @@ class SQLAlchemyPostGraph:
                 """
                 rows = await self._fetch(conn, query)
 
-            tables = [row['table_name'] for row in rows]
-            
+            tables = [row["table_name"] for row in rows]
+
             total_deleted = 0
             for table in tables:
                 table_ref = self._get_table_ref(table, realm)
-                delete_query = f'DELETE FROM {table_ref} WHERE realm = :realm'
+                delete_query = f"DELETE FROM {table_ref} WHERE realm = :realm"
                 res = await conn.execute(text(delete_query), {"realm": realm})
                 total_deleted += res.rowcount
             return total_deleted
 
         return await self._run_in_tx(_op, user_id)
 
-    async def get_edge_schema(self, conn: AsyncConnection, edge_table: str, realm: Optional[str] = None) -> Dict[str, str]:
+    async def get_edge_schema(
+        self, conn: AsyncConnection, edge_table: str, realm: Optional[str] = None
+    ) -> Dict[str, str]:
         """
         Query system catalog pg_constraint to discover referenced vertex tables
         for 'from_id' and 'to_id' keys of the edge table. Caches the schema.
@@ -2993,7 +3978,7 @@ class SQLAlchemyPostGraph:
 
         schema = {}
         for row in rows:
-            schema[row['column_name']] = row['referenced_table']
+            schema[row["column_name"]] = row["referenced_table"]
 
         if len(schema) < 2:
             raise PostGraphError(
@@ -3010,17 +3995,17 @@ class SQLAlchemyPostGraph:
         vertex_table: str,
         vertex_id: str,
         edge_tables: List[str],
-        direction: str = 'out'
+        direction: str = "out",
     ) -> List[Tuple[Vertex, Edge]]:
         """
         Get direct neighbor vertices and connecting edges.
         Returns a list of tuples: (NeighborVertex, ConnectingEdge)
         """
         self._validate_identifier(vertex_table)
-        if direction not in ('out', 'in', 'both'):
+        if direction not in ("out", "in", "both"):
             raise ValueError("Direction must be 'out', 'in', or 'both'")
 
-        v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+        v_id_int = int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
 
         async def _op(conn):
             results = []
@@ -3028,76 +4013,84 @@ class SQLAlchemyPostGraph:
                 self._validate_identifier(edge_table)
                 schema = await self.get_edge_schema(conn, edge_table, realm=realm)
 
-                from_ref = schema['from_id']
-                to_ref = schema['to_id']
+                from_ref = schema["from_id"]
+                to_ref = schema["to_id"]
 
                 queries = []
 
                 # 1. Outgoing paths: from_id is the start, to_id is the neighbor
-                if direction in ('out', 'both') and from_ref == vertex_table:
+                if direction in ("out", "both") and from_ref == vertex_table:
                     edge_ref = self._get_table_ref(edge_table, realm)
                     to_ref_ref = self._get_table_ref(to_ref, realm)
-                    queries.append((
-                        to_ref,
-                        f"""
+                    queries.append(
+                        (
+                            to_ref,
+                            f"""
                         SELECT
                             v.id AS v_id, v.space AS v_space, v.fqid AS v_fqid, v.payload AS v_payload, v.created_at AS v_created_at, v.updated_at AS v_updated_at,
                             e.id AS e_id, e.space AS e_space, e.fqid AS e_fqid, e.from_id AS e_from, e.to_id AS e_to, e.relation_type AS e_rel, e.payload AS e_payload, e.created_at AS e_created_at, e.updated_at AS e_updated_at
                         FROM {edge_ref} e
                         JOIN {to_ref_ref} v ON e.realm = v.realm AND e.to_id = v.id
                         WHERE e.realm = :realm AND e.from_id = :vertex_id
-                        """
-                    ))
+                        """,
+                        )
+                    )
 
                 # 2. Incoming paths: to_id is the start, from_id is the neighbor
-                if direction in ('in', 'both') and to_ref == vertex_table:
+                if direction in ("in", "both") and to_ref == vertex_table:
                     edge_ref = self._get_table_ref(edge_table, realm)
                     from_ref_ref = self._get_table_ref(from_ref, realm)
-                    queries.append((
-                        from_ref,
-                        f"""
+                    queries.append(
+                        (
+                            from_ref,
+                            f"""
                         SELECT
                             v.id AS v_id, v.space AS v_space, v.fqid AS v_fqid, v.payload AS v_payload, v.created_at AS v_created_at, v.updated_at AS v_updated_at,
                             e.id AS e_id, e.space AS e_space, e.fqid AS e_fqid, e.from_id AS e_from, e.to_id AS e_to, e.relation_type AS e_rel, e.payload AS e_payload, e.created_at AS e_created_at, e.updated_at AS e_updated_at
                         FROM {edge_ref} e
                         JOIN {from_ref_ref} v ON e.realm = v.realm AND e.from_id = v.id
                         WHERE e.realm = :realm AND e.to_id = :vertex_id
-                        """
-                    ))
+                        """,
+                        )
+                    )
 
                 for neighbor_table, sql in queries:
                     rows = await self._fetch(conn, sql, realm=realm, vertex_id=v_id_int)
                     for r in rows:
                         v = Vertex(
                             realm=realm,
-                            id=str(r['v_id']),
-                            space=r.get('v_space') or 'default',
-                            fqid=r['v_fqid'],
-                            payload=r['v_payload'] if isinstance(r['v_payload'], dict) else json.loads(r['v_payload']),
-                            created_at=r['v_created_at'],
-                            updated_at=r['v_updated_at'],
+                            id=str(r["v_id"]),
+                            space=r.get("v_space") or "default",
+                            fqid=r["v_fqid"],
+                            payload=r["v_payload"]
+                            if isinstance(r["v_payload"], dict)
+                            else json.loads(r["v_payload"]),
+                            created_at=r["v_created_at"],
+                            updated_at=r["v_updated_at"],
                             table_name=neighbor_table,
-                            _client=self
+                            _client=self,
                         )
                         e = Edge(
                             realm=realm,
-                            id=str(r['e_id']),
-                            fqid=r['e_fqid'],
-                            from_id=str(r['e_from']),
-                            to_id=str(r['e_to']),
-                            relation_type=r['e_rel'],
-                            space=r.get('e_space') or 'default',
-                            payload=r['e_payload'] if isinstance(r['e_payload'], dict) else json.loads(r['e_payload']),
-                            created_at=r['e_created_at'],
-                            updated_at=r['e_updated_at'],
+                            id=str(r["e_id"]),
+                            fqid=r["e_fqid"],
+                            from_id=str(r["e_from"]),
+                            to_id=str(r["e_to"]),
+                            relation_type=r["e_rel"],
+                            space=r.get("e_space") or "default",
+                            payload=r["e_payload"]
+                            if isinstance(r["e_payload"], dict)
+                            else json.loads(r["e_payload"]),
+                            created_at=r["e_created_at"],
+                            updated_at=r["e_updated_at"],
                             table_name=edge_table,
-                            _client=self
+                            _client=self,
                         )
                         results.append((v, e))
 
             return results
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -3128,15 +4121,16 @@ class SQLAlchemyPostGraph:
         cache_key = (realm, table_name)
         if cache_key in self._promoted_cache:
             return self._promoted_cache[cache_key]
-        schema = realm if self.schema_per_realm else 'public'
+        schema = realm if self.schema_per_realm else "public"
         rows = await self._fetch(
             conn,
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = :s AND table_name = :t "
             "AND (column_name LIKE 'pt\\_%' OR column_name LIKE 'p\\_%')",
-            s=schema, t=table_name,
+            s=schema,
+            t=table_name,
         )
-        cols = {r['column_name'] for r in rows}
+        cols = {r["column_name"] for r in rows}
         self._promoted_cache[cache_key] = cols
         return cols
 
@@ -3161,11 +4155,11 @@ class SQLAlchemyPostGraph:
 
         if relation_types:
             clauses.append("relation_type = ANY(CAST(:rel_types AS text[]))")
-            params['rel_types'] = list(relation_types)
+            params["rel_types"] = list(relation_types)
 
         if space and space != RESERVED_SPACE_ALL:
             clauses.append("space = :trav_space")
-            params['trav_space'] = space
+            params["trav_space"] = space
 
         # A relation with no stated period holds at every date: silence about
         # when a fact applied means it applied throughout, not that it never did.
@@ -3187,7 +4181,7 @@ class SQLAlchemyPostGraph:
                     f"(({vf} IS NULL OR {self._padded_date_sql(vf)} <= {at}) AND "
                     f"({vt} IS NULL OR {self._padded_date_sql(vt)} >= {at}))"
                 )
-            params['trav_as_of'] = as_of
+            params["trav_as_of"] = as_of
 
         for key in payload_null_keys or []:
             self._validate_identifier(key)
@@ -3206,13 +4200,13 @@ class SQLAlchemyPostGraph:
         start_id: str,
         edge_tables: List[str],
         max_depth: int = 3,
-        direction: str = 'out',
+        direction: str = "out",
         relation_types: Optional[List[str]] = None,
         as_of: Optional[str] = None,
         payload_null_keys: Optional[List[str]] = None,
         space: Optional[str] = None,
-        valid_from_key: str = 'valid_from',
-        valid_to_key: str = 'valid_to',
+        valid_from_key: str = "valid_from",
+        valid_to_key: str = "valid_to",
     ) -> List[Dict[str, Any]]:
         """
         Perform a dynamic graph traversal starting from (start_table, start_id)
@@ -3232,10 +4226,10 @@ class SQLAlchemyPostGraph:
                              vertex will still wander into other tenants' data.
         """
         self._validate_identifier(start_table)
-        if direction not in ('out', 'in', 'both'):
+        if direction not in ("out", "in", "both"):
             raise ValueError("Direction must be 'out', 'in', or 'both'")
 
-        start_id_str = str(start_id).split('/')[-1] if '/' in str(start_id) else str(start_id)
+        start_id_str = str(start_id).split("/")[-1] if "/" in str(start_id) else str(start_id)
 
         async def _op(conn):
             # One filter fragment is shared by every edge table in the walk, so a
@@ -3246,19 +4240,23 @@ class SQLAlchemyPostGraph:
                 promoted_columns = _cols if promoted_columns is None else (promoted_columns & _cols)
 
             filter_sql, filter_params = self._edge_filter_sql(
-                relation_types, as_of, payload_null_keys, space,
-                valid_from_key, valid_to_key,
+                relation_types,
+                as_of,
+                payload_null_keys,
+                space,
+                valid_from_key,
+                valid_to_key,
                 promoted_columns=promoted_columns,
             )
 
             subqueries = []
             for edge_table in edge_tables:
                 schema = await self.get_edge_schema(conn, edge_table, realm=realm)
-                from_ref = schema['from_id']
-                to_ref = schema['to_id']
+                from_ref = schema["from_id"]
+                to_ref = schema["to_id"]
                 edge_ref = self._get_table_ref(edge_table, realm)
 
-                if direction in ('out', 'both'):
+                if direction in ("out", "both"):
                     subqueries.append(f"""
                     SELECT 
                         CAST(to_id AS text) AS next_id, 
@@ -3271,7 +4269,7 @@ class SQLAlchemyPostGraph:
                     WHERE realm = :realm AND from_id = (CASE WHEN t.current_id ~ '^[0-9]+$' THEN CAST(t.current_id AS BIGINT) ELSE NULL END) AND t.current_table = '{from_ref}'{filter_sql}
                     """)
 
-                if direction in ('in', 'both'):
+                if direction in ("in", "both"):
                     subqueries.append(f"""
                     SELECT 
                         CAST(from_id AS text) AS next_id, 
@@ -3321,24 +4319,28 @@ class SQLAlchemyPostGraph:
             """
 
             rows = await self._fetch(
-                conn, cte_query,
-                realm=realm, start_id=start_id_str, start_table=start_table, max_depth=max_depth,
-                **filter_params
+                conn,
+                cte_query,
+                realm=realm,
+                start_id=start_id_str,
+                start_table=start_table,
+                max_depth=max_depth,
+                **filter_params,
             )
 
             return [
                 {
-                    'id': row['current_id'],
-                    'table_name': row['current_table'],
-                    'depth': row['depth'],
-                    'path': row['path'],
-                    'edge_path': row['edge_path'],
-                    'edge_ids': row['edge_ids']
+                    "id": row["current_id"],
+                    "table_name": row["current_table"],
+                    "depth": row["depth"],
+                    "path": row["path"],
+                    "edge_path": row["edge_path"],
+                    "edge_ids": row["edge_ids"],
                 }
                 for row in rows
             ]
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -3353,8 +4355,8 @@ class SQLAlchemyPostGraph:
         target_id: str,
         edge_tables: List[str],
         max_depth: int = 5,
-        direction: str = 'out',
-        conn = None
+        direction: str = "out",
+        conn=None,
     ) -> Optional[Dict[str, Any]]:
         """
         Find shortest path from (start_table, start_id) to (target_table, target_id)
@@ -3362,21 +4364,21 @@ class SQLAlchemyPostGraph:
         """
         self._validate_identifier(start_table)
         self._validate_identifier(target_table)
-        if direction not in ('out', 'in', 'both'):
+        if direction not in ("out", "in", "both"):
             raise ValueError("Direction must be 'out', 'in', or 'both'")
 
-        start_id_str = str(start_id).split('/')[-1] if '/' in str(start_id) else str(start_id)
-        target_id_str = str(target_id).split('/')[-1] if '/' in str(target_id) else str(target_id)
+        start_id_str = str(start_id).split("/")[-1] if "/" in str(start_id) else str(start_id)
+        target_id_str = str(target_id).split("/")[-1] if "/" in str(target_id) else str(target_id)
 
         async def _op(c):
             subqueries = []
             for edge_table in edge_tables:
                 schema = await self.get_edge_schema(c, edge_table, realm=realm)
-                from_ref = schema['from_id']
-                to_ref = schema['to_id']
+                from_ref = schema["from_id"]
+                to_ref = schema["to_id"]
                 edge_ref = self._get_table_ref(edge_table, realm)
 
-                if direction in ('out', 'both'):
+                if direction in ("out", "both"):
                     subqueries.append(f"""
                     SELECT 
                         CAST(to_id AS text) AS next_id, 
@@ -3388,7 +4390,7 @@ class SQLAlchemyPostGraph:
                     WHERE realm = :realm AND from_id = (CASE WHEN t.current_id ~ '^[0-9]+$' THEN CAST(t.current_id AS BIGINT) ELSE NULL END) AND t.current_table = '{from_ref}'
                     """)
 
-                if direction in ('in', 'both'):
+                if direction in ("in", "both"):
                     subqueries.append(f"""
                     SELECT 
                         CAST(from_id AS text) AS next_id, 
@@ -3442,25 +4444,30 @@ class SQLAlchemyPostGraph:
             """
 
             row = await self._fetchrow(
-                c, cte_query,
-                realm=realm, start_id=start_id_str, start_table=start_table, max_depth=max_depth,
-                target_id=target_id_str, target_table=target_table
+                c,
+                cte_query,
+                realm=realm,
+                start_id=start_id_str,
+                start_table=start_table,
+                max_depth=max_depth,
+                target_id=target_id_str,
+                target_table=target_table,
             )
-                
+
             if not row:
                 return None
 
             return {
-                'depth': row['depth'],
-                'path': row['path'],
-                'edge_path': row['edge_path'],
-                'edge_ids': row['edge_ids']
+                "depth": row["depth"],
+                "path": row["path"],
+                "edge_path": row["edge_path"],
+                "edge_ids": row["edge_ids"],
             }
 
         if conn:
             return await _op(conn)
         else:
-            if isinstance(self.engine_or_connection, AsyncConnection):
+            if self._bound:
                 return await _op(self.engine_or_connection)
             else:
                 async with self.engine_or_connection.connect() as conn:
@@ -3533,7 +4540,7 @@ class SQLAlchemyPostGraph:
             result = await conn.execute(text(query), {"realm": realm})
             return [list(r[1]) for r in result.fetchall()]
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -3659,7 +4666,7 @@ class SQLAlchemyPostGraph:
                 "total_weight": float(row["total_weight"]),
             }
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -3673,11 +4680,11 @@ class SQLAlchemyPostGraph:
         payload: Dict[str, Any],
         timestamp: Optional[Any] = None,
         embedding: Optional[List[float]] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
     ) -> DataRecord:
         """Append a historical record to {table_name}_data table for a vertex."""
         self._validate_identifier(table_name)
-        v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+        v_id_int = int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
         payload_json = json.dumps(payload or {})
         data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding is not None else None
@@ -3688,7 +4695,9 @@ class SQLAlchemyPostGraph:
                 data_t_name = f"{table_name}_data"
                 if self.schema_per_realm:
                     check_q = "SELECT 1 FROM information_schema.columns WHERE table_schema = :schema AND table_name = :t_name AND column_name = 'embedding'"
-                    res = await conn.execute(text(check_q), {"schema": realm, "t_name": data_t_name})
+                    res = await conn.execute(
+                        text(check_q), {"schema": realm, "t_name": data_t_name}
+                    )
                     has_emb = res.scalar() is not None
                 else:
                     check_q = "SELECT 1 FROM information_schema.columns WHERE table_name = :t_name AND column_name = 'embedding'"
@@ -3702,14 +4711,24 @@ class SQLAlchemyPostGraph:
                     VALUES (:realm, :id, CAST(:payload AS JSONB), :timestamp, CAST(:vec AS vector))
                     RETURNING data_id, realm, id, payload, timestamp, CAST(embedding AS TEXT) AS embedding_text
                     """
-                    row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json, timestamp=timestamp, vec=vec_str)
+                    row = await self._fetchrow(
+                        conn,
+                        query,
+                        realm=realm,
+                        id=v_id_int,
+                        payload=payload_json,
+                        timestamp=timestamp,
+                        vec=vec_str,
+                    )
                 else:
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload, embedding)
                     VALUES (:realm, :id, CAST(:payload AS JSONB), CAST(:vec AS vector))
                     RETURNING data_id, realm, id, payload, timestamp, CAST(embedding AS TEXT) AS embedding_text
                     """
-                    row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json, vec=vec_str)
+                    row = await self._fetchrow(
+                        conn, query, realm=realm, id=v_id_int, payload=payload_json, vec=vec_str
+                    )
             else:
                 if timestamp:
                     query = f"""
@@ -3717,40 +4736,47 @@ class SQLAlchemyPostGraph:
                     VALUES (:realm, :id, CAST(:payload AS JSONB), :timestamp)
                     RETURNING data_id, realm, id, payload, timestamp, NULL AS embedding_text
                     """
-                    row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json, timestamp=timestamp)
+                    row = await self._fetchrow(
+                        conn,
+                        query,
+                        realm=realm,
+                        id=v_id_int,
+                        payload=payload_json,
+                        timestamp=timestamp,
+                    )
                 else:
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload)
                     VALUES (:realm, :id, CAST(:payload AS JSONB))
                     RETURNING data_id, realm, id, payload, timestamp, NULL AS embedding_text
                     """
-                    row = await self._fetchrow(conn, query, realm=realm, id=v_id_int, payload=payload_json)
+                    row = await self._fetchrow(
+                        conn, query, realm=realm, id=v_id_int, payload=payload_json
+                    )
 
             emb = None
-            if 'embedding_text' in row and row['embedding_text']:
-                emb = [float(x) for x in row['embedding_text'].strip('[]').split(',') if x.strip()]
+            if "embedding_text" in row and row["embedding_text"]:
+                emb = [float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()]
 
             return DataRecord(
-                data_id=str(row['data_id']),
-                realm=row['realm'],
-                id=str(row['id']),
-                payload=row['payload'] if isinstance(row['payload'], dict) else json.loads(row['payload']),
-                timestamp=row['timestamp'],
-                embedding=emb
+                data_id=str(row["data_id"]),
+                realm=row["realm"],
+                id=str(row["id"]),
+                payload=row["payload"]
+                if isinstance(row["payload"], dict)
+                else json.loads(row["payload"]),
+                timestamp=row["timestamp"],
+                embedding=emb,
             )
 
         return await self._run_in_tx(_op, user_id)
 
     async def get_vertex_data(
-        self,
-        table_name: str,
-        realm: str,
-        vertex_id: Union[str, int],
-        limit: Optional[int] = None
+        self, table_name: str, realm: str, vertex_id: Union[str, int], limit: Optional[int] = None
     ) -> List[DataRecord]:
         """Fetch append-only data records for a vertex sorted by timestamp descending."""
         self._validate_identifier(table_name)
-        v_id_int = int(str(vertex_id).split('/')[-1]) if '/' in str(vertex_id) else int(vertex_id)
+        v_id_int = int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
         data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
 
         limit_clause = f"LIMIT {limit}" if limit and limit > 0 else ""
@@ -3767,41 +4793,39 @@ class SQLAlchemyPostGraph:
             results = []
             for r in rows:
                 emb = None
-                if 'embedding_text' in r and r['embedding_text']:
-                    emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+                if "embedding_text" in r and r["embedding_text"]:
+                    emb = [
+                        float(x) for x in r["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 results.append(
                     DataRecord(
-                        data_id=str(r['data_id']),
-                        realm=r['realm'],
-                        id=str(r['id']),
-                        payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
-                        timestamp=r['timestamp'],
-                        embedding=emb
+                        data_id=str(r["data_id"]),
+                        realm=r["realm"],
+                        id=str(r["id"]),
+                        payload=r["payload"]
+                        if isinstance(r["payload"], dict)
+                        else json.loads(r["payload"]),
+                        timestamp=r["timestamp"],
+                        embedding=emb,
                     )
                 )
             return results
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
                 return await _op(conn)
 
     async def get_latest_vertex_data(
-        self,
-        table_name: str,
-        realm: str,
-        vertex_id: Union[str, int]
+        self, table_name: str, realm: str, vertex_id: Union[str, int]
     ) -> Optional[DataRecord]:
         """Fetch the latest append-only data record (version) for a vertex."""
         records = await self.get_vertex_data(table_name, realm, vertex_id, limit=1)
         return records[0] if records else None
 
     async def get_vertex_data_by_id(
-        self,
-        table_name: str,
-        realm: str,
-        data_id: Union[str, int]
+        self, table_name: str, realm: str, data_id: Union[str, int]
     ) -> Optional[DataRecord]:
         """Query a specific data entry / version by its sequential data_id."""
         self._validate_identifier(table_name)
@@ -3820,18 +4844,20 @@ class SQLAlchemyPostGraph:
                 return None
             r = rows[0]
             emb = None
-            if 'embedding_text' in r and r['embedding_text']:
-                emb = [float(x) for x in r['embedding_text'].strip('[]').split(',') if x.strip()]
+            if "embedding_text" in r and r["embedding_text"]:
+                emb = [float(x) for x in r["embedding_text"].strip("[]").split(",") if x.strip()]
             return DataRecord(
-                data_id=str(r['data_id']),
-                realm=r['realm'],
-                id=str(r['id']),
-                payload=r['payload'] if isinstance(r['payload'], dict) else json.loads(r['payload']),
-                timestamp=r['timestamp'],
-                embedding=emb
+                data_id=str(r["data_id"]),
+                realm=r["realm"],
+                id=str(r["id"]),
+                payload=r["payload"]
+                if isinstance(r["payload"], dict)
+                else json.loads(r["payload"]),
+                timestamp=r["timestamp"],
+                embedding=emb,
             )
 
-        if isinstance(self.engine_or_connection, AsyncConnection):
+        if self._bound:
             return await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
@@ -3845,36 +4871,33 @@ class SQLAlchemyPostGraph:
         payload: Dict[str, Any],
         timestamp: Optional[Any] = None,
         embedding: Optional[List[float]] = None,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
     ) -> DataRecord:
         """Append a historical record to {table_name}_data table for an edge."""
-        return await self.add_vertex_data(table_name, realm, edge_id, payload, timestamp=timestamp, embedding=embedding, user_id=user_id)
+        return await self.add_vertex_data(
+            table_name,
+            realm,
+            edge_id,
+            payload,
+            timestamp=timestamp,
+            embedding=embedding,
+            user_id=user_id,
+        )
 
     async def get_edge_data(
-        self,
-        table_name: str,
-        realm: str,
-        edge_id: Union[str, int],
-        limit: Optional[int] = None
+        self, table_name: str, realm: str, edge_id: Union[str, int], limit: Optional[int] = None
     ) -> List[DataRecord]:
         """Fetch append-only data records for an edge sorted by timestamp descending."""
         return await self.get_vertex_data(table_name, realm, edge_id, limit=limit)
 
     async def get_latest_edge_data(
-        self,
-        table_name: str,
-        realm: str,
-        edge_id: Union[str, int]
+        self, table_name: str, realm: str, edge_id: Union[str, int]
     ) -> Optional[DataRecord]:
         """Fetch the latest append-only data record for an edge."""
         return await self.get_latest_vertex_data(table_name, realm, edge_id)
 
     async def get_edge_data_by_id(
-        self,
-        table_name: str,
-        realm: str,
-        data_id: Union[str, int]
+        self, table_name: str, realm: str, data_id: Union[str, int]
     ) -> Optional[DataRecord]:
         """Query a specific data entry by its sequential data_id for an edge."""
         return await self.get_vertex_data_by_id(table_name, realm, data_id)
-

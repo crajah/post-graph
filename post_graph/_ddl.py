@@ -47,6 +47,9 @@ _CATALOG_INDEXES = (
     "pg_constraint_conrelid_contypid_conname_index",
     "pg_trigger_tgrelid_tgname_index",
     "pg_attribute_relid_attnam_index",
+    # CREATE DATABASE racing. The loser does not always reach the
+    # duplicate-database check and can fail on this index instead.
+    "pg_database_datname_index",
 )
 
 

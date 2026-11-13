@@ -7,12 +7,16 @@ from post_graph.cypher import (
     CypherTranslationError,
 )
 from post_graph.errors import (
+    CommitFailedError,
+    ConcurrentModificationError,
     CyclicReferenceError,
     EdgeNotFoundError,
+    NestedTransactionError,
     PostGraphError,
     ReservedSpaceError,
     TableExistsError,
     TableNotFoundError,
+    UniqueConstraintError,
     VertexNotFoundError,
 )
 from post_graph.models import ABSENT, JSON_NULL, Edge, TraversalStep, Vertex
@@ -22,7 +26,7 @@ try:
 except ImportError:
     SQLAlchemyPostGraph = None
 
-__version__ = "1.13.0"
+__version__ = "1.14.0"
 
 __all__ = [
     "JSON_NULL",
@@ -42,6 +46,10 @@ __all__ = [
     "TableNotFoundError",
     "CyclicReferenceError",
     "ReservedSpaceError",
+    "UniqueConstraintError",
+    "ConcurrentModificationError",
+    "NestedTransactionError",
+    "CommitFailedError",
     "Vertex",
     "Edge",
     "TraversalStep",

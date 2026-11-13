@@ -81,6 +81,13 @@ Every one was executed against a live database before being committed.
 
 ## 📦 Installation
 
+**Requires Python 3.13 and PostgreSQL 18 with `pgvector`.** Those are the
+versions CI runs, and the only ones claimed: this library's behaviour lives in
+the database, so a PostgreSQL version nothing exercises is not a version
+supported. PostgreSQL 18 matters particularly because it changed what
+`GENERATED ALWAYS AS (expr)` means when no storage keyword is given — it was an
+error before 18 and is now `VIRTUAL`, which cannot be indexed.
+
 Install `post-graph` from PyPI:
 
 ```bash
@@ -365,6 +372,42 @@ await client.create_edge_table(
 
 ### Vertex Operations
 
+#### Optimistic concurrency: `expected_updated_at`
+`upsert_vertex` and `update_vertex` take `expected_updated_at=`, a
+compare-and-swap token. When it does not match the stored row they raise
+`ConcurrentModificationError` and the write is not applied.
+
+```python
+v = await client.get_vertex("RoleGrant", "identity", grant_id)
+await client.update_vertex("RoleGrant", "identity", grant_id,
+                          payload={"roles": [...]},
+                          expected_updated_at=v.updated_at)
+```
+
+`update_vertex` distinguishes the two ways it can find nothing: a row that does
+not exist returns `None` as always, while a row whose `updated_at` moved raises.
+A missing row is not a lost race. `upsert_vertex` requires `vertex_id` with a
+token — a sequence-assigned id is a row that does not exist yet, so there is no
+prior `updated_at` to have moved from.
+
+`updated_at` is maintained with `clock_timestamp()`, not `now()`. `now()` is the
+*transaction's* start time, so two writes to one row inside a transaction would
+leave `updated_at` unchanged between them and a token taken from the first would
+still match after the second. An existing realm picks this up when a table is
+next declared.
+
+#### Typed errors
+`UniqueConstraintError` carries `constraint_name`, so a caller can tell "this
+username is taken" from "this id is taken" without reading `__cause__` or
+importing the driver's exception type. It subclasses `TableExistsError`, so code
+written against earlier releases keeps working. Raised consistently by
+`add_vertex`, `upsert_vertex`, `update_vertex`, `add_edge` and `upsert_edge` —
+`insert_vertex` cannot raise it, since its untargeted `ON CONFLICT DO NOTHING`
+absorbs any unique violation and reports `False`.
+
+Also `ConcurrentModificationError`, `NestedTransactionError` and
+`CommitFailedError`, all exported from `post_graph`.
+
 #### `add_vertex` / `upsert_vertex`
 Upserts a vertex object into a specific `{realm}` and optional `{space}`.
 
@@ -431,6 +474,103 @@ Two differences from `upsert_vertex` worth knowing:
   insert into the audited one. The alternative,
   `create_vertex_table(..., audited=False)`, trades the audit trail away — for a
   security-relevant write, usually the wrong trade.
+
+#### `purge_record_audit(table_name, realm, record_ids)`
+Deletes the shadow `_audit` rows for specific records; returns how many went.
+
+```python
+await client.purge_record_audit("Document", "learner_7", [doc_id])
+```
+
+An audited table keeps a copy of every version of every row, so deleting a row
+from the live table leaves its contents behind — and for a row holding
+something a person asked to have deleted, that is the whole of the problem
+rather than a detail of it. `drop_realm` removes it, but a realm is everything
+that person has, not the one record they deleted.
+
+Matches **`old_row` and `new_row`**, because the two hold different halves of
+the history: an `INSERT` audit row has `old_row` NULL and the contents under
+`new_row`, a `DELETE` has it the other way about, and an `UPDATE` has both.
+Matching only `old_row` would leave the original `INSERT` copy in place — the
+one that has been there longest.
+
+Returns 0 without touching the database for an empty id list, and 0 when there
+is no audit table (declared `audited=False`, or dropped). Neither is an error:
+the caller asked for the audit rows to be gone and they are. Accepts one id or
+many; `realm/table/42` is read as 42.
+
+#### `realm_exists(realm)` · `list_realms(prefix=…)` · `table_exists(table, realm)` · `drop_realm(realm, cascade=True)`
+The catalogue, so a caller need not reach for `information_schema` itself.
+
+`list_realms(prefix=…)` matches the prefix **literally** — `_` and `%` in it are
+escaped, so `prefix="learner_"` does not also return `learners_archive`. That is
+not cosmetic where the result decides which schemas get dropped.
+
+`drop_realm` returns `True` if the schema was there and `False` if it was
+already gone, and refuses when `schema_per_realm=False`: without it a realm is a
+column value spread across shared tables and there is nothing to drop — use
+`delete_realm` for that.
+
+#### `tables_containing_text(needle, include_realms=…, exclude_realm_prefixes=…)`
+`{"schema.table", …}` for every table holding `needle` anywhere in a row.
+
+A residue check, for asserting that something asked to be deleted is actually
+gone. It casts the whole row to text, so it finds the needle in a payload, in a
+shadow `_data` row and in an `_audit` copy alike — the places a deletion tends
+to miss.
+
+**Deliberately not fast**: one `LIMIT 1` probe per table, sequential scans, no
+indexes. It is for tests and erasure receipts, not a request path.
+`exclude_realm_prefixes` skips whole families of schemas unless
+`include_realms` names them, which keeps such an assertion quick on a cluster
+carrying hundreds of per-tenant schemas. `needle` is matched literally.
+
+#### `ensure_database(dsn, *, database, maintenance_database="postgres")`
+Creates the database if absent and returns a DSN pointing at it. A static
+method, because connecting normally requires the database to exist.
+
+```python
+dsn = await AsyncPostGraph.ensure_database(admin_dsn, database="app")
+client = AsyncPostGraph(dsn=dsn, schema_per_realm=True)
+```
+
+`CREATE DATABASE` cannot run inside a transaction and takes no bound parameter,
+so the name is validated as a bare identifier **before any connection is
+opened**. Idempotent under a deploy herd: replicas starting together race, and
+the loser's error is success. Both shapes that race takes are handled — `42P04`,
+and a unique violation on `pg_database`'s own index, which is what several
+concurrent callers actually produce.
+
+#### `transaction(*, user_id, idle_in_transaction_timeout_ms=None)`
+One transaction spanning several calls; yields a client bound to it.
+
+```python
+async with client.transaction(user_id="usr_alice") as tx:
+    grant = await tx.add_vertex("RoleGrant", realm="identity", payload=…)
+    await tx.add_edge("granted_by", realm="identity", from_id=…, to_id=…)
+```
+
+Every write here is already atomic on its own. This is for the cases where two
+of them must be atomic *together*, which no care at the call site can arrange
+from outside.
+
+`user_id` is required and is **remembered**: a call inside the block that passes
+no `user_id` is attributed to it rather than to nobody. Without that, the second
+write in a block blanked `app.current_user_id` and its audit row recorded an
+empty actor — the audit trail quietly losing exactly the writes important enough
+to group. An inner call may still pass its own `user_id` without affecting the
+ones after it.
+
+`idle_in_transaction_timeout_ms` is applied with `SET LOCAL`, so it reverts on
+commit and cannot leak onto a pooled backend another request borrows next.
+
+A commit that itself fails raises **`CommitFailedError`** rather than an
+ordinary error: everything in the block ran, so any external effect it had has
+happened, and the caller needs to reconcile rather than retry. Nesting raises
+`NestedTransactionError` — a nested block would be a `SAVEPOINT` whose exit
+commits nothing. The yielded client is poisoned on exit, so a reference stashed
+outside fails loudly instead of writing outside any transaction on a connection
+now serving somebody else.
 
 #### `reassign_owned_to(role)`
 Gives every object the connected role owns **in the current database** to `role`,
@@ -553,6 +693,29 @@ Two things to know:
 On an **audited** table the shadow trigger's own `INSERT` runs as the invoking
 role, so it needs the same two grants `update_vertex` documents above
 (`INSERT ON <table>_audit`, `USAGE ON SEQUENCE <table>_audit_audit_id_seq`).
+
+#### `create_payload_index(table, realm, key, numeric=False, *, unique=False, scope_by_space=True, index_name=None)`
+Indexes `(payload->>'key')`; returns the index name.
+
+`key` may be several keys for a composite index. `unique=True` makes it a
+constraint rather than an optimisation, and a violation arrives as
+`UniqueConstraintError` carrying this index name. `scope_by_space` decides what
+the uniqueness is *per*:
+
+- `True` (default) leads with `(realm, space, …)`, so each space has its own
+  namespace — two tenants can each hold an `"oliver"` while a duplicate inside
+  one tenant is refused.
+- `False` leads with `(realm, …)`, for a key unique across every space.
+
+A non-unique index over a single key keeps exactly the name and shape earlier
+releases built, so an existing caller does not create a second index alongside
+the one it already has.
+
+`index_name` must fit in **63 bytes**. PostgreSQL truncates longer identifiers
+silently, which would let two distinct indexes become one and drop a uniqueness
+constraint nobody was told about — so this refuses instead. A derived name too
+long to fit is shortened with a hash rather than truncated, so two key tuples
+cannot collide.
 
 #### `get_vertex(table_name, realm, vertex_id)`
 Fetches a single vertex by its numeric ID, UUID, or FQID.

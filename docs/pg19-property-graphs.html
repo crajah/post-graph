@@ -657,7 +657,7 @@ async def _check_pg_version(self):
         <tr>
           <td>
 <pre style="border:none;margin:0;"><code>steps = await client.get_neighbors(
-    "people", realm, vertex_id,
+    realm, "people", vertex_id,
     edge_tables=["knows"],
     direction="out"
 )</code></pre>
@@ -686,7 +686,7 @@ async def _check_pg_version(self):
           <td>
 <pre style="border:none;margin:0;"><code># Requires recursive CTE (max_depth=2)
 steps = await client.traverse(
-    "people", realm, start_id,
+    realm, "people", start_id,
     edge_tables=["knows"],
     direction="out",
     max_depth=2

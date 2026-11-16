@@ -55,7 +55,7 @@ The consequential difference is one sentence in the AGE manual:
 
 That is a reasonable thing for an extension to say — it owns those tables and rewrites them across versions. But it forecloses most of what follows in this article. You cannot safely add a `vector` column with an HNSW index to an AGE vertex, nor your own foreign keys, nor audit triggers, nor a unique index on a property to enforce entity identity.
 
-There is also a practical constraint worth checking before adopting: AGE's setup documentation lists support for **PostgreSQL 11 through 15**, with the project homepage announcing compatibility with **16** in a 1.5.0 release candidate. On PostgreSQL 17 or 18, that means pinning backwards.
+There is also a practical constraint worth checking before adopting. AGE is an extension, built separately for each PostgreSQL major version — its README currently lists 11 through 18 — so it has to be installable on your server. On a self-managed instance that is a package; on a managed service it depends on what the provider offers. post-graph asks for nothing of its own: it is tables, triggers and indexes, plus pgvector only if you want embeddings.
 
 **pgvector alone** solves similarity search beautifully and models no relationships at all. The two are complementary rather than competing — post-graph uses pgvector.
 
@@ -68,7 +68,7 @@ There is also a practical constraint worth checking before adopting: AGE's setup
 | Shadow audit log of every mutation | enterprise | ❌ | ✅ |
 | Append-only history per element | ❌ | ❌ | ✅ |
 | Schema-per-tenant isolation | enterprise | per graph | ✅ |
-| Needs a recent PostgreSQL | n/a | ⚠️ 11–16 | ✅ any supported |
+| Works without installing an extension of its own | n/a | ❌ | ✅ |
 
 ## What the tables actually look like
 
@@ -118,7 +118,7 @@ Each vertex table can carry an `embedding` column with an HNSW index, so similar
 
 ```python
 hits = await pg.vector_search("people", realm="acme", space="production",
-                              query_embedding=vec, limit=10)
+                              query_vector=vec, top_k=10)
 ```
 
 Edges may be embedded too — `vector_search_edges` — which is unusual and mostly optional. Relationships are normally reached by traversing from a matched vertex rather than by similarity. It exists for the cases where the *description* of a relationship is the thing worth searching.
@@ -278,7 +278,7 @@ Conformance is measured, not asserted. The openCypher TCK is 1,615 Cucumber scen
 
 Reach for post-graph when the graph is *part of* an application whose data already lives in PostgreSQL, when tenancy and audit are requirements rather than nice-to-haves, and when the queries are bounded traversals rather than open-ended pattern matching. Multi-tenant SaaS with per-customer graphs, knowledge graphs with embeddings, entity resolution over documents, anything where "which rows changed and who changed them" is a question someone will eventually ask.
 
-Reach for Neo4j when graph querying *is* the product and Cypher is the interface your team wants. Reach for AGE when you want Cypher inside PostgreSQL and can live on a supported major version without adding your own columns, constraints or triggers to the graph tables.
+Reach for Neo4j when graph querying *is* the product and Cypher is the interface your team wants. Reach for AGE when you want Cypher inside PostgreSQL, can install the extension where you run, and do not need to add your own columns, constraints or triggers to the graph tables.
 
 ## Try it
 

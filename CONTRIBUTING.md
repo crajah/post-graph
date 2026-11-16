@@ -33,13 +33,14 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[test]"
 
 export POST_GRAPH_TEST_DSN=postgresql://localhost/post_graph_test
-pytest -q                  # ~635 tests, around five minutes
+pytest -q                  # ~850 tests, around four minutes
 pytest tests/test_range_queries.py -q   # one file
 pytest -q -k traversal                  # one behaviour
 ```
 
 The suite must be green before you open a pull request. CI runs the same
-command on Python 3.9 and 3.13 against a pgvector container.
+command in three jobs — Python 3.11 on PostgreSQL 16, and Python 3.13 on both
+PostgreSQL 16 and 18 — each against a pgvector container.
 
 ## Linting
 

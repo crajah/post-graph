@@ -308,7 +308,7 @@ async def run_asyncpg_demo():
 
         e_auto = await client.add_edge("follows", realm="realm_a", from_id=1, to_id=301, relation_type="knows")
         print(f"    Generated Edge ID:   {e_auto.id}, FQID: {e_auto.fqid}")
-        assert e_auto.fqid.startswith("realm_a/users-users/")
+        assert e_auto.fqid.startswith("realm_a/follows/")
         assert e_auto.id.isdigit()
 
         # 14. delete_realm Verification
@@ -519,7 +519,7 @@ async def run_sqlalchemy_demo():
 
         e_auto = await client.add_edge("sa_follows", realm="default", from_id=1, to_id=301, relation_type="knows")
         print(f"    SQLAlchemy Generated Edge ID:   {e_auto.id}, FQID: {e_auto.fqid}")
-        assert e_auto.fqid.startswith("default/sa_users-sa_users/")
+        assert e_auto.fqid.startswith("default/sa_follows/")
         assert e_auto.id.isdigit()
 
         # Testing delete_realm in SQLAlchemy

@@ -3,6 +3,7 @@
 [![CI](https://github.com/crajah/post-graph/actions/workflows/ci.yml/badge.svg)](https://github.com/crajah/post-graph/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/post-graph.svg)](https://pypi.org/project/post-graph/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/post-graph.svg)](https://pypi.org/project/post-graph/)
+[![PostgreSQL 16 | 18](https://img.shields.io/badge/PostgreSQL-16%20%7C%2018-blue.svg)](https://www.postgresql.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
 A high-performance Python library for using PostgreSQL as a native graph database. It supports **multi-tenant realms**, **application-level space sub-grouping (`space`)**, **pgvector similarity search across main & history tables**, automatic **shadow audit logging**, **append-only history tables**, and high-speed **recursive graph traversals (CTEs)**.
@@ -81,12 +82,14 @@ Every one was executed against a live database before being committed.
 
 ## 📦 Installation
 
-**Requires Python 3.13 and PostgreSQL 18 with `pgvector`.** Those are the
-versions CI runs, and the only ones claimed: this library's behaviour lives in
-the database, so a PostgreSQL version nothing exercises is not a version
-supported. PostgreSQL 18 matters particularly because it changed what
-`GENERATED ALWAYS AS (expr)` means when no storage keyword is given — it was an
-error before 18 and is now `VIRTUAL`, which cannot be indexed.
+**Needs Python 3.11+ and PostgreSQL 16 or 18 with `pgvector`.** CI runs 3.11
+on 16, and 3.13 on both 16 and 18: this library's behaviour lives in the
+database, so each PostgreSQL version is exercised rather than assumed.
+
+PostgreSQL 18 gets its own job because it changed what
+`GENERATED ALWAYS AS (expr)` means when no storage keyword is given — an error
+before 18, and `VIRTUAL` from 18 on, which cannot be indexed. Every generated
+column here says `STORED`, and a test asserts it against the catalogue.
 
 Install `post-graph` from PyPI:
 

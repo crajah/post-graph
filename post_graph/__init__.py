@@ -26,7 +26,7 @@ try:
 except ImportError:
     SQLAlchemyPostGraph = None
 
-__version__ = "1.14.1"
+__version__ = "1.14.2"
 
 __all__ = [
     "JSON_NULL",

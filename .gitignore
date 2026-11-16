@@ -229,3 +229,4 @@ reports/
 
 # openCypher TCK corpus, fetched by tests/tck/fetch_tck.sh
 tests/tck/features/
+**/.DS_Store

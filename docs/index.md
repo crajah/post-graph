@@ -245,6 +245,15 @@ filters={"ended": ABSENT}      # key not present at all
 
 One behaviour to know: containment, not equality, for nested values — `{"tags": ["a"]}` matches a payload whose `tags` is `["a", "b"]`. For scalar filters the two are identical.
 
+## Production primitives (`1.6` – `1.14`)
+
+Everything above covers the core graph model. Later releases added the operational primitives needed so an application never has to drop to raw SQL alongside `post-graph`:
+
+- **Privilege-scoped writes:** `update_vertex` runs a bare `UPDATE` (never `INSERT ... ON CONFLICT`) for roles granted `SELECT, UPDATE`; `insert_vertex` runs untargeted `INSERT ... ON CONFLICT DO NOTHING` for `INSERT`-only append ledgers.
+- **Optimistic concurrency & transactions:** `expected_updated_at` on `update_vertex` / `upsert_vertex` raises `ConcurrentModificationError` on lost races; `client.transaction(user_id=...)` groups multi-step writes atomically while preserving audit attribution (`CommitFailedError` / `NestedTransactionError`).
+- **Duck-typed pools & fleet ops:** `AsyncPostGraph(connection_or_pool=...)` drives any wrapper exposing `acquire()` (the safe shape for per-tenant `SET LOCAL ROLE` behind PgBouncer in transaction mode); `ensure_database`, `reassign_owned_to`, `execute_outside_transaction`, `list_realms`, `drop_realm`, `purge_record_audit`, and `tables_containing_text` cover provisioning, ownership repair, maintenance, and erasure verification.
+- **PostgreSQL 16 & 18 verified in CI:** every generated column explicitly specifies `STORED` (avoiding PostgreSQL 18's `VIRTUAL` default, which cannot be indexed) and is asserted against `pg_attribute`.
+
 ## A Cypher subset, measured rather than claimed
 
 ```python

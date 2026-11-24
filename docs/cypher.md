@@ -102,9 +102,9 @@ where you need a number in the result.
 
 ## Performance
 
-Property predicates use a [promoted column](../post_graph/promoted.py) when the
+Property predicates use a [promoted column](https://github.com/crajah/post-graph/blob/main/post_graph/promoted.py) when the
 table has one, and fall back to `payload->>` otherwise — same rows either way,
-but the promoted path is indexed. Promote the keys you filter on:
+but the promoted path is indexed (see [Indexing JSONB for temporal queries](indexing-jsonb-temporal-queries.md)). Promote the keys you filter on:
 
 ```python
 await client.create_edge_table(

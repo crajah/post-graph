@@ -41,7 +41,7 @@ A property graph is two tables. Vertices with a JSONB payload, edges with a from
 
 What you gain by staying in PostgreSQL is not philosophical. It is that **the graph and the rest of your data share one transaction, one backup and one consistency model.** You can write a vertex, its embedding and an application row in a single transaction and have all three commit or none.
 
-What you give up is openCypher, and a genuinely mature ecosystem of graph tooling. That trade is discussed honestly at the end.
+What you give up is full openCypher (`post-graph` implements a documented subset, not the whole language) and a genuinely mature ecosystem of graph tooling. That trade is discussed honestly at the end.
 
 ## Where the alternatives sit
 
@@ -147,6 +147,7 @@ Since 0.6.0 the walk is filterable, and the filters apply to **every step** rath
 await pg.traverse(
     realm, "entities", start_id, edge_tables=["relations"],
     max_depth=3,
+    direction="both",                     # 'out' (default), 'in', or 'both'
     relation_types=["generates_cash_flow", "consumes_cash"],
     as_of="2020",                       # only edges whose stated validity covers it
     payload_null_keys=["superseded_by"],  # skip edges the caller has closed
@@ -178,7 +179,7 @@ await pg.add_edge("relations", realm, a, b, "generates_cash_flow",
                   payload={"valid_from": "2024-06"})   # unchanged
 ```
 
-`valid_from` and `valid_to` are promoted by default as `pt_valid_from` and `pt_valid_to`, holding the date normalised to `YYYY-MM-DD` so a partial date like `'2024'` orders correctly against a full one. On 65k rows the temporal filter moved from a 588-buffer sequential scan to a 27-buffer bitmap index scan — roughly 31ms to 2.5ms warm — and the margin grows with the table.
+`valid_from` and `valid_to` are promoted by default as `pt_valid_from` and `pt_valid_to`, holding the date normalised to `YYYY-MM-DD` so a partial date like `'2024'` orders correctly against a full one. On 65k rows the temporal filter moved from a 588-buffer sequential scan to a 27-buffer bitmap index scan — roughly 31ms to 2.5ms warm — and the margin grows with the table. The full technique — including the PostgreSQL 18 `VIRTUAL` generated-column default trap — is written up in [Indexing JSONB for temporal queries](indexing-jsonb-temporal-queries.html).
 
 Two things this deliberately does not do. It does not change the model: `Vertex` and `Edge` carry no new fields, because a promoted column is derived, read-only, and present only on tables created since the feature existed. And it does not touch existing tables — a realm created earlier keeps working and returns the same rows through `payload->>`, without the index.
 
@@ -268,7 +269,7 @@ Conformance is measured, not asserted. The openCypher TCK is 1,615 Cucumber scen
 
 ## What this is not
 
-**Cypher is a subset, not the whole language.** Since 1.0.0 there is a Cypher query surface (see below), but it is a documented subset and it refuses what it cannot express. If full Cypher is your primary interface, Neo4j or AGE remains the better tool. What post-graph offers is filtered traversal that composes with the tenancy, temporal and vector predicates the same query already needs — which a separate graph engine cannot do — with Cypher available on top of it.
+**Cypher is a subset, not the whole language.** Since 1.0.0 there is a Cypher query surface (see above), but it is a documented subset and it refuses what it cannot express. If full Cypher is your primary interface, Neo4j or AGE remains the better tool. What post-graph offers is filtered traversal that composes with the tenancy, temporal and vector predicates the same query already needs — which a separate graph engine cannot do — with Cypher available on top of it.
 
 **There is no query planner for graph patterns.** Recursive CTEs are executed by PostgreSQL's planner, which is excellent at set operations and knows nothing about graph cardinality. Deep unbounded traversal on a dense graph will find that out: three hops from one well-connected vertex in a real 3,000-vertex graph reached over 25,000 rows. Bound your depth and cap your fan-out.
 
@@ -287,7 +288,7 @@ pip install post-graph
 createdb mydb && psql -d mydb -c "CREATE EXTENSION vector;"
 ```
 
-`post-graph` is Apache 2.0 licensed and on PyPI. It is also the storage layer beneath **[post-graph-rag](https://github.com/crajah/post-graph-rag)** ([write-up](https://crajah.github.io/post-graph-rag/)), a Graph RAG library that leans on every feature described here — the vector columns for retrieval, the composite keys for tenancy, the audit history for re-indexing, and the filtered traversal for multi-hop question answering over corpora whose facts change.
+`post-graph` is Apache 2.0 licensed and on PyPI. It is also the storage layer beneath **[post-graph-rag](https://github.com/crajah/post-graph-rag)** ([write-up](https://crajah.github.io/post-graph-rag/)) and its IDE memory server **[post-graph-rag-mcp](https://github.com/crajah/post-graph-rag/tree/main/post-graph-rag-mcp)**, a Graph RAG stack that leans on every feature described here — the vector columns for retrieval, the composite keys for tenancy, the audit history for re-indexing, and the filtered traversal for multi-hop question answering over corpora whose facts change.
 
 The paper covering the combined architecture and its evaluation is at [arXiv:2608.24921](https://arxiv.org/abs/2608.24921).
 

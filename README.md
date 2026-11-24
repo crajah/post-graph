@@ -50,7 +50,7 @@ Because the graph is ordinary tables, an edge and the application row it describ
 | openCypher | ✅ | ✅ | subset |
 | Audit log and history built in | enterprise | ❌ | ✅ |
 
-The longer comparison, with sources, is in [the write-up](https://crajah.github.io/post-graph/).
+The longer comparison, with sources, is in [the write-up](https://crajah.github.io/post-graph/). If you want a bi-temporal Graph RAG engine or MCP memory server built on top of `post-graph`, see [post-graph-rag](https://github.com/crajah/post-graph-rag) and [post-graph-rag-mcp](https://github.com/crajah/post-graph-rag/tree/main/post-graph-rag-mcp).
 
 ---
 
@@ -366,8 +366,8 @@ the client over a connection for that.
 
 ### Client Initialization & Management
 
-#### `AsyncPostGraph(dsn, schema_per_realm=False)`
-Initializes the high-performance `asyncpg` graph client.
+#### `AsyncPostGraph(connection_or_pool=None, dsn=None, schema_per_realm=False, pool_min_size=1, pool_max_size=10, **conn_kwargs)`
+Initializes the high-performance `asyncpg` graph client. Pass either `dsn` (managed pool) or `connection_or_pool` (caller-owned `asyncpg.Connection`, `asyncpg.Pool`, or any duck-typed pool wrapper with `acquire()`). Extra `**conn_kwargs` (such as `statement_cache_size=0` or `server_settings={...}`) are forwarded to `asyncpg.create_pool`.
 
 ```python
 client = AsyncPostGraph(
@@ -378,14 +378,14 @@ await client.connect()
 ```
 
 #### `SQLAlchemyPostGraph(dsn_or_engine, schema_per_realm=False)`
-Initializes the `SQLAlchemy` v2.0 async graph client.
+Initializes the `SQLAlchemy` v2.0 async graph client with the same public API as `AsyncPostGraph`.
 
 ---
 
 ### Schema Definition APIs
 
-#### `create_vertex_table(table_name, realm=None, vector_dim=None, temporal_keys=None, promoted_keys=None)`
-Creates a vertex table, associated audit table (`{table_name}_audit`), and append-only data history table (`{table_name}_data`).
+#### `create_vertex_table(table_name, realm=None, vector_dim=None, vector_columns=None, temporal_keys=None, promoted_keys=None, audited=True)`
+Creates a vertex table, associated audit table (`{table_name}_audit`, unless `audited=False`), and append-only data history table (`{table_name}_data`).
 
 ```python
 await client.create_vertex_table(
@@ -398,9 +398,10 @@ await client.create_vertex_table(
 
 `temporal_keys` overrides which pair of payload keys is promoted as dates
 (default `('valid_from', 'valid_to')`); `promoted_keys` promotes further keys
-verbatim. See **Promoted Payload Columns** below.
+verbatim; `vector_columns` declares additional named vector columns (`{"col": dim}`).
+See **Promoted Payload Columns** below.
 
-#### `create_edge_table(table_name=None, from_vertex_table=..., to_vertex_table=..., cascade_delete_from=False, cascade_delete_to=False, realm=None, vector_dim=None, temporal_keys=None, promoted_keys=None)`
+#### `create_edge_table(table_name=None, *, from_vertex_table, to_vertex_table, cascade_delete_from=False, cascade_delete_to=False, realm=None, vector_dim=None, vector_columns=None, temporal_keys=None, promoted_keys=None, audited=True)`
 Creates a directed edge table linking two vertex tables.
 
 Pass `vector_dim` to give edges their own pgvector `embedding` column and HNSW
@@ -416,6 +417,9 @@ await client.create_edge_table(
     vector_dim=1536  # Optional: enables semantic search over relationships
 )
 ```
+
+#### `drop_audit_table(table_name, realm=None, user_id=None)`
+Removes the shadow `{table_name}_audit` table and its trigger for an existing vertex or edge table. Returns `True` if dropped, `False` if already absent.
 
 ---
 
@@ -478,7 +482,7 @@ vertex = await client.upsert_vertex(
 )
 ```
 
-#### `update_vertex(table_name, realm, vertex_id, payload, space=None, replace=False)`
+#### `update_vertex(table_name, realm, vertex_id, payload=None, embedding=None, embeddings=None, user_id=None, space=None, replace=False, *, expected_updated_at=None)`
 Changes an existing vertex with a bare `UPDATE`, and never an `INSERT`. Returns the
 updated vertex, or `None` when no row matches `(realm, vertex_id)` — it does not
 create the row.
@@ -783,6 +787,14 @@ all_vertices = await client.get_vertices("agents", realm="proj_alpha")
 #### `delete_vertex(table_name, realm, vertex_id, user_id=None)`
 Deletes a vertex and automatically cascades deletion to referencing edges and history records.
 
+#### `newest_vertex(table_name, realm, space=None)` & `advisory_xact_lock(table_name, realm)`
+`newest_vertex` returns the highest-`id` vertex in `(realm, space)` (or `None` when empty) — useful for append-only chains and ledger tips. Pair it with `advisory_xact_lock` on a connection-bound transaction to serialize concurrent appenders targeting the same `(realm, table_name)` without locking unrelated tables.
+
+#### `batch_upsert_vertices` / `batch_upsert_edges` & `fulltext_search_vertices` / `fulltext_search_edges`
+- `batch_upsert_vertices(table_name, realm, items, user_id=None)` and `batch_upsert_edges(...)`: bulk upsert lists of vertex/edge dicts in a single transactional batch.
+- `fulltext_search_vertices(table_name, realm, query, fields=None, config="english", limit=20, space=None)` and `fulltext_search_edges(...)`: PostgreSQL `to_tsvector` / `plainto_tsquery` search over JSONB payload fields.
+- `find_edges(...)` and `count_edges(...)`: mirror `find_vertices` and `count_vertices` with JSONB containment (`filters`), range predicates (`where`), `relation_type`, `order_by`, and `limit`.
+
 ---
 
 ### Edge Operations
@@ -884,7 +896,7 @@ history = await client.get_vertex_data("agents", realm="proj_alpha", vertex_id=1
 ### Advanced Graph Traversals & Shortest Path (CTEs)
 
 #### `traverse`
-Executes recursive CTE traversals across edge tables.
+Executes recursive CTE traversals across edge tables. Filters (`direction`, `relation_types`, `as_of`, `payload_null_keys`, `space`) are pushed into **every step** of the walk so paths cannot pass through excluded edges.
 
 ```python
 paths = await client.traverse(
@@ -892,14 +904,22 @@ paths = await client.traverse(
     start_table="agents",
     start_id=101,
     edge_tables=["spawns", "collaborates"],
-    max_depth=4
+    max_depth=4,
+    direction="both",                  # 'out' (default), 'in', or 'both'
+    relation_types=["spawned_progeny"], # optional predicate filter
+    as_of="2026-07-01",                # optional valid-time filter
+    payload_null_keys=["superseded_by"], # optional: skip edges with a non-null key
+    space="production",                # optional space filter
 )
 for p in paths:
     print(f"Depth: {p['depth']} | Path: {' -> '.join(p['path'])}")
 ```
 
-#### `shortest_path`
-Finds the shortest cycle-free path between two vertices.
+#### `get_neighbors` · `shortest_path` · `weighted_shortest_path` · `connected_components`
+- `get_neighbors(realm, vertex_table, vertex_id, edge_tables, direction="out")`: 1-hop neighbors (`"out"`, `"in"`, or `"both"`).
+- `shortest_path(realm, start_table, start_id, target_table, target_id, edge_tables, max_depth=5, direction="out")`: shortest cycle-free path between two vertices.
+- `weighted_shortest_path(..., weight_field="weight", max_depth=10, direction="out")`: lowest-cost path using a numeric JSONB edge weight.
+- `connected_components(realm, vertex_table, edge_tables, direction="both")`: partitions vertices into connected components.
 
 ```python
 sp = await client.shortest_path(
@@ -909,7 +929,8 @@ sp = await client.shortest_path(
     target_table="agents",
     target_id=105,
     edge_tables=["spawns", "collaborates"],
-    max_depth=5
+    max_depth=5,
+    direction="out",
 )
 if sp:
     print(f"Shortest path found at depth {sp['depth']}: {sp['path']}")

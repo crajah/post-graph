@@ -288,7 +288,7 @@ pip install post-graph
 createdb mydb && psql -d mydb -c "CREATE EXTENSION vector;"
 ```
 
-`post-graph` is Apache 2.0 licensed and on PyPI. It is also the storage layer beneath **[post-graph-rag](https://github.com/crajah/post-graph-rag)** ([write-up](https://crajah.github.io/post-graph-rag/)) and its IDE memory server **[post-graph-rag-mcp](https://github.com/crajah/post-graph-rag/tree/main/post-graph-rag-mcp)**, a Graph RAG stack that leans on every feature described here — the vector columns for retrieval, the composite keys for tenancy, the audit history for re-indexing, and the filtered traversal for multi-hop question answering over corpora whose facts change.
+`post-graph` is Apache 2.0 licensed and on PyPI. It is also the storage layer beneath **[post-graph-rag](https://github.com/crajah/post-graph-rag)** ([write-up](https://crajah.github.io/post-graph-rag/)) and its MCP memory server **[post-graph-rag-mcp](https://crajah.github.io/post-graph-rag/mcp.html)** (one-command setup for Claude Code, Claude Desktop, Gemini CLI, Cursor, Windsurf, VS Code, and Codex CLI) — a Graph RAG stack that leans on every feature described here: the vector columns for retrieval, the composite keys for tenancy, the audit history for re-indexing, and the filtered traversal for multi-hop question answering over corpora whose facts change.
 
 The paper covering the combined architecture and its evaluation is at [arXiv:2608.24921](https://arxiv.org/abs/2608.24921).
 

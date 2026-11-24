@@ -50,7 +50,21 @@ Because the graph is ordinary tables, an edge and the application row it describ
 | openCypher | ✅ | ✅ | subset |
 | Audit log and history built in | enterprise | ❌ | ✅ |
 
-The longer comparison, with sources, is in [the write-up](https://crajah.github.io/post-graph/). If you want a bi-temporal Graph RAG engine or MCP memory server built on top of `post-graph`, see [post-graph-rag](https://github.com/crajah/post-graph-rag) and [post-graph-rag-mcp](https://github.com/crajah/post-graph-rag/tree/main/post-graph-rag-mcp).
+The longer comparison, with sources, is in [the write-up](https://crajah.github.io/post-graph/).
+
+### Using with Claude, Gemini CLI, Cursor & MCP
+
+Looking for persistent Graph RAG memory for AI coding assistants backed by `post-graph`? [`post-graph-rag`](https://github.com/crajah/post-graph-rag) and its MCP server [`post-graph-rag-mcp`](https://crajah.github.io/post-graph-rag/mcp.html) run directly on `post-graph` with zero sidecar LLM API keys:
+
+```bash
+# Claude Code (zero-config local Postgres + local ONNX embeddings)
+claude mcp add post-graph-rag -- uvx --python 3.12 --from "post-graph-rag-mcp[embedded,local-embed]" post-graph-rag-mcp
+
+# Gemini CLI
+gemini mcp add post-graph-rag uvx -- --python 3.12 --from "post-graph-rag-mcp[embedded,local-embed]" post-graph-rag-mcp
+```
+
+See the [full MCP & AI Client Guide](https://crajah.github.io/post-graph-rag/mcp.html) for Claude Desktop, Cursor, Windsurf, VS Code, Codex CLI, existing PostgreSQL / Neon / Supabase, and a tool walkthrough.
 
 ---
 

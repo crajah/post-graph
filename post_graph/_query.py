@@ -83,3 +83,42 @@ def validate_order_column(column: str, allowed) -> str:
             f"use order_by= instead."
         )
     return column
+
+
+# Upper bound for automatic BIGSERIAL sequence advancement when a caller passes
+# an explicit integer vertex_id or edge_id. Sequential IDs start at 1 and grow
+# by +1 per write (even 1M writes/sec for a century stays well below 2^53),
+# whereas deterministic 63-bit hashed IDs (e.g. truncated SHA-256) land across
+# [0, 2^63 - 1]. Advancing a BIGSERIAL sequence to a 63-bit hash near INT64_MAX
+# permanently exhausts nextval() on the next sequence-assigned write while
+# providing no collision protection against uniform hashes.
+MAX_SEQUENCE_SYNC_ID = (1 << 53) - 1
+
+
+def should_sync_sequence(record_id_int: int, sync_sequence: bool) -> bool:
+    """Return True when an explicit integer ID should advance the table sequence."""
+    return bool(sync_sequence) and 1 <= record_id_int <= MAX_SEQUENCE_SYNC_ID
+
+
+def sequence_advance_sql(table_ref_pg: str, *, param: str = "$1") -> str:
+    """O(1) monotonic sequence advancement SQL with zero table scan.
+
+    Reads only ``pg_sequence_last_value(seq)`` on the sequence relation itself
+    rather than ``SELECT MAX(id) FROM <table>``, avoiding both full sequential
+    scans under row-level security and sequence rewinds when RLS hides higher
+    IDs written in other spaces. Requires both ``SELECT`` and ``UPDATE`` on the
+    sequence: without ``SELECT``, ``pg_sequence_last_value`` returns NULL even
+    on an advanced sequence, so skipping ``setval`` prevents rewinding it; and
+    without ``UPDATE``, ``setval`` would fail with ``InsufficientPrivilegeError``
+    on a write that never needed the sequence in the first place.
+    """
+    return (
+        "SELECT setval("
+        f"seq, GREATEST(CAST({param} AS bigint), COALESCE(pg_sequence_last_value(seq), 1)), true"
+        ") "
+        f"FROM (SELECT CAST(pg_get_serial_sequence('{table_ref_pg}', 'id') AS regclass) AS seq) s "
+        "WHERE seq IS NOT NULL "
+        "AND has_sequence_privilege(seq, 'SELECT') "
+        "AND has_sequence_privilege(seq, 'UPDATE') "
+        f"AND CAST({param} AS bigint) > COALESCE(pg_sequence_last_value(seq), 0)"
+    )

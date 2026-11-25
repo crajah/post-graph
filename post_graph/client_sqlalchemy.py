@@ -19,6 +19,8 @@ from post_graph._query import (
     EDGE_ORDER_COLUMNS,
     VERTEX_ORDER_COLUMNS,
     advisory_key,
+    sequence_advance_sql,
+    should_sync_sequence,
     validate_order_column,
 )
 from post_graph._shared import SharedLogic
@@ -1474,6 +1476,7 @@ class SQLAlchemyPostGraph(SharedLogic):
         embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
         space: Optional[str] = "default",
+        sync_sequence: bool = True,
     ) -> Vertex:
         """Add a new vertex. Raises TableExistsError if it already exists."""
         self._validate_identifier(table_name)
@@ -1529,11 +1532,10 @@ class SQLAlchemyPostGraph(SharedLogic):
 
             try:
                 row = await self._fetchrow(conn, query, **kwargs)
-                if vertex_id is not None:
+                if vertex_id is not None and should_sync_sequence(v_id_int, sync_sequence):
                     await conn.execute(
-                        text(
-                            f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"
-                        )
+                        text(sequence_advance_sql(table_ref_pg, param=":seq_id")),
+                        {"seq_id": v_id_int},
                     )
 
                 emb_dict = None
@@ -3120,6 +3122,7 @@ class SQLAlchemyPostGraph(SharedLogic):
         check_cycle: Union[bool, List[str]] = False,
         space: Optional[str] = "default",
         embedding: Optional[List[float]] = None,
+        sync_sequence: bool = True,
     ) -> Edge:
         """Add a new edge. Raises TableExistsError if it already exists.
 
@@ -3210,11 +3213,10 @@ class SQLAlchemyPostGraph(SharedLogic):
 
             try:
                 row = await self._fetchrow(conn, query, **kwargs)
-                if edge_id is not None:
+                if edge_id is not None and should_sync_sequence(e_id_int, sync_sequence):
                     await conn.execute(
-                        text(
-                            f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"
-                        )
+                        text(sequence_advance_sql(table_ref_pg, param=":seq_id")),
+                        {"seq_id": e_id_int},
                     )
                 emb = None
                 if "embedding_text" in row and row["embedding_text"]:

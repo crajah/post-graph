@@ -17,6 +17,8 @@ from post_graph._query import (
     EDGE_ORDER_COLUMNS,
     VERTEX_ORDER_COLUMNS,
     advisory_key,
+    sequence_advance_sql,
+    should_sync_sequence,
     validate_order_column,
 )
 from post_graph._shared import SharedLogic
@@ -1586,8 +1588,16 @@ class AsyncPostGraph(SharedLogic):
         embeddings: Optional[Dict[str, List[float]]] = None,
         user_id: Optional[str] = None,
         space: Optional[str] = "default",
+        sync_sequence: bool = True,
     ) -> Vertex:
-        """Add a new vertex. Raises TableExistsError if it already exists."""
+        """Add a new vertex. Raises TableExistsError if it already exists.
+
+        When ``vertex_id`` is supplied and ``sync_sequence=True`` (the default),
+        the table's ``id`` sequence is advanced monotonically in ``O(1)``
+        against ``pg_sequence_last_value`` (without scanning the table or
+        rewinding under RLS). Pass ``sync_sequence=False`` (or a 63-bit hashed
+        ID above ``MAX_SEQUENCE_SYNC_ID``) to skip sequence advancement entirely.
+        """
         self._validate_identifier(table_name)
         if space == RESERVED_SPACE_ALL:
             raise ReservedSpaceError(
@@ -1661,10 +1671,8 @@ class AsyncPostGraph(SharedLogic):
                     RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
                     """
                     row = await conn.fetchrow(query, realm, v_id_int, eff_space, payload_json)
-                if vertex_id is not None:
-                    await conn.execute(
-                        f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"
-                    )
+                if vertex_id is not None and should_sync_sequence(v_id_int, sync_sequence):
+                    await conn.execute(sequence_advance_sql(table_ref_pg, param="$1"), v_id_int)
 
                 emb_dict = None
                 if embeddings:
@@ -3427,6 +3435,7 @@ class AsyncPostGraph(SharedLogic):
         check_cycle: Union[bool, List[str]] = False,
         space: Optional[str] = "default",
         embedding: Optional[List[float]] = None,
+        sync_sequence: bool = True,
     ) -> Edge:
         """Add a new edge. Raises TableExistsError if it already exists.
 
@@ -3526,10 +3535,8 @@ class AsyncPostGraph(SharedLogic):
 
             try:
                 row = await conn.fetchrow(query, *args)
-                if edge_id is not None:
-                    await conn.execute(
-                        f"SELECT setval(pg_get_serial_sequence('{table_ref_pg}', 'id'), (SELECT COALESCE(MAX(id), 1) FROM {table_ref}))"
-                    )
+                if edge_id is not None and should_sync_sequence(e_id_int, sync_sequence):
+                    await conn.execute(sequence_advance_sql(table_ref_pg, param="$1"), e_id_int)
                 emb = None
                 if "embedding_text" in row and row["embedding_text"]:
                     emb = [

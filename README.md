@@ -481,8 +481,12 @@ Upserts a vertex object into a specific `{realm}` and optional `{space}`.
 `add_vertex` inserts and refuses a duplicate: a `vertex_id` already in use
 raises `TableExistsError`, naming the id, the table and the realm. (Before
 1.11.0 the duplicate escaped as a raw `asyncpg.UniqueViolationError` — the
-handler was there, the `INSERT` was outside it.) `upsert_vertex` merges
-instead.
+handler was there, the `INSERT` was outside it.) When an explicit `vertex_id`
+is supplied, `add_vertex` (and `add_edge` with `edge_id`) advances the table's
+`id` sequence monotonically in `O(1)` via `pg_sequence_last_value` without
+scanning the table or rewinding under RLS; pass `sync_sequence=False` (or a
+63-bit hashed ID above `MAX_SEQUENCE_SYNC_ID`) to skip sequence advancement
+altogether. `upsert_vertex` merges instead.
 
 ```python
 vertex = await client.upsert_vertex(
@@ -740,7 +744,7 @@ does without is a privilege the other writes need:
 | :--- | :--- | :--- |
 | `RETURNING` | `SELECT` on every column named | PostgreSQL privilege-checks them column by column, even when the caller discards the result |
 | `ON CONFLICT (realm, id)` | `SELECT` | naming the arbiter reads the index; the untargeted form does not |
-| `setval(…, MAX(id))` | `SELECT` | `add_vertex` resynchronises the sequence after a supplied id |
+| `setval(seq, …)` | `SELECT, UPDATE` on sequence | `add_vertex` advances the sequence monotonically when `sync_sequence=True` |
 
 So this is the write for an append-only ledger whose containment is its grant:
 the writer holds `INSERT` and nothing else, so no path it reaches can amend or

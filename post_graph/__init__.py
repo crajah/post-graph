@@ -1,5 +1,5 @@
 from post_graph._ddl import is_concurrent_creation, is_retryable_ddl
-from post_graph._query import ADVISORY_CLASSID, advisory_key
+from post_graph._query import ADVISORY_CLASSID, MAX_SEQUENCE_SYNC_ID, advisory_key
 from post_graph.client_asyncpg import RESERVED_SPACE_ALL, AsyncPostGraph
 from post_graph.cypher import (
     CypherSession,
@@ -26,7 +26,7 @@ try:
 except ImportError:
     SQLAlchemyPostGraph = None
 
-__version__ = "1.14.2"
+__version__ = "1.15.0"
 
 __all__ = [
     "JSON_NULL",
@@ -36,6 +36,7 @@ __all__ = [
     'CypherTranslationError',
     "__version__",
     "ADVISORY_CLASSID",
+    "MAX_SEQUENCE_SYNC_ID",
     "advisory_key",
     "is_concurrent_creation",
     "is_retryable_ddl",

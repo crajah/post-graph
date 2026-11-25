@@ -23,7 +23,7 @@ from post_graph._query import (
     should_sync_sequence,
     validate_order_column,
 )
-from post_graph._shared import SharedLogic
+from post_graph._shared import PG_COLUMN_EXISTS_SA_SQL, SharedLogic
 from post_graph.errors import (
     CommitFailedError,
     ConcurrentModificationError,
@@ -407,6 +407,33 @@ class SQLAlchemyPostGraph(SharedLogic):
             row = await self._fetchrow(conn, query, table_name=table_name)
         return row is not None
 
+    async def _table_has_column(
+        self,
+        conn: AsyncConnection,
+        table_name: str,
+        realm: Optional[str] = None,
+        column_name: str = "embedding",
+    ) -> bool:
+        """Return True if *table_name* has *column_name*, cached per (realm, table, column)."""
+        cached = self._lookup_cached_column(realm, table_name, column_name)
+        if cached is not None:
+            return cached
+        table_ref = self._get_table_ref(table_name, realm)
+        row = await self._fetchrow(
+            conn, PG_COLUMN_EXISTS_SA_SQL, table_ref=table_ref, col_name=column_name
+        )
+        if not row or not row["rel_exists"]:
+            return False
+        present = bool(row["col_exists"])
+        self._store_cached_column(realm, table_name, column_name, present)
+        return present
+
+    async def _table_has_embedding(
+        self, conn: AsyncConnection, table_name: str, realm: Optional[str] = None
+    ) -> bool:
+        """Return True if the given table has an 'embedding' column."""
+        return await self._table_has_column(conn, table_name, realm, "embedding")
+
     async def _execute_ddl(
         self, conn: AsyncConnection, sql: str, tolerate_existing: bool = True
     ) -> None:
@@ -625,7 +652,7 @@ class SQLAlchemyPostGraph(SharedLogic):
             )
 
         await self._provision(_op)
-        for cache in (self._schema_cache, self._promoted_cache):
+        for cache in (self._schema_cache, self._promoted_cache, self._col_cache_dict()):
             for key in [k for k in cache if isinstance(k, tuple) and k and k[0] == realm]:
                 cache.pop(key, None)
         return existed
@@ -778,6 +805,7 @@ class SQLAlchemyPostGraph(SharedLogic):
         scoped._tx_user_id = user_id
         scoped._schema_cache = self._schema_cache
         scoped._promoted_cache = self._promoted_cache
+        scoped._column_cache = self._col_cache_dict()
         tx = await conn.begin()
         try:
             if ms is not None:
@@ -1119,6 +1147,7 @@ class SQLAlchemyPostGraph(SharedLogic):
                 )
 
         await self._provision(_op)
+        self._record_vector_columns_created(realm, table_name, vector_dim, vector_columns)
 
     async def create_edge_table(
         self,
@@ -1461,6 +1490,7 @@ class SQLAlchemyPostGraph(SharedLogic):
                 )
 
         await self._provision(_op)
+        self._record_vector_columns_created(realm, table_name, vector_dim, vector_columns)
 
         # Clear cached schema as a new edge is declared
         cache_key = (realm, table_name) if self.schema_per_realm else table_name
@@ -1504,33 +1534,38 @@ class SQLAlchemyPostGraph(SharedLogic):
 
             v_id_str = str(v_id_int)
 
-            if vec_str:
-                query = f"""
-                INSERT INTO {table_ref} (realm, id, space, payload, embedding)
-                VALUES (:realm, :id, :space, CAST(:payload AS JSONB), CAST(:vec AS vector))
-                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
-                """
-                kwargs = {
-                    "realm": realm,
-                    "id": v_id_int,
-                    "space": eff_space,
-                    "payload": payload_json,
-                    "vec": vec_str,
-                }
-            else:
-                query = f"""
-                INSERT INTO {table_ref} (realm, id, space, payload)
-                VALUES (:realm, :id, :space, CAST(:payload AS JSONB))
-                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
-                """
-                kwargs = {
-                    "realm": realm,
-                    "id": v_id_int,
-                    "space": eff_space,
-                    "payload": payload_json,
-                }
-
             try:
+                has_emb = (
+                    await self._table_has_embedding(conn, table_name, realm)
+                    if vec_str
+                    else False
+                )
+                if vec_str and has_emb:
+                    query = f"""
+                    INSERT INTO {table_ref} (realm, id, space, payload, embedding)
+                    VALUES (:realm, :id, :space, CAST(:payload AS JSONB), CAST(:vec AS vector))
+                    RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
+                    """
+                    kwargs = {
+                        "realm": realm,
+                        "id": v_id_int,
+                        "space": eff_space,
+                        "payload": payload_json,
+                        "vec": vec_str,
+                    }
+                else:
+                    query = f"""
+                    INSERT INTO {table_ref} (realm, id, space, payload)
+                    VALUES (:realm, :id, :space, CAST(:payload AS JSONB))
+                    RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
+                    """
+                    kwargs = {
+                        "realm": realm,
+                        "id": v_id_int,
+                        "space": eff_space,
+                        "payload": payload_json,
+                    }
+
                 row = await self._fetchrow(conn, query, **kwargs)
                 if vertex_id is not None and should_sync_sequence(v_id_int, sync_sequence):
                     await conn.execute(
@@ -1715,45 +1750,50 @@ class SQLAlchemyPostGraph(SharedLogic):
             if expected_updated_at is not None:
                 cas = f" WHERE {table_ref}.updated_at = :_cas_ts"
 
-            if vec_str:
-                query = f"""
-                INSERT INTO {table_ref} (realm, id, space, payload, embedding)
-                VALUES (:realm, :id, :space, CAST(:payload AS JSONB), CAST(:vec AS vector))
-                ON CONFLICT (realm, id) DO UPDATE
-                SET space = EXCLUDED.space,
-                    payload = {payload_sql},
-                    embedding = EXCLUDED.embedding,
-                    updated_at = clock_timestamp(){cas}
-                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
-                """
-                kwargs = {
-                    "realm": realm,
-                    "id": v_id_int,
-                    "space": eff_space,
-                    "payload": payload_json,
-                    "vec": vec_str,
-                }
-            else:
-                query = f"""
-                INSERT INTO {table_ref} (realm, id, space, payload)
-                VALUES (:realm, :id, :space, CAST(:payload AS JSONB))
-                ON CONFLICT (realm, id) DO UPDATE
-                SET space = EXCLUDED.space,
-                    payload = {payload_sql},
-                    updated_at = clock_timestamp(){cas}
-                RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
-                """
-                kwargs = {
-                    "realm": realm,
-                    "id": v_id_int,
-                    "space": eff_space,
-                    "payload": payload_json,
-                }
-
-            if expected_updated_at is not None:
-                kwargs["_cas_ts"] = expected_updated_at
-
             try:
+                has_emb = (
+                    await self._table_has_embedding(conn, table_name, realm)
+                    if vec_str
+                    else False
+                )
+                if vec_str and has_emb:
+                    query = f"""
+                    INSERT INTO {table_ref} (realm, id, space, payload, embedding)
+                    VALUES (:realm, :id, :space, CAST(:payload AS JSONB), CAST(:vec AS vector))
+                    ON CONFLICT (realm, id) DO UPDATE
+                    SET space = EXCLUDED.space,
+                        payload = {payload_sql},
+                        embedding = EXCLUDED.embedding,
+                        updated_at = clock_timestamp(){cas}
+                    RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text, CAST(embedding AS TEXT) AS embedding_text
+                    """
+                    kwargs = {
+                        "realm": realm,
+                        "id": v_id_int,
+                        "space": eff_space,
+                        "payload": payload_json,
+                        "vec": vec_str,
+                    }
+                else:
+                    query = f"""
+                    INSERT INTO {table_ref} (realm, id, space, payload)
+                    VALUES (:realm, :id, :space, CAST(:payload AS JSONB))
+                    ON CONFLICT (realm, id) DO UPDATE
+                    SET space = EXCLUDED.space,
+                        payload = {payload_sql},
+                        updated_at = clock_timestamp(){cas}
+                    RETURNING realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text
+                    """
+                    kwargs = {
+                        "realm": realm,
+                        "id": v_id_int,
+                        "space": eff_space,
+                        "payload": payload_json,
+                    }
+
+                if expected_updated_at is not None:
+                    kwargs["_cas_ts"] = expected_updated_at
+
                 row = await self._fetchrow(conn, query, **kwargs)
                 if row is None:
                     # The only way RETURNING yields nothing: the row existed,
@@ -1864,7 +1904,7 @@ class SQLAlchemyPostGraph(SharedLogic):
             returning = (
                 "realm, id, space, fqid, payload, created_at, updated_at, uuid::text AS uuid_text"
             )
-            if vec_str:
+            if vec_str and await self._table_has_embedding(conn, table_name, realm):
                 kwargs["vec"] = vec_str
                 set_parts.append("embedding = CAST(:vec AS vector)")
                 returning += ", CAST(embedding AS TEXT) AS embedding_text"
@@ -1995,6 +2035,7 @@ class SQLAlchemyPostGraph(SharedLogic):
                 relation_type=item["relation_type"],
                 edge_id=item.get("edge_id"),
                 payload=item.get("payload"),
+                embedding=item.get("embedding"),
                 space=item.get("space", "default"),
                 replace=item.get("replace", False),
                 user_id=user_id,
@@ -2003,17 +2044,35 @@ class SQLAlchemyPostGraph(SharedLogic):
         return results
 
     async def get_vertex(
-        self, table_name: str, realm: str, vertex_id: str, strict: bool = False
+        self,
+        table_name: str,
+        realm: str,
+        vertex_id: str,
+        strict: bool = False,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> Optional[Vertex]:
         """Fetch a vertex by realm and id or uuid.
 
         When *strict* is True, raises VertexNotFoundError instead of returning None.
         """
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         v_str = str(vertex_id).strip()
 
         if len(v_str) == 36 and "-" in v_str:
-            result = await self.get_vertex_by_uuid(table_name, realm, v_str)
+            result = await self.get_vertex_by_uuid(
+                table_name,
+                realm,
+                v_str,
+                payload_fields=payload_fields,
+                exclude_payload_fields=exclude_payload_fields,
+                include_embedding=include_embedding,
+            )
             if strict and result is None:
                 raise VertexNotFoundError(
                     f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'."
@@ -2023,7 +2082,14 @@ class SQLAlchemyPostGraph(SharedLogic):
         try:
             v_id_int = int(v_str.split("/")[-1]) if "/" in v_str else int(v_str)
         except ValueError:
-            result = await self.get_vertex_by_uuid(table_name, realm, v_str)
+            result = await self.get_vertex_by_uuid(
+                table_name,
+                realm,
+                v_str,
+                payload_fields=payload_fields,
+                exclude_payload_fields=exclude_payload_fields,
+                include_embedding=include_embedding,
+            )
             if strict and result is None:
                 raise VertexNotFoundError(
                     f"Vertex '{vertex_id}' not found in table '{table_name}', realm '{realm}'."
@@ -2033,15 +2099,22 @@ class SQLAlchemyPostGraph(SharedLogic):
         table_ref = self._get_table_ref(table_name, realm)
 
         async def _op(conn):
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if include_embedding
+                else False
+            )
+            params: Dict[str, Any] = {"realm": realm, "id": v_id_int}
+            payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("t", has_emb)
             query = f"""
-            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
-                   t.uuid::text AS uuid_text,
-                   to_jsonb(t)->>'embedding' AS embedding_text
+            SELECT t.realm, t.id, t.space, t.fqid, {payload_expr}, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text{emb_expr}
             FROM {table_ref} t
             WHERE t.realm = :realm AND t.id = :id
             """
             try:
-                row = await self._fetchrow(conn, query, realm=realm, id=v_id_int)
+                row = await self._fetchrow(conn, query, **params)
                 if not row:
                     return None
 
@@ -2083,18 +2156,37 @@ class SQLAlchemyPostGraph(SharedLogic):
         return result
 
     async def get_vertices(
-        self, table_name: str, realm: str, space: Optional[str] = None, limit: Optional[int] = None
+        self,
+        table_name: str,
+        realm: str,
+        space: Optional[str] = None,
+        limit: Optional[int] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[Vertex]:
         """Fetch all vertices in a realm, optionally filtered by space."""
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         table_ref = self._get_table_ref(table_name, realm)
 
         async def _op(conn):
-            params = {"realm": realm}
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if include_embedding
+                else False
+            )
+            params: Dict[str, Any] = {"realm": realm}
             space_clause = ""
             if space and space != RESERVED_SPACE_ALL:
                 params["space"] = space
                 space_clause = " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+
+            payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("t", has_emb)
 
             limit_clause = ""
             if limit:
@@ -2102,9 +2194,8 @@ class SQLAlchemyPostGraph(SharedLogic):
                 limit_clause = " LIMIT :limit"
 
             query = f"""
-            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
-                   t.uuid::text AS uuid_text,
-                   to_jsonb(t)->>'embedding' AS embedding_text
+            SELECT t.realm, t.id, t.space, t.fqid, {payload_expr}, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text{emb_expr}
             FROM {table_ref} t
             WHERE t.realm = :realm{space_clause}
             ORDER BY t.id ASC{limit_clause}
@@ -2154,16 +2245,29 @@ class SQLAlchemyPostGraph(SharedLogic):
         realms: List[str],
         space: Optional[str] = None,
         limit: Optional[int] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[Vertex]:
         """Fetch vertices across multiple realms."""
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
 
         async def _op(conn):
             if self.schema_per_realm:
                 parts = []
                 params: Dict[str, Any] = {}
+                payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
                 for i, r in enumerate(realms):
                     tref = self._get_table_ref(table_name, r)
+                    has_emb = (
+                        await self._table_has_embedding(conn, table_name, r)
+                        if include_embedding
+                        else False
+                    )
                     rp = f"r{i}"
                     params[rp] = r
                     space_clause = ""
@@ -2171,8 +2275,9 @@ class SQLAlchemyPostGraph(SharedLogic):
                         sp = f"sp{i}"
                         params[sp] = space
                         space_clause = f" AND (t.space = :{sp} OR (:{sp} = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+                    emb_expr = self._embedding_select_clause("t", has_emb, union_branch=True)
                     parts.append(
-                        f"SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text, to_jsonb(t)->>'embedding' AS embedding_text FROM {tref} t WHERE t.realm = :{rp}{space_clause}"
+                        f"SELECT t.realm, t.id, t.space, t.fqid, {payload_expr}, t.created_at, t.updated_at, t.uuid::text AS uuid_text{emb_expr} FROM {tref} t WHERE t.realm = :{rp}{space_clause}"
                     )
                 query = " UNION ALL ".join(parts) + " ORDER BY realm, id ASC"
                 if limit:
@@ -2180,19 +2285,25 @@ class SQLAlchemyPostGraph(SharedLogic):
                     query += " LIMIT :limit"
             else:
                 table_ref = self._get_table_ref(table_name, realms[0])
+                has_emb = (
+                    await self._table_has_embedding(conn, table_name, realms[0])
+                    if include_embedding
+                    else False
+                )
                 params = {"realms": realms}
                 space_clause = ""
                 if space and space != RESERVED_SPACE_ALL:
                     params["space"] = space
                     space_clause = " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+                payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+                emb_expr = self._embedding_select_clause("t", has_emb)
                 limit_clause = ""
                 if limit:
                     params["limit"] = limit
                     limit_clause = " LIMIT :limit"
                 query = f"""
-                SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
-                       t.uuid::text AS uuid_text,
-                       to_jsonb(t)->>'embedding' AS embedding_text
+                SELECT t.realm, t.id, t.space, t.fqid, {payload_expr}, t.created_at, t.updated_at,
+                       t.uuid::text AS uuid_text{emb_expr}
                 FROM {table_ref} t
                 WHERE t.realm = ANY(:realms){space_clause}
                 ORDER BY t.realm, t.id ASC{limit_clause}
@@ -2269,7 +2380,14 @@ class SQLAlchemyPostGraph(SharedLogic):
         )
 
     async def newest_vertex(
-        self, table_name: str, realm: str, space: Optional[str] = None
+        self,
+        table_name: str,
+        realm: str,
+        space: Optional[str] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> Optional[Vertex]:
         """The most recently inserted row of a vertex table, or None if empty.
 
@@ -2286,6 +2404,9 @@ class SQLAlchemyPostGraph(SharedLogic):
             order_by_column="id",
             descending=True,
             limit=1,
+            payload_fields=payload_fields,
+            exclude_payload_fields=exclude_payload_fields,
+            include_embedding=include_embedding,
         )
         return rows[0] if rows else None
 
@@ -2300,6 +2421,10 @@ class SQLAlchemyPostGraph(SharedLogic):
         order_by: Optional[str] = None,
         order_by_column: Optional[str] = None,
         descending: bool = False,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[Vertex]:
         """Find vertices whose payload matches the given key-value filters.
 
@@ -2326,6 +2451,9 @@ class SQLAlchemyPostGraph(SharedLogic):
         predicate on the same key.
         """
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         table_ref = self._get_table_ref(table_name, realm)
         if order_by is not None:
             self._validate_payload_key(order_by)
@@ -2367,14 +2495,20 @@ class SQLAlchemyPostGraph(SharedLogic):
                 order_clause = f"ORDER BY {acc} {'DESC' if descending else 'ASC'}, t.id ASC"
             else:
                 order_clause = "ORDER BY t.id ASC"
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if include_embedding
+                else False
+            )
+            payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("t", has_emb)
             limit_clause = ""
             if limit:
                 params["limit"] = limit
                 limit_clause = " LIMIT :limit"
             query = f"""
-            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
-                   t.uuid::text AS uuid_text,
-                   to_jsonb(t)->>'embedding' AS embedding_text
+            SELECT t.realm, t.id, t.space, t.fqid, {payload_expr}, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text{emb_expr}
             FROM {table_ref} t
             WHERE t.realm = :realm{clauses}
             {order_clause}{limit_clause}
@@ -2419,26 +2553,44 @@ class SQLAlchemyPostGraph(SharedLogic):
                 return await _op(conn)
 
     async def get_vertex_by_uuid(
-        self, table_name: str, realm: str, uuid: str, strict: bool = False
+        self,
+        table_name: str,
+        realm: str,
+        uuid: str,
+        strict: bool = False,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> Optional[Vertex]:
         """Fetch a vertex record by its UUID.
 
         When *strict* is True, raises VertexNotFoundError instead of returning None.
         """
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         table_ref = self._get_table_ref(table_name, realm)
         uuid_str = str(uuid).strip()
 
         async def _op(conn):
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if include_embedding
+                else False
+            )
+            params: Dict[str, Any] = {"realm": realm, "uuid": uuid_str}
+            payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("t", has_emb)
             query = f"""
-            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
-                   t.uuid::text AS uuid_text,
-                   to_jsonb(t)->>'embedding' AS embedding_text
+            SELECT t.realm, t.id, t.space, t.fqid, {payload_expr}, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text{emb_expr}
             FROM {table_ref} t
             WHERE t.realm = :realm AND t.uuid = CAST(:uuid AS UUID)
             """
             try:
-                row = await self._fetchrow(conn, query, realm=realm, uuid=uuid_str)
+                row = await self._fetchrow(conn, query, **params)
                 if not row:
                     return None
 
@@ -2491,6 +2643,10 @@ class SQLAlchemyPostGraph(SharedLogic):
         space: Optional[str] = None,
         column_name: str = "embedding",
         where: Optional[List[tuple]] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[Tuple[Vertex, float]]:
         """Perform vector similarity search on vertex embeddings using pgvector.
 
@@ -2499,6 +2655,9 @@ class SQLAlchemyPostGraph(SharedLogic):
         top-k is a genuine top-k rather than a post-filtered remainder."""
         self._validate_identifier(table_name)
         self._validate_identifier(column_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         col = f'"{column_name}"'
         table_ref = self._get_table_ref(table_name, realm)
         data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
@@ -2513,80 +2672,101 @@ class SQLAlchemyPostGraph(SharedLogic):
         scope = search_scope.lower()
         if search_data_table and scope == "main":
             scope = "data"
+        if where and scope != "main":
+            raise ValueError(
+                "vector_search(where=...) is supported for the 'main' scope "
+                "only; filtering the data/both scopes is not implemented."
+            )
 
         effective_space = space if space and space != RESERVED_SPACE_ALL else None
         space_filter_d = " AND d.space = :space" if effective_space else ""
         space_filter_t = " AND t.space = :space" if effective_space else ""
         space_filter_combined = " AND space = :space" if effective_space else ""
 
-        if scope == "data":
-            query = f"""
-            SELECT v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at,
-                   to_jsonb(v)->>'{column_name}' AS embedding_text,
-                   MIN(d.{col} {op} CAST(:vec AS vector)) AS distance
-            FROM {data_table_ref} d
-            JOIN {table_ref} v ON d.realm = v.realm AND d.id = v.id
-            WHERE d.realm = :realm AND d.{col} IS NOT NULL{space_filter_d}
-            GROUP BY v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at, to_jsonb(v)
-            ORDER BY distance ASC
-            LIMIT :top_k
-            """
-        elif scope == "both":
-            query = f"""
-            WITH combined AS (
-                SELECT realm, id, ({col} {op} CAST(:vec AS vector)) AS distance
-                FROM {table_ref}
-                WHERE realm = :realm AND {col} IS NOT NULL{space_filter_combined}
-
-                UNION ALL
-
-                SELECT realm, id, ({col} {op} CAST(:vec AS vector)) AS distance
-                FROM {data_table_ref}
-                WHERE realm = :realm AND {col} IS NOT NULL{space_filter_combined}
-            ),
-            best AS (
-                SELECT realm, id, MIN(distance) AS distance
-                FROM combined
-                GROUP BY realm, id
-            )
-            SELECT v.realm, v.id, v.space, v.fqid, v.payload, v.created_at, v.updated_at,
-                   to_jsonb(v)->>'{column_name}' AS embedding_text,
-                   b.distance
-            FROM best b
-            JOIN {table_ref} v ON b.realm = v.realm AND b.id = v.id
-            ORDER BY b.distance ASC
-            LIMIT :top_k
-            """
-        else:
-            fetch_params = {"realm": realm, "vec": vec_str, "top_k": top_k}
-            if effective_space:
-                fetch_params["space"] = effective_space
-            where_sql, _nk = self._compile_where(where, fetch_params)
-            query = f"""
-            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
-                   CAST(t.{col} AS TEXT) AS embedding_text,
-                   (t.{col} {op} CAST(:vec AS vector)) AS distance
-            FROM {table_ref} t
-            WHERE t.realm = :realm AND t.{col} IS NOT NULL{space_filter_t}{where_sql}
-            ORDER BY t.{col} {op} CAST(:vec AS vector) ASC
-            LIMIT :top_k
-            """
-
-        if search_scope.lower() != "main" or (search_data_table and search_scope.lower() == "main"):
-            if where:
-                raise ValueError(
-                    "vector_search(where=...) is supported for the 'main' scope "
-                    "only; filtering the data/both scopes is not implemented."
-                )
-            fetch_params = {"realm": realm, "vec": vec_str, "top_k": top_k}
-            if effective_space:
-                fetch_params["space"] = effective_space
-
         async def _op(conn):
+            fetch_params: Dict[str, Any] = {"realm": realm, "vec": vec_str, "top_k": top_k}
+            if effective_space:
+                fetch_params["space"] = effective_space
+
+            if scope == "data":
+                has_emb = (
+                    await self._table_has_column(conn, table_name, realm, column_name)
+                    if include_embedding
+                    else False
+                )
+                payload_expr = self._payload_select_expr_sa("v", inc_fields, exc_fields, fetch_params)
+                emb_expr = self._embedding_select_clause("v", has_emb, column_name=column_name)
+                query = f"""
+                WITH best AS (
+                    SELECT d.realm, d.id, MIN(d.{col} {op} CAST(:vec AS vector)) AS distance
+                    FROM {data_table_ref} d
+                    WHERE d.realm = :realm AND d.{col} IS NOT NULL{space_filter_d}
+                    GROUP BY d.realm, d.id
+                )
+                SELECT v.realm, v.id, v.space, v.fqid, {payload_expr}, v.created_at, v.updated_at,
+                       v.uuid::text AS uuid_text{emb_expr},
+                       b.distance
+                FROM best b
+                JOIN {table_ref} v ON b.realm = v.realm AND b.id = v.id
+                ORDER BY b.distance ASC
+                LIMIT :top_k
+                """
+            elif scope == "both":
+                payload_expr = self._payload_select_expr_sa("v", inc_fields, exc_fields, fetch_params)
+                emb_expr = self._embedding_select_clause(
+                    "v", include_embedding, column_name=column_name
+                )
+                query = f"""
+                WITH combined AS (
+                    SELECT realm, id, ({col} {op} CAST(:vec AS vector)) AS distance
+                    FROM {table_ref}
+                    WHERE realm = :realm AND {col} IS NOT NULL{space_filter_combined}
+
+                    UNION ALL
+
+                    SELECT realm, id, ({col} {op} CAST(:vec AS vector)) AS distance
+                    FROM {data_table_ref}
+                    WHERE realm = :realm AND {col} IS NOT NULL{space_filter_combined}
+                ),
+                best AS (
+                    SELECT realm, id, MIN(distance) AS distance
+                    FROM combined
+                    GROUP BY realm, id
+                )
+                SELECT v.realm, v.id, v.space, v.fqid, {payload_expr}, v.created_at, v.updated_at,
+                       v.uuid::text AS uuid_text{emb_expr},
+                       b.distance
+                FROM best b
+                JOIN {table_ref} v ON b.realm = v.realm AND b.id = v.id
+                ORDER BY b.distance ASC
+                LIMIT :top_k
+                """
+            else:
+                where_sql, _nk = self._compile_where(where, fetch_params)
+                payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, fetch_params)
+                emb_expr = self._embedding_select_clause(
+                    "t", include_embedding, column_name=column_name
+                )
+                query = f"""
+                SELECT t.realm, t.id, t.space, t.fqid, {payload_expr}, t.created_at, t.updated_at,
+                       t.uuid::text AS uuid_text{emb_expr},
+                       (t.{col} {op} CAST(:vec AS vector)) AS distance
+                FROM {table_ref} t
+                WHERE t.realm = :realm AND t.{col} IS NOT NULL{space_filter_t}{where_sql}
+                ORDER BY t.{col} {op} CAST(:vec AS vector) ASC
+                LIMIT :top_k
+                """
+
             try:
                 rows = await self._fetch(conn, query, **fetch_params)
             except ProgrammingError as e:
-                if "does not exist" in str(e).lower():
+                err_lower = str(e).lower()
+                if "column " in err_lower and "does not exist" in err_lower:
+                    logger.warning(
+                        f"Table '{table_name}' or data table does not have a vector embedding column."
+                    )
+                    return []
+                if "does not exist" in err_lower:
                     raise TableNotFoundError(f"Vertex table '{table_name}' does not exist.")
                 logger.warning(f"Vector search failed: {e}")
                 return []
@@ -2594,7 +2774,7 @@ class SQLAlchemyPostGraph(SharedLogic):
             results = []
             for r in rows:
                 emb = None
-                if r["embedding_text"]:
+                if "embedding_text" in r and r["embedding_text"]:
                     emb = [
                         float(x) for x in r["embedding_text"].strip("[]").split(",") if x.strip()
                     ]
@@ -2610,6 +2790,7 @@ class SQLAlchemyPostGraph(SharedLogic):
                     updated_at=r["updated_at"],
                     table_name=table_name,
                     embedding=emb,
+                    uuid=str(r["uuid_text"]) if r.get("uuid_text") else None,
                     _client=self,
                 )
                 dist = float(r["distance"])
@@ -2632,6 +2813,10 @@ class SQLAlchemyPostGraph(SharedLogic):
         space: Optional[str] = None,
         relation_type: Optional[str] = None,
         column_name: str = "embedding",
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[Tuple[Edge, float]]:
         """Perform vector similarity search over edge embeddings using pgvector.
 
@@ -2642,6 +2827,9 @@ class SQLAlchemyPostGraph(SharedLogic):
         """
         self._validate_identifier(table_name)
         self._validate_identifier(column_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         col = f'"{column_name}"'
         table_ref = self._get_table_ref(table_name, realm)
         vec_str = f"[{','.join(str(x) for x in query_vector)}]"
@@ -2659,10 +2847,18 @@ class SQLAlchemyPostGraph(SharedLogic):
         if relation_type:
             filters += " AND t.relation_type = :rel_type"
 
+        fetch_params: Dict[str, Any] = {"realm": realm, "vec": vec_str, "top_k": top_k}
+        if effective_space:
+            fetch_params["space"] = effective_space
+        if relation_type:
+            fetch_params["rel_type"] = relation_type
+
+        payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, fetch_params)
+        emb_expr = self._embedding_select_clause("t", include_embedding, column_name=column_name)
+
         query = f"""
         SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type,
-               t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text,
-               CAST(t.{col} AS TEXT) AS embedding_text,
+               {payload_expr}, t.created_at, t.updated_at, t.uuid::text AS uuid_text{emb_expr},
                (t.{col} {op} CAST(:vec AS vector)) AS distance
         FROM {table_ref} t
         WHERE t.realm = :realm AND t.{col} IS NOT NULL{filters}
@@ -2670,17 +2866,18 @@ class SQLAlchemyPostGraph(SharedLogic):
         LIMIT :top_k
         """
 
-        fetch_params: Dict[str, Any] = {"realm": realm, "vec": vec_str, "top_k": top_k}
-        if effective_space:
-            fetch_params["space"] = effective_space
-        if relation_type:
-            fetch_params["rel_type"] = relation_type
-
         async def _op(conn):
             try:
                 rows = await self._fetch(conn, query, **fetch_params)
             except ProgrammingError as e:
-                if "does not exist" in str(e).lower():
+                err_lower = str(e).lower()
+                if "column " in err_lower and "does not exist" in err_lower:
+                    logger.warning(
+                        f"Edge table '{table_name}' has no vector embedding column. "
+                        f"Recreate it with create_edge_table(..., vector_dim=N)."
+                    )
+                    return []
+                if "does not exist" in err_lower:
                     raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
                 logger.warning(f"Vector search on edges failed: {e}")
                 return []
@@ -2688,7 +2885,7 @@ class SQLAlchemyPostGraph(SharedLogic):
             results = []
             for r in rows:
                 emb = None
-                if r["embedding_text"]:
+                if "embedding_text" in r and r["embedding_text"]:
                     emb = [
                         float(x) for x in r["embedding_text"].strip("[]").split(",") if x.strip()
                     ]
@@ -2960,9 +3157,16 @@ class SQLAlchemyPostGraph(SharedLogic):
         config: str = "english",
         limit: int = 20,
         space: Optional[str] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[Vertex]:
         """Full-text search on vertex payload fields using tsvector/tsquery."""
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         table_ref = self._get_table_ref(table_name, realm)
 
         if fields:
@@ -2975,14 +3179,21 @@ class SQLAlchemyPostGraph(SharedLogic):
             ts_expr = """(SELECT string_agg(value::text, ' ') FROM jsonb_each_text(t.payload))"""
 
         async def _op(conn):
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if include_embedding
+                else False
+            )
             params: Dict[str, Any] = {"realm": realm, "query": query, "lim": limit}
             space_clause = ""
             if space and space != RESERVED_SPACE_ALL:
                 params["space"] = space
                 space_clause = " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("t", has_emb)
             sql = f"""
-            SELECT t.realm, t.id, t.space, t.fqid, t.payload, t.created_at, t.updated_at,
-                   t.uuid::text AS uuid_text,
+            SELECT t.realm, t.id, t.space, t.fqid, {payload_expr}, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text{emb_expr},
                    ts_rank(to_tsvector('{config}', {ts_expr}), plainto_tsquery('{config}', :query)) AS rank
             FROM {table_ref} t
             WHERE t.realm = :realm
@@ -2995,6 +3206,13 @@ class SQLAlchemyPostGraph(SharedLogic):
                 rows = result.mappings().all()
                 vertices = []
                 for row in rows:
+                    emb = None
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
                     payload = (
                         row["payload"]
                         if isinstance(row["payload"], dict)
@@ -3010,6 +3228,7 @@ class SQLAlchemyPostGraph(SharedLogic):
                             created_at=row["created_at"],
                             updated_at=row["updated_at"],
                             table_name=table_name,
+                            embedding=emb,
                             uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
                             _client=self,
                         )
@@ -3037,9 +3256,16 @@ class SQLAlchemyPostGraph(SharedLogic):
         config: str = "english",
         limit: int = 20,
         space: Optional[str] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[Edge]:
         """Full-text search on edge payload fields using tsvector/tsquery."""
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         table_ref = self._get_table_ref(table_name, realm)
 
         if fields:
@@ -3052,15 +3278,22 @@ class SQLAlchemyPostGraph(SharedLogic):
             ts_expr = """(SELECT string_agg(value::text, ' ') FROM jsonb_each_text(t.payload))"""
 
         async def _op(conn):
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if include_embedding
+                else False
+            )
             params: Dict[str, Any] = {"realm": realm, "query": query, "lim": limit}
             space_clause = ""
             if space and space != RESERVED_SPACE_ALL:
                 params["space"] = space
                 space_clause = " AND (t.space = :space OR (:space = 'default' AND (t.space IS NULL OR t.space = 'default')))"
+            payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("t", has_emb)
             sql = f"""
             SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id,
-                   t.relation_type, t.payload, t.created_at, t.updated_at,
-                   t.uuid::text AS uuid_text,
+                   t.relation_type, {payload_expr}, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text{emb_expr},
                    ts_rank(to_tsvector('{config}', {ts_expr}), plainto_tsquery('{config}', :query)) AS rank
             FROM {table_ref} t
             WHERE t.realm = :realm
@@ -3073,6 +3306,13 @@ class SQLAlchemyPostGraph(SharedLogic):
                 rows = result.mappings().all()
                 edges = []
                 for row in rows:
+                    emb = None
+                    if "embedding_text" in row and row["embedding_text"]:
+                        emb = [
+                            float(x)
+                            for x in row["embedding_text"].strip("[]").split(",")
+                            if x.strip()
+                        ]
                     payload = (
                         row["payload"]
                         if isinstance(row["payload"], dict)
@@ -3091,6 +3331,7 @@ class SQLAlchemyPostGraph(SharedLogic):
                             created_at=row["created_at"],
                             updated_at=row["updated_at"],
                             table_name=table_name,
+                            embedding=emb,
                             uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
                             _client=self,
                         )
@@ -3179,7 +3420,12 @@ class SQLAlchemyPostGraph(SharedLogic):
                         f"Existing path: {' -> '.join(path['path'])}"
                     )
 
-            if vec_str:
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if vec_str
+                else False
+            )
+            if vec_str and has_emb:
                 query = f"""
                 INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload, embedding)
                 VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB), CAST(:vec AS vector))
@@ -3196,6 +3442,11 @@ class SQLAlchemyPostGraph(SharedLogic):
                     "vec": vec_str,
                 }
             else:
+                if vec_str and not has_emb:
+                    logger.warning(
+                        f"Edge table '{table_name}' has no embedding column; the supplied embedding was not stored. "
+                        f"Recreate the table with create_edge_table(..., vector_dim=N)."
+                    )
                 query = f"""
                 INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
                 VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB))
@@ -3339,7 +3590,12 @@ class SQLAlchemyPostGraph(SharedLogic):
                         f"Adding edge from '{from_id}' to '{to_id}' in table '{table_name}' would create a cycle."
                     )
 
-            if vec_str:
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if vec_str
+                else False
+            )
+            if vec_str and has_emb:
                 query = f"""
                 INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload, embedding)
                 VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB), CAST(:vec AS vector))
@@ -3364,6 +3620,11 @@ class SQLAlchemyPostGraph(SharedLogic):
                     "vec": vec_str,
                 }
             else:
+                if vec_str and not has_emb:
+                    logger.warning(
+                        f"Edge table '{table_name}' has no embedding column; the supplied embedding was not stored. "
+                        f"Recreate the table with create_edge_table(..., vector_dim=N)."
+                    )
                 query = f"""
                 INSERT INTO {table_ref} (realm, id, space, from_id, to_id, relation_type, payload)
                 VALUES (:realm, :id, :space, :from_id, :to_id, :relation_type, CAST(:payload AS JSONB))
@@ -3431,17 +3692,35 @@ class SQLAlchemyPostGraph(SharedLogic):
         return await self._run_in_tx(_op, user_id)
 
     async def get_edge(
-        self, table_name: str, realm: str, edge_id: str, strict: bool = False
+        self,
+        table_name: str,
+        realm: str,
+        edge_id: str,
+        strict: bool = False,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> Optional[Edge]:
         """Fetch an edge by realm and id or uuid.
 
         When *strict* is True, raises EdgeNotFoundError instead of returning None.
         """
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         e_str = str(edge_id).strip()
 
         if len(e_str) == 36 and "-" in e_str:
-            result = await self.get_edge_by_uuid(table_name, realm, e_str)
+            result = await self.get_edge_by_uuid(
+                table_name,
+                realm,
+                e_str,
+                payload_fields=payload_fields,
+                exclude_payload_fields=exclude_payload_fields,
+                include_embedding=include_embedding,
+            )
             if strict and result is None:
                 raise EdgeNotFoundError(
                     f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'."
@@ -3449,71 +3728,118 @@ class SQLAlchemyPostGraph(SharedLogic):
             return result
 
         table_ref = self._get_table_ref(table_name, realm)
-        query = f"""
-        SELECT realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
-        FROM {table_ref}
-        WHERE realm = :realm AND ((CASE WHEN :id ~ '^[0-9]+$' THEN id = CAST(:id AS BIGINT) ELSE FALSE END) OR fqid = :id)
-        """
 
         async def _op(conn):
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if include_embedding
+                else False
+            )
+            params: Dict[str, Any] = {"realm": realm, "id": e_str}
+            payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("t", has_emb)
+            query = f"""
+            SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type,
+                   {payload_expr}, t.created_at, t.updated_at, t.uuid::text AS uuid_text{emb_expr}
+            FROM {table_ref} t
+            WHERE t.realm = :realm AND ((CASE WHEN :id ~ '^[0-9]+$' THEN t.id = CAST(:id AS BIGINT) ELSE FALSE END) OR t.fqid = :id)
+            """
             try:
-                row = await self._fetchrow(conn, query, realm=realm, id=e_str)
-                if not row:
-                    return await self.get_edge_by_uuid(table_name, realm, e_str)
-                return Edge(
-                    realm=row["realm"],
-                    id=str(row["id"]),
-                    fqid=row["fqid"],
-                    from_id=str(row["from_id"]),
-                    to_id=str(row["to_id"]),
-                    relation_type=row["relation_type"],
-                    space=row.get("space") or "default",
-                    payload=row["payload"]
-                    if isinstance(row["payload"], dict)
-                    else json.loads(row["payload"]),
-                    created_at=row["created_at"],
-                    updated_at=row["updated_at"],
-                    table_name=table_name,
-                    uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
-                    _client=self,
-                )
+                return await self._fetchrow(conn, query, **params)
             except ProgrammingError as e:
                 if "does not exist" in str(e).lower():
                     raise TableNotFoundError(f"Edge table '{table_name}' does not exist.")
                 raise PostGraphError(f"Programming error: {e}")
 
         if self._bound:
-            result = await _op(self.engine_or_connection)
+            row = await _op(self.engine_or_connection)
         else:
             async with self.engine_or_connection.connect() as conn:
-                result = await _op(conn)
-        if strict and result is None:
-            raise EdgeNotFoundError(
-                f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'."
+                row = await _op(conn)
+
+        if not row:
+            result = await self.get_edge_by_uuid(
+                table_name,
+                realm,
+                e_str,
+                payload_fields=payload_fields,
+                exclude_payload_fields=exclude_payload_fields,
+                include_embedding=include_embedding,
             )
-        return result
+            if strict and result is None:
+                raise EdgeNotFoundError(
+                    f"Edge '{edge_id}' not found in table '{table_name}', realm '{realm}'."
+                )
+            return result
+
+        emb = None
+        if "embedding_text" in row and row["embedding_text"]:
+            emb = [float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()]
+        return Edge(
+            realm=row["realm"],
+            id=str(row["id"]),
+            fqid=row["fqid"],
+            from_id=str(row["from_id"]),
+            to_id=str(row["to_id"]),
+            relation_type=row["relation_type"],
+            space=row.get("space") or "default",
+            payload=row["payload"]
+            if isinstance(row["payload"], dict)
+            else json.loads(row["payload"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            table_name=table_name,
+            embedding=emb,
+            uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
+            _client=self,
+        )
 
     async def get_edge_by_uuid(
-        self, table_name: str, realm: str, uuid: str, strict: bool = False
+        self,
+        table_name: str,
+        realm: str,
+        uuid: str,
+        strict: bool = False,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> Optional[Edge]:
         """Fetch an edge record by its UUID.
 
         When *strict* is True, raises EdgeNotFoundError instead of returning None.
         """
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         table_ref = self._get_table_ref(table_name, realm)
         uuid_str = str(uuid).strip()
-        query = f"""
-        SELECT realm, id, space, fqid, from_id, to_id, relation_type, payload, created_at, updated_at, uuid::text AS uuid_text
-        FROM {table_ref}
-        WHERE realm = :realm AND uuid = CAST(:uuid AS UUID)
-        """
 
         async def _op(conn):
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if include_embedding
+                else False
+            )
+            params: Dict[str, Any] = {"realm": realm, "uuid": uuid_str}
+            payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("t", has_emb)
+            query = f"""
+            SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type,
+                   {payload_expr}, t.created_at, t.updated_at, t.uuid::text AS uuid_text{emb_expr}
+            FROM {table_ref} t
+            WHERE t.realm = :realm AND t.uuid = CAST(:uuid AS UUID)
+            """
             try:
-                row = await self._fetchrow(conn, query, realm=realm, uuid=uuid_str)
+                row = await self._fetchrow(conn, query, **params)
                 if not row:
                     return None
+                emb = None
+                if "embedding_text" in row and row["embedding_text"]:
+                    emb = [
+                        float(x) for x in row["embedding_text"].strip("[]").split(",") if x.strip()
+                    ]
                 return Edge(
                     realm=row["realm"],
                     id=str(row["id"]),
@@ -3528,6 +3854,7 @@ class SQLAlchemyPostGraph(SharedLogic):
                     created_at=row["created_at"],
                     updated_at=row["updated_at"],
                     table_name=table_name,
+                    embedding=emb,
                     uuid=str(row["uuid_text"]) if row.get("uuid_text") else None,
                     _client=self,
                 )
@@ -3554,13 +3881,25 @@ class SQLAlchemyPostGraph(SharedLogic):
         space: Optional[str] = None,
         limit: Optional[int] = None,
         relation_type: Optional[str] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[Edge]:
         """Fetch all edges in a realm, optionally filtered by space and relation_type."""
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         table_ref = self._get_table_ref(table_name, realm)
 
         async def _op(conn):
-            params = {"realm": realm}
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if include_embedding
+                else False
+            )
+            params: Dict[str, Any] = {"realm": realm}
             filters = ""
             if space and space != RESERVED_SPACE_ALL:
                 params["space"] = space
@@ -3569,6 +3908,9 @@ class SQLAlchemyPostGraph(SharedLogic):
                 params["relation_type"] = relation_type
                 filters += " AND t.relation_type = :relation_type"
 
+            payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("t", has_emb)
+
             limit_clause = ""
             if limit:
                 params["limit"] = limit
@@ -3576,9 +3918,8 @@ class SQLAlchemyPostGraph(SharedLogic):
 
             query = f"""
             SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id,
-                   t.relation_type, t.payload, t.created_at, t.updated_at,
-                   t.uuid::text AS uuid_text,
-                   to_jsonb(t)->>'embedding' AS embedding_text
+                   t.relation_type, {payload_expr}, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text{emb_expr}
             FROM {table_ref} t
             WHERE t.realm = :realm{filters}
             ORDER BY t.id ASC{limit_clause}
@@ -3632,16 +3973,29 @@ class SQLAlchemyPostGraph(SharedLogic):
         space: Optional[str] = None,
         limit: Optional[int] = None,
         relation_type: Optional[str] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[Edge]:
         """Fetch edges across multiple realms."""
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
 
         async def _op(conn):
             if self.schema_per_realm:
                 parts = []
                 params: Dict[str, Any] = {}
+                payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
                 for i, r in enumerate(realms):
                     tref = self._get_table_ref(table_name, r)
+                    has_emb = (
+                        await self._table_has_embedding(conn, table_name, r)
+                        if include_embedding
+                        else False
+                    )
                     rp = f"r{i}"
                     params[rp] = r
                     extra = ""
@@ -3653,8 +4007,9 @@ class SQLAlchemyPostGraph(SharedLogic):
                         rt = f"rt{i}"
                         params[rt] = relation_type
                         extra += f" AND t.relation_type = :{rt}"
+                    emb_expr = self._embedding_select_clause("t", has_emb, union_branch=True)
                     parts.append(
-                        f"SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type, t.payload, t.created_at, t.updated_at, t.uuid::text AS uuid_text, to_jsonb(t)->>'embedding' AS embedding_text FROM {tref} t WHERE t.realm = :{rp}{extra}"
+                        f"SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id, t.relation_type, {payload_expr}, t.created_at, t.updated_at, t.uuid::text AS uuid_text{emb_expr} FROM {tref} t WHERE t.realm = :{rp}{extra}"
                     )
                 query = " UNION ALL ".join(parts) + " ORDER BY realm, id ASC"
                 if limit:
@@ -3662,6 +4017,11 @@ class SQLAlchemyPostGraph(SharedLogic):
                     query += " LIMIT :limit"
             else:
                 table_ref = self._get_table_ref(table_name, realms[0])
+                has_emb = (
+                    await self._table_has_embedding(conn, table_name, realms[0])
+                    if include_embedding
+                    else False
+                )
                 params = {"realms": realms}
                 extra = ""
                 if space and space != RESERVED_SPACE_ALL:
@@ -3670,15 +4030,16 @@ class SQLAlchemyPostGraph(SharedLogic):
                 if relation_type:
                     params["relation_type"] = relation_type
                     extra += " AND t.relation_type = :relation_type"
+                payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+                emb_expr = self._embedding_select_clause("t", has_emb)
                 limit_clause = ""
                 if limit:
                     params["limit"] = limit
                     limit_clause = " LIMIT :limit"
                 query = f"""
                 SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id,
-                       t.relation_type, t.payload, t.created_at, t.updated_at,
-                       t.uuid::text AS uuid_text,
-                       to_jsonb(t)->>'embedding' AS embedding_text
+                       t.relation_type, {payload_expr}, t.created_at, t.updated_at,
+                       t.uuid::text AS uuid_text{emb_expr}
                 FROM {table_ref} t
                 WHERE t.realm = ANY(:realms){extra}
                 ORDER BY t.realm, t.id ASC{limit_clause}
@@ -3737,6 +4098,10 @@ class SQLAlchemyPostGraph(SharedLogic):
         order_by: Optional[str] = None,
         order_by_column: Optional[str] = None,
         descending: bool = False,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[Edge]:
         """Find edges whose payload matches the given key-value filters.
 
@@ -3745,6 +4110,9 @@ class SQLAlchemyPostGraph(SharedLogic):
         further restricts results.
         """
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         if order_by is not None:
             self._validate_payload_key(order_by)
         if order_by_column is not None:
@@ -3786,15 +4154,21 @@ class SQLAlchemyPostGraph(SharedLogic):
                 order_clause = f"ORDER BY {acc} {'DESC' if descending else 'ASC'}, t.id ASC"
             else:
                 order_clause = "ORDER BY t.id ASC"
+            has_emb = (
+                await self._table_has_embedding(conn, table_name, realm)
+                if include_embedding
+                else False
+            )
+            payload_expr = self._payload_select_expr_sa("t", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("t", has_emb)
             limit_clause = ""
             if limit:
                 params["limit"] = limit
                 limit_clause = " LIMIT :limit"
             query = f"""
             SELECT t.realm, t.id, t.space, t.fqid, t.from_id, t.to_id,
-                   t.relation_type, t.payload, t.created_at, t.updated_at,
-                   t.uuid::text AS uuid_text,
-                   to_jsonb(t)->>'embedding' AS embedding_text
+                   t.relation_type, {payload_expr}, t.created_at, t.updated_at,
+                   t.uuid::text AS uuid_text{emb_expr}
             FROM {table_ref} t
             WHERE t.realm = :realm{clauses}
             {order_clause}{limit_clause}
@@ -4688,23 +5062,20 @@ class SQLAlchemyPostGraph(SharedLogic):
         self._validate_identifier(table_name)
         v_id_int = int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
         payload_json = json.dumps(payload or {})
-        data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
+        data_t_name = f"{table_name}_data"
+        data_table_ref = self._get_table_ref(data_t_name, realm)
         vec_str = f"[{','.join(str(x) for x in embedding)}]" if embedding is not None else None
 
         async def _op(conn):
             has_emb = False
             if vec_str:
-                data_t_name = f"{table_name}_data"
-                if self.schema_per_realm:
-                    check_q = "SELECT 1 FROM information_schema.columns WHERE table_schema = :schema AND table_name = :t_name AND column_name = 'embedding'"
-                    res = await conn.execute(
-                        text(check_q), {"schema": realm, "t_name": data_t_name}
-                    )
-                    has_emb = res.scalar() is not None
-                else:
-                    check_q = "SELECT 1 FROM information_schema.columns WHERE table_name = :t_name AND column_name = 'embedding'"
-                    res = await conn.execute(text(check_q), {"t_name": data_t_name})
-                    has_emb = res.scalar() is not None
+                has_emb = await self._table_has_embedding(conn, data_t_name, realm)
+
+            if vec_str and not has_emb:
+                logger.warning(
+                    f"Data table '{table_name}_data' has no embedding column; the supplied embedding "
+                    f"was not stored. Recreate '{table_name}' with a vector_dim to enable it."
+                )
 
             if vec_str and has_emb:
                 if timestamp:
@@ -4736,7 +5107,7 @@ class SQLAlchemyPostGraph(SharedLogic):
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload, timestamp)
                     VALUES (:realm, :id, CAST(:payload AS JSONB), :timestamp)
-                    RETURNING data_id, realm, id, payload, timestamp, NULL AS embedding_text
+                    RETURNING data_id, realm, id, payload, timestamp
                     """
                     row = await self._fetchrow(
                         conn,
@@ -4750,7 +5121,7 @@ class SQLAlchemyPostGraph(SharedLogic):
                     query = f"""
                     INSERT INTO {data_table_ref} (realm, id, payload)
                     VALUES (:realm, :id, CAST(:payload AS JSONB))
-                    RETURNING data_id, realm, id, payload, timestamp, NULL AS embedding_text
+                    RETURNING data_id, realm, id, payload, timestamp
                     """
                     row = await self._fetchrow(
                         conn, query, realm=realm, id=v_id_int, payload=payload_json
@@ -4774,24 +5145,46 @@ class SQLAlchemyPostGraph(SharedLogic):
         return await self._run_in_tx(_op, user_id)
 
     async def get_vertex_data(
-        self, table_name: str, realm: str, vertex_id: Union[str, int], limit: Optional[int] = None
+        self,
+        table_name: str,
+        realm: str,
+        vertex_id: Union[str, int],
+        limit: Optional[int] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[DataRecord]:
         """Fetch append-only data records for a vertex sorted by timestamp descending."""
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         v_id_int = int(str(vertex_id).split("/")[-1]) if "/" in str(vertex_id) else int(vertex_id)
-        data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
-
-        limit_clause = f"LIMIT {limit}" if limit and limit > 0 else ""
-        query = f"""
-        SELECT d.data_id, d.realm, d.id, d.payload, d.timestamp, to_jsonb(d)->>'embedding' AS embedding_text
-        FROM {data_table_ref} d
-        WHERE d.realm = :realm AND d.id = :id
-        ORDER BY d.timestamp DESC, d.data_id DESC
-        {limit_clause}
-        """
+        data_t_name = f"{table_name}_data"
+        data_table_ref = self._get_table_ref(data_t_name, realm)
 
         async def _op(conn):
-            rows = await self._fetch(conn, query, realm=realm, id=v_id_int)
+            has_emb = (
+                await self._table_has_embedding(conn, data_t_name, realm)
+                if include_embedding
+                else False
+            )
+            params: Dict[str, Any] = {"realm": realm, "id": v_id_int}
+            payload_expr = self._payload_select_expr_sa("d", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("d", has_emb)
+            limit_clause = ""
+            if limit and limit > 0:
+                params["limit"] = limit
+                limit_clause = "LIMIT :limit"
+            query = f"""
+            SELECT d.data_id, d.realm, d.id, {payload_expr}, d.timestamp{emb_expr}
+            FROM {data_table_ref} d
+            WHERE d.realm = :realm AND d.id = :id
+            ORDER BY d.timestamp DESC, d.data_id DESC
+            {limit_clause}
+            """
+            rows = await self._fetch(conn, query, **params)
             results = []
             for r in rows:
                 emb = None
@@ -4820,31 +5213,63 @@ class SQLAlchemyPostGraph(SharedLogic):
                 return await _op(conn)
 
     async def get_latest_vertex_data(
-        self, table_name: str, realm: str, vertex_id: Union[str, int]
+        self,
+        table_name: str,
+        realm: str,
+        vertex_id: Union[str, int],
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> Optional[DataRecord]:
         """Fetch the latest append-only data record (version) for a vertex."""
-        records = await self.get_vertex_data(table_name, realm, vertex_id, limit=1)
+        records = await self.get_vertex_data(
+            table_name,
+            realm,
+            vertex_id,
+            limit=1,
+            payload_fields=payload_fields,
+            exclude_payload_fields=exclude_payload_fields,
+            include_embedding=include_embedding,
+        )
         return records[0] if records else None
 
     async def get_vertex_data_by_id(
-        self, table_name: str, realm: str, data_id: Union[str, int]
+        self,
+        table_name: str,
+        realm: str,
+        data_id: Union[str, int],
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> Optional[DataRecord]:
         """Query a specific data entry / version by its sequential data_id."""
         self._validate_identifier(table_name)
+        inc_fields, exc_fields = self._validate_payload_projection(
+            payload_fields, exclude_payload_fields, validate_payload_key=self._validate_payload_key
+        )
         d_id_int = int(data_id)
-        data_table_ref = self._get_table_ref(f"{table_name}_data", realm)
-
-        query = f"""
-        SELECT d.data_id, d.realm, d.id, d.payload, d.timestamp, to_jsonb(d)->>'embedding' AS embedding_text
-        FROM {data_table_ref} d
-        WHERE d.realm = :realm AND d.data_id = :data_id
-        """
+        data_t_name = f"{table_name}_data"
+        data_table_ref = self._get_table_ref(data_t_name, realm)
 
         async def _op(conn):
-            rows = await self._fetch(conn, query, realm=realm, data_id=d_id_int)
-            if not rows:
+            has_emb = (
+                await self._table_has_embedding(conn, data_t_name, realm)
+                if include_embedding
+                else False
+            )
+            params: Dict[str, Any] = {"realm": realm, "data_id": d_id_int}
+            payload_expr = self._payload_select_expr_sa("d", inc_fields, exc_fields, params)
+            emb_expr = self._embedding_select_clause("d", has_emb)
+            query = f"""
+            SELECT d.data_id, d.realm, d.id, {payload_expr}, d.timestamp{emb_expr}
+            FROM {data_table_ref} d
+            WHERE d.realm = :realm AND d.data_id = :data_id
+            """
+            r = await self._fetchrow(conn, query, **params)
+            if not r:
                 return None
-            r = rows[0]
             emb = None
             if "embedding_text" in r and r["embedding_text"]:
                 emb = [float(x) for x in r["embedding_text"].strip("[]").split(",") if x.strip()]
@@ -4887,19 +5312,63 @@ class SQLAlchemyPostGraph(SharedLogic):
         )
 
     async def get_edge_data(
-        self, table_name: str, realm: str, edge_id: Union[str, int], limit: Optional[int] = None
+        self,
+        table_name: str,
+        realm: str,
+        edge_id: Union[str, int],
+        limit: Optional[int] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> List[DataRecord]:
         """Fetch append-only data records for an edge sorted by timestamp descending."""
-        return await self.get_vertex_data(table_name, realm, edge_id, limit=limit)
+        return await self.get_vertex_data(
+            table_name,
+            realm,
+            edge_id,
+            limit=limit,
+            payload_fields=payload_fields,
+            exclude_payload_fields=exclude_payload_fields,
+            include_embedding=include_embedding,
+        )
 
     async def get_latest_edge_data(
-        self, table_name: str, realm: str, edge_id: Union[str, int]
+        self,
+        table_name: str,
+        realm: str,
+        edge_id: Union[str, int],
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> Optional[DataRecord]:
         """Fetch the latest append-only data record for an edge."""
-        return await self.get_latest_vertex_data(table_name, realm, edge_id)
+        return await self.get_latest_vertex_data(
+            table_name,
+            realm,
+            edge_id,
+            payload_fields=payload_fields,
+            exclude_payload_fields=exclude_payload_fields,
+            include_embedding=include_embedding,
+        )
 
     async def get_edge_data_by_id(
-        self, table_name: str, realm: str, data_id: Union[str, int]
+        self,
+        table_name: str,
+        realm: str,
+        data_id: Union[str, int],
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
     ) -> Optional[DataRecord]:
         """Query a specific data entry by its sequential data_id for an edge."""
-        return await self.get_vertex_data_by_id(table_name, realm, data_id)
+        return await self.get_vertex_data_by_id(
+            table_name,
+            realm,
+            data_id,
+            payload_fields=payload_fields,
+            exclude_payload_fields=exclude_payload_fields,
+            include_embedding=include_embedding,
+        )

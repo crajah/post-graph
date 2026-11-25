@@ -245,10 +245,12 @@ filters={"ended": ABSENT}      # key not present at all
 
 One behaviour to know: containment, not equality, for nested values — `{"tags": ["a"]}` matches a payload whose `tags` is `["a", "b"]`. For scalar filters the two are identical.
 
-## Production primitives (`1.6` – `1.14`)
+## Production primitives (`1.6` – `1.16`)
 
 Everything above covers the core graph model. Later releases added the operational primitives needed so an application never has to drop to raw SQL alongside `post-graph`:
 
+- **Server-side payload & vector projection:** every vertex, edge, search, and `_data` read accepts `payload_fields=[...]`, `exclude_payload_fields=[...]`, and `include_embedding=False` (preserving `JSON_NULL` vs `ABSENT` semantics in a single JSONB detoast), and vector-column presence is cached per `(realm, table)` via `pg_attribute` so non-vector and TOASTed tables never serialize full rows to JSONB.
+- **O(1) monotonic sequence sync:** explicit-ID `add_vertex` / `add_edge` writes advance sequences monotonically via `pg_sequence_last_value` without scanning `MAX(id)` or rewinding under space-scoped RLS (`sync_sequence=False` skips it altogether).
 - **Privilege-scoped writes:** `update_vertex` runs a bare `UPDATE` (never `INSERT ... ON CONFLICT`) for roles granted `SELECT, UPDATE`; `insert_vertex` runs untargeted `INSERT ... ON CONFLICT DO NOTHING` for `INSERT`-only append ledgers.
 - **Optimistic concurrency & transactions:** `expected_updated_at` on `update_vertex` / `upsert_vertex` raises `ConcurrentModificationError` on lost races; `client.transaction(user_id=...)` groups multi-step writes atomically while preserving audit attribution (`CommitFailedError` / `NestedTransactionError`).
 - **Duck-typed pools & fleet ops:** `AsyncPostGraph(connection_or_pool=...)` drives any wrapper exposing `acquire()` (the safe shape for per-tenant `SET LOCAL ROLE` behind PgBouncer in transaction mode); `ensure_database`, `reassign_owned_to`, `execute_outside_transaction`, `list_realms`, `drop_realm`, `purge_record_audit`, and `tables_containing_text` cover provisioning, ownership repair, maintenance, and erasure verification.

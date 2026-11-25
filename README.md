@@ -328,6 +328,35 @@ the numeric cast when a numeric predicate references the same key.
 `delete_realm`. `create_payload_index(..., numeric=True)` indexes the cast
 expression; idempotent, deterministically named.
 
+### Server-Side Payload & Embedding Projection (`payload_fields` / `exclude_payload_fields` / `include_embedding`)
+
+When rows carry large JSONB values (transcripts, extracted documents, raw tool outputs) alongside compact metadata, listing or polling should not transfer 30+ KB TOAST payloads or 1536-float embeddings that the caller never reads. Every vertex, edge, search, and `_data` read surface accepts three keyword-only projection controls across both `AsyncPostGraph` and `SQLAlchemyPostGraph`:
+
+```python
+# Project only summary keys (single JSONB detoast; omits absent keys, preserves explicit JSON null)
+sessions = await pg.find_vertices(
+    "sessions",
+    realm=realm,
+    order_by_column="updated_at",
+    descending=True,
+    limit=100,
+    payload_fields=["title", "status", "ended_at"],
+    include_embedding=False,
+)
+
+# Or strip one heavy key server-side via PostgreSQL's `payload - text[]` operator
+docs = await pg.get_vertices(
+    "documents",
+    realm=realm,
+    exclude_payload_fields=["raw_transcript"],
+    include_embedding=False,
+)
+```
+
+- **Mutually exclusive & validated:** passing both `payload_fields` and `exclude_payload_fields` (or a bare `str` instead of a sequence) raises `PostGraphError`; every field name is validated with the same rules as `where`.
+- **`JSON_NULL` vs `ABSENT` preserved:** `payload_fields` keeps keys holding an explicit JSON `null` (`{"ended_at": None}`) while omitting keys that are absent from the stored row; `payload_fields=[]` returns `payload={}` without detoasting the JSONB column at all.
+- **Consistent across every read surface:** `get_vertex`, `get_vertex_by_uuid`, `get_vertices`, `get_vertices_multi_realm`, `newest_vertex`, `find_vertices`, `get_edge`, `get_edge_by_uuid`, `get_edges`, `get_edges_multi_realm`, `find_edges`, `vector_search`, `vector_search_edges`, `fulltext_search_vertices`, `fulltext_search_edges`, `get_vertex_data`, `get_latest_vertex_data`, `get_vertex_data_by_id`, `get_edge_data`, `get_latest_edge_data`, `get_edge_data_by_id` (plus `vertex.get_data*` and `edge.get_data*`).
+
 ## 🔌 Connection Pooling for Fleets
 
 Each client manages an asyncpg pool. `pool_min_size` defaults to **1** (lazy):
@@ -788,11 +817,11 @@ constraint nobody was told about — so this refuses instead. A derived name too
 long to fit is shortened with a hash rather than truncated, so two key tuples
 cannot collide.
 
-#### `get_vertex(table_name, realm, vertex_id)`
-Fetches a single vertex by its numeric ID, UUID, or FQID.
+#### `get_vertex(table_name, realm, vertex_id, strict=False, *, payload_fields=None, exclude_payload_fields=None, include_embedding=True)`
+Fetches a single vertex by its numeric ID, UUID, or FQID, optionally projecting or excluding payload keys and omitting the vector column.
 
-#### `get_vertices(table_name, realm, space=None, limit=None)`
-Fetches all vertices belonging to a `{realm}`, with optional filtering by `{space}`.
+#### `get_vertices(table_name, realm, space=None, limit=None, *, payload_fields=None, exclude_payload_fields=None, include_embedding=True)`
+Fetches all vertices belonging to a `{realm}`, with optional filtering by `{space}` and server-side payload/embedding projection.
 
 ```python
 # Fetch only production space vertices

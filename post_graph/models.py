@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 
 @dataclass
@@ -152,7 +152,14 @@ class Vertex:
             user_id=user_id
         )
 
-    async def get_data(self, limit: Optional[int] = None) -> List['DataRecord']:
+    async def get_data(
+        self,
+        limit: Optional[int] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
+    ) -> List['DataRecord']:
         """Fetch append-only data records for this vertex."""
         if not self._client:
             from post_graph.errors import PostGraphError
@@ -161,10 +168,19 @@ class Vertex:
             table_name=self.table_name,
             realm=self.realm,
             vertex_id=self.id,
-            limit=limit
+            limit=limit,
+            payload_fields=payload_fields,
+            exclude_payload_fields=exclude_payload_fields,
+            include_embedding=include_embedding,
         )
 
-    async def get_latest_data(self) -> Optional['DataRecord']:
+    async def get_latest_data(
+        self,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
+    ) -> Optional['DataRecord']:
         """Fetch the latest append-only data record (version) for this vertex."""
         if not self._client:
             from post_graph.errors import PostGraphError
@@ -172,10 +188,20 @@ class Vertex:
         return await self._client.get_latest_vertex_data(
             table_name=self.table_name,
             realm=self.realm,
-            vertex_id=self.id
+            vertex_id=self.id,
+            payload_fields=payload_fields,
+            exclude_payload_fields=exclude_payload_fields,
+            include_embedding=include_embedding,
         )
 
-    async def get_data_by_id(self, data_id: Any) -> Optional['DataRecord']:
+    async def get_data_by_id(
+        self,
+        data_id: Any,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
+    ) -> Optional['DataRecord']:
         """Fetch a specific append-only data record / version by sequential data_id."""
         if not self._client:
             from post_graph.errors import PostGraphError
@@ -183,7 +209,10 @@ class Vertex:
         return await self._client.get_vertex_data_by_id(
             table_name=self.table_name,
             realm=self.realm,
-            data_id=data_id
+            data_id=data_id,
+            payload_fields=payload_fields,
+            exclude_payload_fields=exclude_payload_fields,
+            include_embedding=include_embedding,
         )
 
 
@@ -263,7 +292,14 @@ class Edge:
             user_id=user_id
         )
 
-    async def get_data(self, limit: Optional[int] = None) -> List['DataRecord']:
+    async def get_data(
+        self,
+        limit: Optional[int] = None,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
+    ) -> List['DataRecord']:
         """Fetch append-only data records for this edge."""
         if not self._client:
             from post_graph.errors import PostGraphError
@@ -272,10 +308,19 @@ class Edge:
             table_name=self.table_name,
             realm=self.realm,
             edge_id=self.id,
-            limit=limit
+            limit=limit,
+            payload_fields=payload_fields,
+            exclude_payload_fields=exclude_payload_fields,
+            include_embedding=include_embedding,
         )
 
-    async def get_latest_data(self) -> Optional['DataRecord']:
+    async def get_latest_data(
+        self,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
+    ) -> Optional['DataRecord']:
         """Fetch the latest append-only data record for this edge."""
         if not self._client:
             from post_graph.errors import PostGraphError
@@ -283,10 +328,20 @@ class Edge:
         return await self._client.get_latest_edge_data(
             table_name=self.table_name,
             realm=self.realm,
-            edge_id=self.id
+            edge_id=self.id,
+            payload_fields=payload_fields,
+            exclude_payload_fields=exclude_payload_fields,
+            include_embedding=include_embedding,
         )
 
-    async def get_data_by_id(self, data_id: Any) -> Optional['DataRecord']:
+    async def get_data_by_id(
+        self,
+        data_id: Any,
+        *,
+        payload_fields: Optional[Sequence[str]] = None,
+        exclude_payload_fields: Optional[Sequence[str]] = None,
+        include_embedding: bool = True,
+    ) -> Optional['DataRecord']:
         """Fetch a specific append-only data record by sequential data_id for this edge."""
         if not self._client:
             from post_graph.errors import PostGraphError
@@ -294,7 +349,10 @@ class Edge:
         return await self._client.get_edge_data_by_id(
             table_name=self.table_name,
             realm=self.realm,
-            data_id=data_id
+            data_id=data_id,
+            payload_fields=payload_fields,
+            exclude_payload_fields=exclude_payload_fields,
+            include_embedding=include_embedding,
         )
 
 

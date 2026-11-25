@@ -14,9 +14,45 @@ genuinely about their driver.
 """
 import hashlib
 import re
-from typing import List, Optional, Sequence, Tuple, Union
+import time
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
-from post_graph.errors import UniqueConstraintError
+from post_graph.errors import PostGraphError, UniqueConstraintError
+
+#: Seconds to keep a negative ("table has no embedding column") pg_attribute
+#: result cached before re-checking, so out-of-band ALTER TABLE ADD COLUMN
+#: self-heals while eliminating per-query catalog lookups on hot read paths.
+_COLUMN_NEGATIVE_CACHE_TTL = 30.0
+
+#: O(1) pg_attribute existence probe returning (rel_exists, col_exists) without
+#: touching information_schema views or caching non-existent tables.
+PG_COLUMN_EXISTS_ASYNC_SQL = """
+SELECT r.oid IS NOT NULL AS rel_exists,
+       CASE WHEN r.oid IS NULL THEN FALSE
+            ELSE EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = r.oid
+                  AND attname = $2
+                  AND attnum > 0
+                  AND NOT attisdropped
+            )
+       END AS col_exists
+FROM (SELECT to_regclass($1) AS oid) r
+"""
+
+PG_COLUMN_EXISTS_SA_SQL = """
+SELECT r.oid IS NOT NULL AS rel_exists,
+       CASE WHEN r.oid IS NULL THEN FALSE
+            ELSE EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = r.oid
+                  AND attname = :col_name
+                  AND attnum > 0
+                  AND NOT attisdropped
+            )
+       END AS col_exists
+FROM (SELECT to_regclass(:table_ref) AS oid) r
+"""
 
 #: PostgreSQL's NAMEDATALEN - 1. Identifiers longer than this are truncated
 #: silently, which is how two distinct index names sharing a 63-byte prefix
@@ -216,3 +252,149 @@ class SharedLogic:
                 "index directly if a mixed composite is really intended."
             )
         return keys
+
+    # ---------------------------------------------- column cache & projection
+
+    def _col_cache_dict(self) -> Dict[tuple, Tuple[bool, float]]:
+        cache = getattr(self, "_column_cache", None)
+        if cache is None:
+            cache = {}
+            self._column_cache = cache
+        return cache
+
+    def _col_cache_key(
+        self, realm: Optional[str], table_name: str, column_name: str
+    ) -> Tuple[str, str, str]:
+        return (realm if getattr(self, "schema_per_realm", False) and realm else "", table_name, column_name)
+
+    def _lookup_cached_column(
+        self, realm: Optional[str], table_name: str, column_name: str = "embedding"
+    ) -> Optional[bool]:
+        entry = self._col_cache_dict().get(self._col_cache_key(realm, table_name, column_name))
+        if entry is None:
+            return None
+        present, ts = entry
+        if present:
+            return True
+        if time.monotonic() - ts < _COLUMN_NEGATIVE_CACHE_TTL:
+            return False
+        return None
+
+    def _store_cached_column(
+        self, realm: Optional[str], table_name: str, column_name: str, present: bool
+    ) -> None:
+        self._col_cache_dict()[self._col_cache_key(realm, table_name, column_name)] = (
+            bool(present),
+            time.monotonic(),
+        )
+
+    def _record_vector_columns_created(
+        self,
+        realm: Optional[str],
+        table_name: str,
+        vector_dim: Optional[int],
+        vector_columns: Optional[Dict[str, int]],
+    ) -> None:
+        cols: List[str] = []
+        if vector_dim and vector_dim > 0:
+            cols.append("embedding")
+        if vector_columns:
+            cols.extend(vector_columns.keys())
+        for col in cols:
+            self._store_cached_column(realm, table_name, col, True)
+            self._store_cached_column(realm, f"{table_name}_data", col, True)
+
+    @staticmethod
+    def _embedding_select_clause(
+        alias: str,
+        has_emb: bool,
+        column_name: str = "embedding",
+        *,
+        union_branch: bool = False,
+    ) -> str:
+        if has_emb:
+            return f', CAST({alias}."{column_name}" AS TEXT) AS embedding_text'
+        if union_branch:
+            return ", CAST(NULL AS TEXT) AS embedding_text"
+        return ""
+
+    @staticmethod
+    def _validate_payload_projection(
+        payload_fields: Optional[Sequence[str]],
+        exclude_payload_fields: Optional[Sequence[str]],
+        *,
+        validate_payload_key,
+    ) -> Tuple[Optional[List[str]], Optional[List[str]]]:
+        if payload_fields is not None and exclude_payload_fields is not None:
+            raise PostGraphError(
+                "Pass payload_fields or exclude_payload_fields, not both."
+            )
+        if payload_fields is not None:
+            if isinstance(payload_fields, (str, bytes)):
+                raise PostGraphError(
+                    "payload_fields must be a sequence of field names, not a bare string."
+                )
+            inc = list(dict.fromkeys(payload_fields))
+            for k in inc:
+                validate_payload_key(k)
+            return inc, None
+        if exclude_payload_fields is not None:
+            if isinstance(exclude_payload_fields, (str, bytes)):
+                raise PostGraphError(
+                    "exclude_payload_fields must be a sequence of field names, not a bare string."
+                )
+            exc = list(dict.fromkeys(exclude_payload_fields))
+            for k in exc:
+                validate_payload_key(k)
+            return None, exc
+        return None, None
+
+    @staticmethod
+    def _payload_select_expr_asyncpg(
+        alias: str,
+        inc_fields: Optional[List[str]],
+        exc_fields: Optional[List[str]],
+        params: list,
+    ) -> str:
+        if inc_fields is not None:
+            if not inc_fields:
+                return "CAST('{}' AS jsonb) AS payload"
+            params.append(inc_fields)
+            idx = len(params)
+            return (
+                f"COALESCE((SELECT jsonb_object_agg(e.key, e.value) "
+                f"FROM jsonb_each({alias}.payload) AS e(key, value) "
+                f"WHERE e.key = ANY(${idx}::text[])), CAST('{{}}' AS jsonb)) AS payload"
+            )
+        if exc_fields is not None:
+            if not exc_fields:
+                return f"{alias}.payload"
+            params.append(exc_fields)
+            idx = len(params)
+            return f"({alias}.payload - ${idx}::text[]) AS payload"
+        return f"{alias}.payload"
+
+    @staticmethod
+    def _payload_select_expr_sa(
+        alias: str,
+        inc_fields: Optional[List[str]],
+        exc_fields: Optional[List[str]],
+        params: dict,
+        *,
+        param_name: str = "_pfields",
+    ) -> str:
+        if inc_fields is not None:
+            if not inc_fields:
+                return "CAST('{}' AS jsonb) AS payload"
+            params[param_name] = inc_fields
+            return (
+                f"COALESCE((SELECT jsonb_object_agg(e.key, e.value) "
+                f"FROM jsonb_each({alias}.payload) AS e(key, value) "
+                f"WHERE e.key = ANY(CAST(:{param_name} AS text[]))), CAST('{{}}' AS jsonb)) AS payload"
+            )
+        if exc_fields is not None:
+            if not exc_fields:
+                return f"{alias}.payload"
+            params[param_name] = exc_fields
+            return f"({alias}.payload - CAST(:{param_name} AS text[])) AS payload"
+        return f"{alias}.payload"
